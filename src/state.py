@@ -32,8 +32,6 @@ class AVRState:
         # Rotary encoder increments accumulated since the last volume command.
         self._pending_ticks = 0
 
-        self.busy = False
-
     # ------------------------------------------------------------------
     # State update from a successful poll
     # ------------------------------------------------------------------

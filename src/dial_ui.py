@@ -17,8 +17,6 @@
 # Screen layout:
 #   Upper 75 %: circular arc gauge (8 o'clock → 4 o'clock, 240° sweep)
 #   Centre:     volume number  large-int + small-decimal, mute-pulsed when muted
-#   Upper 75 %: arc gauge (8 o'clock → 4 o'clock, 240° sweep)
-#   Centre:     volume  –large integer + small decimal, pulsed when muted
 #   Below:      input name / Dirac preset
 #   Bottom:     MENU hint
 

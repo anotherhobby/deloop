@@ -43,13 +43,9 @@ def _chirp(phases):
 def click():
     """Crisp tap sound – mute toggle, menu navigation, menu selection."""
     _chirp([
-        # (2500, 3, 20000),   # sharp attack   (~62 % of 32 768 = full-drive edge)
-        # (1800, 2, 10000),   # soft decay
-        # (2500, 3, 20000),   # sharp attack   (~62 % of 32 768 = full-drive edge)
         (1800, 3, 10000),   # soft decay
         ( 800, 2, 16000),
         ( 400, 2, 6000),
-
     ])
 
 
