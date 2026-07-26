@@ -1,0 +1,21 @@
+# deloop device settings
+# Copy to src/settings.toml and fill in your values.
+# settings.toml is deployed to /CIRCUITPY/ and read by CircuitPython at boot.
+# All values are read as strings via os.getenv(); config.py converts types.
+
+# WiFi credentials (required)
+WIFI_SSID = "your_wifi_ssid"
+WIFI_PASS = "your_wifi_password"
+
+# Denon/Marantz AVR (required)
+AVR_HOST = "192.168.1.100"
+
+# Optional overrides (safe to leave commented out)
+# AVR_PORT          = "8080"
+# VOLUME_STEP       = "0.5"    # dB per tick at normal speed
+# VOLUME_STEP_FAST  = "2.0"    # dB per tick when spinning fast
+# ACCEL_THRESHOLD   = "100"     # ms between ticks that triggers fast mode
+# ACCEL_SAFETY_CAP  = "-15.0"  # max volume (dB) allowed during fast upward spin
+# POLL_INTERVAL     = "30.0"
+# SPEAKER_PRESET_1  = "Preset1"   # display name for speaker preset 1
+# SPEAKER_PRESET_2  = "Preset2"    # display name for speaker preset 2

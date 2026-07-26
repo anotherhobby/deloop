@@ -1,0 +1,14 @@
+# Local settings with WiFi credentials and AVR IP -- never commit
+src/settings.toml
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+local/
+.vscode/

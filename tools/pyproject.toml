@@ -1,0 +1,17 @@
+[project]
+name = "deloop-tools"
+version = "0.1.0"
+description = "Host-side tools for deloop development"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+dev = [
+    "mpremote",
+    "requests",
+    "circup",
+    "denonavr",
+]
+
+[tool.setuptools]
+# No packages to install — this project ships as CircuitPython files to the device
+packages = []
