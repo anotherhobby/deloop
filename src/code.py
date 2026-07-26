@@ -3,9 +3,8 @@
 # Input model:
 #   - Rotate encoder     -> volume (in MAIN mode) or navigate menu (in MENU mode)
 #   - Encoder press      -> open menu / select item / confirm
-#   - Touch 0.5 s hold   -> mute toggle (MAIN mode only)
+#   - Touch tap          -> mute toggle (MAIN mode); select / close (MENU mode)
 #   - Touch 1.5 s hold   -> power toggle (MAIN mode only)
-#   - Touch tap (<0.5 s) -> close menu (MENU mode)
 #   - Poll adaptive      -> AVR ground-truth sync
 
 import time
@@ -42,7 +41,6 @@ _NVM_SOUND      = 1
 ENC_DEBOUNCE_S = 0.15
 
 # Touch long-press / tap thresholds
-TOUCH_MUTE_S    = 0.5
 TOUCH_POWER_S   = 1.5
 TOUCH_MIN_S     = 0.05  # minimum tap duration; filters electrical noise
 MENU_TAP_Y      = 195   # pixels from top: taps below this open the menu
@@ -221,7 +219,6 @@ class _Loop:
         self.touch_x           = 0   # coordinates captured at touch-down
         self.touch_y           = 0
         self.touch_x_start     = 0   # x at touch-down (for swipe detection)
-        self.touch_mute_fired  = False
         self.touch_power_fired = False
 
         self.last_poll   = time.monotonic() + 2.0
@@ -430,7 +427,6 @@ def _handle_touch_down(loop, ui, state, touch, now):
     # Power toggle must be checked first – it works in any power state
     # (this is the only way to wake the AVR from standby).
     loop.touch_power_fired = True
-    loop.touch_mute_fired  = True  # suppress tap-mute when power fires
     sound.click_heavy()
     try:
         if state.power == "ON":
@@ -593,14 +589,13 @@ def _dispatch_tap(loop, ui, state, now):
 
 def _handle_touch_released(loop, ui, state, now):
     held = (now - loop.touch_start) if loop.touch_start > 0.0 else 0.0
-    if held >= TOUCH_MIN_S and not loop.touch_mute_fired and not loop.touch_power_fired:
+    if held >= TOUCH_MIN_S and not loop.touch_power_fired:
         _dispatch_tap(loop, ui, state, now)
 
     loop.touch_start       = 0.0
     loop.touch_x           = 0
     loop.touch_y           = 0
     loop.touch_x_start     = 0
-    loop.touch_mute_fired  = False
     loop.touch_power_fired = False
 
 
