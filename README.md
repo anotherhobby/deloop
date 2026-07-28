@@ -2,7 +2,7 @@
 
 deloop is Firmware for the [M5 Dial](https://shop.m5stack.com/products/m5stack-dial-v1-1) that turns it into a dedicated remote and volume knob for a Denon/Marantz AVR, intended for desktop use. You rotate the encoder to change volume, tap the scren to mute, and there is touch menu for inputs / Dirac Live presets / and device settings.
 
-![Main screen at a normal volume](ui/main_normal.png)
+![device](ui/device.jpeg)
 
 ## How was AI used in developing deloop?
 
