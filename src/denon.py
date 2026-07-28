@@ -55,6 +55,26 @@ _RENAME_BODY = (
     '<tx><cmd id="1">GetRenameSource</cmd></tx>'
 )
 
+# GetRenameSource keys some inputs by a descriptive name that differs from
+# the short protocol code GetAllZoneSource actually reports in status polls
+# (e.g. rename table says "Media Player", status poll says "MPLAY"). Fixed
+# Denon/Marantz protocol quirk, not user-configurable -- same table
+# python-denonavr (the Home Assistant integration) hardcodes as SOURCE_MAPPING.
+# Only ever applied to the rename table's own name field (see load_input_names)
+# -- never to a raw status value, so it can't misfire on a real raw code that
+# happens to share text with one of these keys.
+_SOURCE_ALIAS = {
+    "TV AUDIO":      "TV",
+    "IPOD/USB":      "USB/IPOD",
+    "BLUETOOTH":     "BT",
+    "BLU-RAY":       "BD",
+    "NETWORK":       "NET",
+    "MEDIA PLAYER":  "MPLAY",
+    "AUX":           "AUX1",
+    "FM":            "TUNER",
+    "SPOTIFYCONNECT": "SPOTIFY CONNECT",
+}
+
 
 def _norm_source(s):
     """Normalize a source name for lookup: uppercase, sort slash-parts.
@@ -92,7 +112,8 @@ def load_input_names():
         name   = _tag(block, "name")
         rename = _tag(block, "rename")
         if name and rename:
-            result[_norm_source(name)] = rename.strip()
+            raw = _SOURCE_ALIAS.get(name.strip().upper(), name)
+            result[_norm_source(raw)] = rename.strip()
         pos = end + 7
     _input_names = result
 
@@ -236,7 +257,7 @@ def power_standby():
 
 
 # ---------------------------------------------------------------------------
-# Speaker preset and Dirac Live (port 11080 web UI API)
+# Shared web UI helpers (port 11080) -- used by the source list and Dirac Live
 # ---------------------------------------------------------------------------
 
 def _attr(tag, name):
@@ -337,17 +358,6 @@ def set_input(index):
     url = _BASE_UI + "/ajax/globals/set_config?" + qs
     resp = _session.get(url, timeout=_TIMEOUT)
     resp.close()
-
-
-def get_speaker_preset():
-    """Return current speaker preset as '1' or '2'."""
-    xml = _ui_get("/ajax/speakers/get_config", "type=11")
-    return (_tag(xml, "SpeakerPreset") or "1").strip()
-
-
-def set_speaker_preset(preset):
-    """Set speaker preset. preset: '1' or '2'."""
-    _ui_set("/ajax/speakers/set_config", "11", "SpeakerPreset", preset)
 
 
 def get_dirac_filters():

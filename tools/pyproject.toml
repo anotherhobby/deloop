@@ -10,6 +10,7 @@ dev = [
     "requests",
     "circup",
     "denonavr",
+    "Pillow",
 ]
 
 [tool.setuptools]

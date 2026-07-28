@@ -15,13 +15,11 @@ class AVRState:
         self.power = "STANDBY"
         self.input = ""
 
-        # Speaker preset and Dirac Live -- loaded from AVR at boot via denon.
-        # speaker_preset: '1' or '2'
-        # dirac_filter:   '0'=Off, '1'=first filter, '2'=second filter
-        # dirac_names:    list of (value, name) from get_dirac_filters()
-        self.speaker_preset = "1"
-        self.dirac_filter   = "1"   # "1" = Off; real value fetched at boot
-        self.dirac_names    = [("2", "Filter 1"), ("1", "Off")]  # placeholder
+        # Dirac Live -- loaded from AVR at boot via denon.get_dirac_filters().
+        # dirac_filter: '0'=Off, '1'=first filter, '2'=second filter
+        # dirac_names:  list of (value, name) from get_dirac_filters()
+        self.dirac_filter = "1"   # "1" = Off; real value fetched at boot
+        self.dirac_names  = [("2", "Filter 1"), ("1", "Off")]  # placeholder
 
         # Input list -- loaded from AVR at boot via denon.get_inputs().
         # input_names: list of (index, friendly_name)

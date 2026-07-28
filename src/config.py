@@ -15,7 +15,7 @@ WIFI_PASS = os.getenv("WIFI_PASS", "")
 # Port 80 redirects to HTTPS; port 443 HTTPS returns 403 for /goform/ paths.
 AVR_HOST   = os.getenv("AVR_HOST", "192.168.1.100")
 AVR_PORT   = int(os.getenv("AVR_PORT", "8080"))
-AVR_PORT_UI = 11080  # web UI port (speaker preset, Dirac Live)
+AVR_PORT_UI = 11080  # web UI port (inputs/sources, Dirac Live)
 AVR_SCHEME = "http"
 AVR_TIMEOUT_MS = 1000  # 1 s -- keep low so a slow AVR does not block the UI
 
@@ -34,7 +34,3 @@ ACCEL_THRESHOLD_MS = int(os.getenv("ACCEL_THRESHOLD", "100"))
 # When spinning fast and increasing volume, stop here. Prevents accidental blasting.
 # Slow down to push past it intentionally.
 ACCEL_SAFETY_CAP = float(os.getenv("ACCEL_SAFETY_CAP", "-15.0"))
-
-# Speaker preset display names (the AVR has no names; set these in settings.toml)
-SPEAKER_PRESET_1 = os.getenv("SPEAKER_PRESET_1", "Preset 1")
-SPEAKER_PRESET_2 = os.getenv("SPEAKER_PRESET_2", "Preset 2")

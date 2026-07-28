@@ -2,12 +2,17 @@
 #
 # Input model:
 #   - Rotate encoder     -> volume (in MAIN mode) or navigate menu (in MENU mode)
+#                           (if muted, stays blue during the turn and
+#                           unmutes with a full-color reveal once it stops)
 #   - Encoder press      -> open menu / select item / confirm
-#   - Touch tap          -> mute toggle (MAIN mode); select / close (MENU mode)
+#   - Touch tap          -> above the dirac name line: mute toggle; at/below
+#                           it: Dirac quick-select button, else no-op
+#                           (MAIN mode); select / close (MENU mode)
 #   - Touch 1.5 s hold   -> power toggle (MAIN mode only)
 #   - Poll adaptive      -> AVR ground-truth sync
 
 import time
+import gc
 import board
 import rotaryio
 import digitalio
@@ -48,6 +53,17 @@ SWIPE_THRESHOLD = 50    # pixels; horizontal delta to register a swipe
 
 # Menu auto-close
 MENU_TIMEOUT = 8.0   # auto-close menu after this many seconds idle
+
+# Mute pulse: throttle how often we bother re-rendering / testing the trough.
+# The animation itself (period, floor, trough width) lives in dial_ui.pulse_mute().
+PULSE_FRAME_S = 1.0 / 30   # ~30 fps
+
+# Touch poll: the main loop has no sleep and spins as fast as the CPU allows,
+# but the FocalTouch controller itself only reports at ~60-120Hz -- polling
+# every iteration (thousands/sec while a finger is down) just burns CPU and
+# allocates a fresh touches list on every call for no benefit. Gate it like
+# the pulse frame rate above.
+TOUCH_FRAME_S = 1.0 / 60   # ~60 fps
 
 
 def _load_brightness():
@@ -159,17 +175,6 @@ def _confirm_sub(sub_type, sub_cursor, state):
             state.dirac_filter = val
         except Exception as e:
             print("set_dirac:", e)
-    elif sub_type == "speaker":
-        preset = str(sub_cursor + 1)
-        try:
-            denon.set_speaker_preset(preset)
-            state.speaker_preset = preset
-            try:
-                state.dirac_filter, state.dirac_names = denon.get_dirac_filters()
-            except Exception as e:
-                print("reload_dirac:", e)
-        except Exception as e:
-            print("set_speaker:", e)
     elif sub_type == "brightness":
         _save_brightness(state.brightness)
     elif sub_type == "sound":
@@ -220,6 +225,7 @@ class _Loop:
         self.touch_y           = 0
         self.touch_x_start     = 0   # x at touch-down (for swipe detection)
         self.touch_power_fired = False
+        self.last_touch_poll   = 0.0   # throttles touch reads -- see TOUCH_FRAME_S
 
         self.last_poll   = time.monotonic() + 2.0
         self.error_count = 0
@@ -232,6 +238,13 @@ class _Loop:
         self.sub_scroll  = 0    # first visible item in sub-menu (for long lists)
         self.sub_type    = None    # "input", "dirac", "brightness", "sound"
         self.menu_idle   = 0.0     # monotonic time of last menu interaction
+
+        self.mute_phase_origin  = 0.0     # monotonic time the current pulse cycle started
+        self.mute_trough_polled = False   # guards against polling every tick while under threshold
+        self.pulse_last_frame   = 0.0
+
+        self.power_fade_start = 0.0   # monotonic time the power-off fade began; 0.0 = not fading
+        self.power_fade_from  = dial_ui.BRIGHTNESS_ON   # display brightness when the fade began
 
 
 # ---------------------------------------------------------------------------
@@ -359,20 +372,31 @@ def _handle_encoder_rotation(loop, ui, state, encoder, now):
 # Volume debounce send (MAIN mode only)
 # ---------------------------------------------------------------------------
 
-def _send_volume_debounced(loop, state, now):
-    """After the encoder stops moving, push the settled volume to the AVR."""
+def _send_volume_debounced(loop, ui, state, now):
+    """After the encoder stops moving, push the settled volume to the AVR.
+
+    If the whole turn happened while muted, this is also the reveal moment:
+    send the unmute, then do the one full redraw that swaps the display
+    back from blue to the normal gradient and colors.
+    """
     if loop.mode != MODE_MAIN or loop.enc_last_move <= 0.0:
         return
     if (now - loop.enc_last_move) < ENC_DEBOUNCE_S:
         return
 
     loop.enc_last_move = 0.0
+    was_muted = state.muted
     try:
+        if was_muted:
+            denon.mute_off()
+            state.muted = False
         denon.set_volume(state.volume_db)
         loop.error_count = 0
     except Exception as e:
-        print("set_volume:", e)
+        print("volume debounce send:", e)
         loop.error_count += 1
+    if was_muted and not state.muted:
+        dial_ui.draw_main(ui, state)
     loop.last_poll = time.monotonic()
 
 
@@ -432,6 +456,10 @@ def _handle_touch_down(loop, ui, state, touch, now):
         if state.power == "ON":
             denon.power_standby()
             state.power = "STANDBY"
+            # Ease brightness down instead of an instant cut; _fade_power_off
+            # swaps in the power icon once dark and hands off to its pulse.
+            loop.power_fade_from  = state.brightness
+            loop.power_fade_start = now
         else:
             denon.power_on()
             state.power = "ON"
@@ -440,7 +468,7 @@ def _handle_touch_down(loop, ui, state, touch, now):
             state.muted = False
             state.volume_db = -80.0
             dial_ui.flash_power_on(ui)
-        dial_ui.draw_main(ui, state)
+            dial_ui.draw_main(ui, state)
         loop.last_poll = time.monotonic() - 4.0  # poll in ~1s (5s interval - 4s)
         loop.error_count = 0
     except Exception as e:
@@ -541,7 +569,12 @@ def _tap_open_menu(loop, ui, now):
     dial_ui.draw_menu(ui, "", _build_top_menu(), loop.menu_cursor, clear_bg=True)
 
 
-def _tap_toggle_mute(loop, ui, state):
+def _start_mute_pulse(loop, now):
+    loop.mute_phase_origin  = now
+    loop.mute_trough_polled = False
+
+
+def _tap_toggle_mute(loop, ui, state, now):
     """Tap anywhere else -> toggle mute."""
     sound.click()
     try:
@@ -551,11 +584,37 @@ def _tap_toggle_mute(loop, ui, state):
         else:
             denon.mute_on()
             state.muted = True
+            _start_mute_pulse(loop, now)
         dial_ui.draw_main(ui, state)
         loop.last_poll = time.monotonic()
         loop.error_count = 0
     except Exception as e:
         print("mute:", e)
+        loop.error_count += 1
+
+
+def _tap_main_screen(loop, ui, state, now):
+    """Tap above the dirac name line -> toggle mute. At or below that line,
+    only the quick-select buttons respond -- everything else there is a
+    no-op, so the button row doesn't accidentally toggle mute too."""
+    if loop.touch_y < dial_ui.DIRAC_NAME_Y:
+        _tap_toggle_mute(loop, ui, state, now)
+        return
+
+    idx = dial_ui.dirac_button_at(loop.touch_x, loop.touch_y, len(state.dirac_names))
+    if idx == -1:
+        return
+
+    sound.click()
+    val, _name = state.dirac_names[idx]
+    try:
+        denon.set_dirac_filter(val)
+        state.dirac_filter = val
+        dial_ui.draw_main(ui, state)
+        loop.last_poll = time.monotonic()
+        loop.error_count = 0
+    except Exception as e:
+        print("set_dirac (quick):", e)
         loop.error_count += 1
 
 
@@ -584,7 +643,7 @@ def _dispatch_tap(loop, ui, state, now):
     elif loop.mode == MODE_MAIN and loop.touch_y >= MENU_TAP_Y:
         _tap_open_menu(loop, ui, now)
     elif loop.mode == MODE_MAIN:
-        _tap_toggle_mute(loop, ui, state)
+        _tap_main_screen(loop, ui, state, now)
 
 
 def _handle_touch_released(loop, ui, state, now):
@@ -600,6 +659,10 @@ def _handle_touch_released(loop, ui, state, now):
 
 
 def _handle_touch(loop, ui, state, touch, touch_ok, now):
+    if (now - loop.last_touch_poll) < TOUCH_FRAME_S:
+        return
+    loop.last_touch_poll = now
+
     try:
         is_touched = touch_ok and touch.touched > 0
     except Exception:
@@ -615,37 +678,45 @@ def _handle_touch(loop, ui, state, touch, touch_ok, now):
 # Periodic AVR poll
 # ---------------------------------------------------------------------------
 
-def _poll_avr(loop, ui, state, now):
-    """Ground-truth sync against the AVR; adaptive interval.
+def _poll_now(loop, ui, state, now):
+    """Fetch AVR ground truth and reconcile local state.
 
-    Interval logic:
-      - AVR is in STANDBY: always 5s -- detect power-on quickly
-      - Recently active (encoder/touch in last 30s): POLL_INTERVAL_S (30s)
-        -- prevents polls chaining immediately after commands
-      - Truly idle: 5s -- catch remote/app changes promptly
-    Always skipped while the encoder is moving.
+    Shared by the adaptive timer poll (_poll_avr) and the mute-pulse trough
+    poll (_pulse_mute) -- only the trigger condition differs between them.
+    Returns True if the AVR was just detected powering on externally, so a
+    timer-driven caller can reschedule its next poll sooner.
     """
-    in_standby = state.power != "ON"
-    last_action = max(loop.enc_last_move, loop.enc_last_tick)
-    recently_active = (now - last_action) < config.POLL_INTERVAL_S
-    poll_interval = 5.0 if (in_standby or not recently_active) else config.POLL_INTERVAL_S
-
-    encoder_idle = (loop.enc_last_move == 0.0)
-    if not encoder_idle or (now - loop.last_poll) < poll_interval:
-        return
-
-    loop.last_poll = now
+    powered_on_externally = False
     try:
         was_standby = state.power != "ON"
+        was_on      = state.power == "ON"
+        was_muted   = state.muted
         status = denon.get_status()
         changed = state.apply_status(status)
 
         if was_standby and state.power == "ON" and not loop.first_poll:
             # AVR just powered on externally – show splash then normal UI.
             state.volume_db = -80.0
-            loop.last_poll = now - poll_interval + 1.0
             changed = True
             dial_ui.flash_power_on(ui)
+            powered_on_externally = True
+
+        if was_on and state.power != "ON" and not loop.first_poll:
+            # AVR went to standby from its own remote/panel -- same fade as
+            # the local long-press, so the transition feels the same either way.
+            loop.power_fade_from  = state.brightness
+            loop.power_fade_start = now
+            changed = False   # _fade_power_off draws the final frame once it settles
+
+        if state.muted and not was_muted:
+            # Muted from the AVR's own remote/app -- start the pulse fresh.
+            _start_mute_pulse(loop, now)
+
+        if loop.mode == MODE_ERROR:
+            # Recovered after a run of failed polls -- leave the error
+            # screen and force a redraw even if nothing else changed.
+            loop.mode = MODE_MAIN
+            changed = True
 
         loop.first_poll = False
         if changed:
@@ -657,6 +728,81 @@ def _poll_avr(loop, ui, state, now):
         if loop.error_count >= _MAX_ERRORS and loop.mode != MODE_ERROR:
             loop.mode = MODE_ERROR
             dial_ui.draw_error(ui, "No AVR")
+    return powered_on_externally
+
+
+def _poll_avr(loop, ui, state, now):
+    """Ground-truth sync against the AVR; adaptive interval.
+
+    Interval logic:
+      - AVR is in STANDBY: always 5s -- detect power-on quickly
+      - Recently active (encoder/touch in last 30s): POLL_INTERVAL_S (30s)
+        -- prevents polls chaining immediately after commands
+      - Truly idle: 5s -- catch remote/app changes promptly
+    Always skipped while the encoder is moving, or while muted in MAIN
+    (_pulse_mute polls at the pulse trough instead).
+    """
+    if loop.mode == MODE_MAIN and state.power == "ON" and state.muted:
+        return
+
+    in_standby = state.power != "ON"
+    last_action = max(loop.enc_last_move, loop.enc_last_tick)
+    recently_active = (now - last_action) < config.POLL_INTERVAL_S
+    poll_interval = 5.0 if (in_standby or not recently_active) else config.POLL_INTERVAL_S
+
+    encoder_idle = (loop.enc_last_move == 0.0)
+    if not encoder_idle or (now - loop.last_poll) < poll_interval:
+        return
+
+    loop.last_poll = now
+    # Same insurance as the boot-time fetches: reclaim garbage from whatever
+    # ran since the last poll before asking for a fresh response buffer. The
+    # device runs unattended for long stretches, and MicroPython's GC doesn't
+    # compact, so this is a cheap hedge against the kind of heap fragmentation
+    # that broke the Dirac filter fetch at boot.
+    gc.collect()
+    if _poll_now(loop, ui, state, now):
+        loop.last_poll = now - poll_interval + 1.0
+
+
+def _pulse_mute(loop, ui, state, now):
+    """While muted and resting in MAIN, breathe the volume number and use
+    the pulse's natural pause at the bottom of each cycle to sneak in an
+    AVR poll. Suspended while the encoder is actively turning -- see
+    _handle_encoder_rotation and _send_volume_debounced for that path.
+    """
+    if loop.mode != MODE_MAIN or state.power != "ON" or not state.muted:
+        return
+    if loop.enc_last_move > 0.0:
+        return   # actively spinning -- draw_volume owns the display for now
+    if (now - loop.pulse_last_frame) < PULSE_FRAME_S:
+        return
+    loop.pulse_last_frame = now
+
+    elapsed = now - loop.mute_phase_origin
+    if dial_ui.mute_pulse_at_trough(elapsed):
+        if not loop.mute_trough_polled:
+            loop.mute_trough_polled = True
+            _poll_now(loop, ui, state, now)   # may redraw; the render below always wins
+    else:
+        loop.mute_trough_polled = False
+
+    # Render last: guarantees this frame's color is what's actually on
+    # screen even if _poll_now() just ran a full draw_main().
+    dial_ui.pulse_mute(ui, now - loop.mute_phase_origin)
+
+
+def _fade_power_off(loop, ui, state, now):
+    """One-shot brightness ease after powering off, toward the static
+    standby brightness draw_main() uses -- hides that redraw at the least
+    visible moment, same trick as the mute-pulse trough poll."""
+    if loop.power_fade_start <= 0.0:
+        return
+    elapsed = now - loop.power_fade_start
+    done = dial_ui.fade_power_off(ui, elapsed, loop.power_fade_from, state)
+    if done:
+        loop.power_fade_start = 0.0
+        dial_ui.draw_main(ui, state)
 
 
 # ---------------------------------------------------------------------------
@@ -727,20 +873,21 @@ def main():
     sound.enabled    = _load_sound()
     ui["display"].brightness = state.brightness
 
-    try:
-        state.speaker_preset = denon.get_speaker_preset()
-    except Exception as e:
-        print("get_speaker_preset:", e)
-
+    # gc.collect() before each boot-time fetch: reclaims fragmented memory
+    # from the previous request/response before asking for the next buffer.
+    # Whichever fetch runs last in this sequence is the one most exposed to
+    # cumulative heap fragmentation, so this matters most right here.
+    gc.collect()
     try:
         state.input_index, state.input_names = denon.get_inputs()
     except Exception as e:
-        print("get_inputs:", e)
+        print("get_inputs:", e, "| free mem:", gc.mem_free())
 
+    gc.collect()
     try:
         state.dirac_filter, state.dirac_names = denon.get_dirac_filters()
     except Exception as e:
-        print("get_dirac_filters:", e)
+        print("get_dirac_filters:", e, "| free mem:", gc.mem_free())
 
     loop = _Loop()
     loop.last_pos = encoder.position
@@ -751,9 +898,11 @@ def main():
 
         _handle_encoder_button(loop, ui, state, btn, now)
         _handle_encoder_rotation(loop, ui, state, encoder, now)
-        _send_volume_debounced(loop, state, now)
+        _send_volume_debounced(loop, ui, state, now)
         _auto_close_menu(loop, ui, state, now)
         _handle_touch(loop, ui, state, touch, touch_ok, now)
+        _pulse_mute(loop, ui, state, now)
+        _fade_power_off(loop, ui, state, now)
         _poll_avr(loop, ui, state, now)
 
 

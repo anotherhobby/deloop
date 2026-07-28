@@ -17,5 +17,3 @@ AVR_HOST = "192.168.1.100"
 # ACCEL_THRESHOLD   = "100"     # ms between ticks that triggers fast mode
 # ACCEL_SAFETY_CAP  = "-15.0"  # max volume (dB) allowed during fast upward spin
 # POLL_INTERVAL     = "30.0"
-# SPEAKER_PRESET_1  = "Preset1"   # display name for speaker preset 1
-# SPEAKER_PRESET_2  = "Preset2"    # display name for speaker preset 2

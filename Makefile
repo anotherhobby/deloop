@@ -3,7 +3,9 @@ CIRCUITPY := /Volumes/CIRCUITPY
 LIB_DIR  := $(CIRCUITPY)/lib
 CIRCUP   := ./.venv/bin/circup
 
-FONT_TTF  := Inter-4.1/extras/ttf/Inter-Medium.ttf
+# Inter-4.1 is a local, gitignored download (not shipped) -- grab v4.1 from
+# https://github.com/rsms/inter/releases and extract it to local/Inter-4.1.
+FONT_TTF  := local/Inter-4.1/extras/ttf/Inter-Medium.ttf
 FONT_SIZES := 20 24 28 32 36 40
 
 # Bootstrap: set up the host venv with all dev tools (run once after clone).
@@ -36,6 +38,11 @@ deploy: _copy-files
 # Requires: pip install pillow
 splash:
 	$(PYTHON) tools/make_splash.py
+
+# renders: render dial_ui.py's actual screens to PNGs (local/renders/) without
+# needing the device -- see tools/dial_sim.py for what's simulated.
+renders:
+	$(PYTHON) tools/dial_sim.py
 
 fonts:
 # Requires: brew install otf2bdf bdftopcf
@@ -89,4 +96,4 @@ probe:
 dump-avr:
 	$(PYTHON) tools/dump_denonavr.py --host $(AVR_HOST)
 
-.PHONY: bootstrap install-libs full-deploy deploy _copy-files ls shell probe dump-avr
+.PHONY: bootstrap install-libs full-deploy deploy _copy-files ls shell probe dump-avr renders

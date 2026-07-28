@@ -8,16 +8,20 @@
 #   init()                              → ui dict
 #   draw_main(ui, state)
 #   draw_volume(ui, state)              fast path – encoder ticks
+#   pulse_mute(ui, elapsed_s)           mute "breathing" animation, per tick
+#   mute_pulse_at_trough(elapsed_s)     phase test, no render -- call before pulse_mute
+#   fade_power_off(ui, elapsed_s, from_brightness, state)   one-shot power-off ease
 #   draw_status(ui, msg)               startup / progress
 #   draw_error(ui, msg)
 #   draw_menu(ui, title, items, cursor)
 #   exit_menu(ui)
-#   BRIGHTNESS_ON, BRIGHTNESS_OFF      constants used by code.py
+#   dirac_button_at(x, y, n)           hit-test for the quick-select buttons
+#   BRIGHTNESS_ON                      constant used by code.py
 #
 # Screen layout:
 #   Upper 75 %: circular arc gauge (8 o'clock → 4 o'clock, 240° sweep)
 #   Centre:     volume number  large-int + small-decimal, mute-pulsed when muted
-#   Below:      input name / Dirac preset
+#   Below:      input name / Dirac preset / quick-select filter buttons
 #   Bottom:     MENU hint
 
 import math
@@ -67,20 +71,38 @@ _PWR_STEM_TOP = CY - _PWR_R_OUT - 4   # y ≈ 38
 _PWR_STEM_BOT = CY - _PWR_R_IN  + 4   # y ≈ 66
 
 # ── Brightness ────────────────────────────────────────────────────────────────
-BRIGHTNESS_ON  = 1.0
-BRIGHTNESS_OFF = 0.05
+BRIGHTNESS_ON = 1.0
+
+# Standby screen brightness is relative to the user's own brightness setting,
+# not a fixed value -- dim room, dim standby indicator; bright room, brighter one.
+_STANDBY_BRIGHTNESS_FRAC = 0.25
 
 # ── Menu geometry (exported so code.py can map touch_y → item index) ─────────
 MENU_ITEM_Y0  = 44    # y-centre of first visible item
 MENU_ITEM_DY  = 38    # vertical spacing between items
 MENU_VISIBLE  = 5     # max items shown at once
 
+# ── Dirac quick-select button geometry ────────────────────────────────────────
+# Row of small numbered buttons just below the dirac name, letting a tap
+# switch filters directly from the main screen instead of via the menu.
+# Exported so code.py can split the main screen's tap zones: mute above this
+# line, quick-select buttons (and nothing else) at or below it.
+DIRAC_NAME_Y = CY + 18
+_DBTN_Y0   = 156   # top of the button row
+_DBTN_H    = 22    # button height
+_DBTN_W    = 22    # button width
+_DBTN_GAP  = 14    # horizontal gap between buttons
+_DBTN_MAX  = 5     # pre-allocated label slots -- real AVRs use 2-3
+
 # ── Gauge bitmap palette (16-colour → 4-bit pixels, ~28 KB for 240×240) ───────
+# _PRR and _BTNSEL_FILTER are aliases, not separate slots: both used to be
+# their own shade of orange, but they're the same colour as _ORG now, so
+# they just point at it instead of duplicating the palette entry.
 _BG    =  0   # black background
 _TRACK =  1   # dim arc track
 _GRN   =  2   # green   (≤ −20 dB)
 _AMB   =  3   # amber   (−20 … −10 dB)
-_ORG   =  4   # orange  (−10 …   0 dB)
+_ORG   =  4   # orange  (−10 … 0 dB); also power ring + selected-filter button
 _RED   =  5   # red     (≥   0 dB)
 _TK_S  =  6   # minor tick
 _TK_L  =  7   # major tick
@@ -88,14 +110,17 @@ _TK_0  =  8   # 0 dB tick (bright)
 _PTR   =  9   # pointer wedge
 _BLUE  = 10   # muted arc fill
 _BLT   = 11   # muted arc track (dim blue)
-_PRR   = 12   # power button ring / stem
+_BTNSEL_OFF    = 12   # dirac quick-select button: selected, and it's "Off"
+_BTNSEL_MUTED  = 13   # dirac quick-select button: selected filter, muted
+_PRR            = _ORG   # power button ring / stem
+_BTNSEL_FILTER  = _ORG   # dirac quick-select button: selected filter, unmuted
 
 _PALETTE = [
     0x000000,  #  0 BG
     0x181818,  #  1 TRACK
     0x009940,  #  2 GREEN
     0xBB8800,  #  3 AMBER
-    0xFF5500,  #  4 ORANGE
+    0xFF5500,  #  4 ORANGE (also power ring, selected-filter button outline)
     0xAA1800,  #  5 RED
     0x232323,  #  6 minor tick
     0x474747,  #  7 major tick
@@ -103,15 +128,82 @@ _PALETTE = [
     0xEEEEEE,  #  9 pointer
     0x0055BB,  # 10 blue (muted)
     0x001133,  # 11 blue track dim (muted)
-    0xCC2000,  # 12 power ring
-]   # 13 entries; value_count=16 → 3 spare slots
+    0xA7A7A7,  # 12 dirac button selected outline, Off            (matches _C_BTN_SEL)
+    0x2277CC,  # 13 dirac button selected outline, filter + muted  (matches _C_MUTED)
+]   # 14 entries; value_count=16 → 2 spare slots
 
 # ── Label colours ─────────────────────────────────────────────────────────────
-_C_TEXT  = 0xEEEEEE
-_C_DIM   = 0x606060
-_C_WARN  = 0xFF8800
-_C_MENU  = 0x383838   # barely-visible menu hint
-_C_MUTED = 0x2277CC   # static blue for muted state
+_C_TEXT    = 0xEEEEEE
+_C_DIM     = 0x606060
+_C_WARN    = 0xFF5500
+_C_MENU    = 0x383838   # barely-visible menu hint
+_C_MUTED   = 0x2277CC   # static blue for muted state
+_C_BTN_SEL = 0xA7A7A7   # dirac quick-select button, selected: midpoint of _C_DIM/_C_TEXT
+
+# ── Mute pulse ────────────────────────────────────────────────────────────────
+# Breathing brightness for the volume number while muted. A cosine wave
+# naturally eases to a stop at both the peak and the trough -- no separate
+# acceleration curve needed. The trough is also where callers should slip in
+# any slow work (e.g. an AVR poll): the animation is barely moving there
+# regardless, so a brief stall blends into the ease instead of reading as
+# a stutter.
+_PULSE_PERIOD_S  = 8    # full breathe cycle, in seconds
+_PULSE_FLOOR     = 0.18   # dimmest point, as a fraction of full brightness -- never fully black
+_PULSE_TROUGH_TH = 0.04   # phase fraction below which pulse_mute() reports "at trough"
+
+
+def _pulse_color(frac):
+    """frac 0..1 (0 = floor, 1 = full mute-blue) -> interpolated RGB."""
+    level = _PULSE_FLOOR + (1.0 - _PULSE_FLOOR) * frac
+    return _lerp_color(0x000000, _C_MUTED, level)
+
+# ── Power fade ────────────────────────────────────────────────────────────────
+# One-shot brightness ease when powering off, toward the static standby
+# level (state.brightness * _STANDBY_BRIGHTNESS_FRAC, see draw_main). A
+# continuous breathe on the icon itself was tried and dropped -- pulsing the
+# icon's palette color forces a full-bitmap SPI refresh every frame (it
+# lives in the same bitmap as the arc gauge), and even after switching to a
+# brightness-only pulse it still read as distracting rather than restful.
+_POWER_FADE_S = 1.2   # duration of the power-off brightness ease-down
+
+
+def fade_power_off(ui, elapsed_s, from_brightness, state):
+    """One frame of the power-off brightness ease-down, toward the same
+    static standby level draw_main() settles on.
+
+    from_brightness: display brightness at the moment the fade started.
+    Returns True once the fade has reached the floor -- the caller should
+    swap to the power icon.
+    """
+    target = state.brightness * _STANDBY_BRIGHTNESS_FRAC
+    if elapsed_s >= _POWER_FADE_S:
+        ui["display"].brightness = target
+        return True
+    ease = 0.5 * (1.0 - math.cos(math.pi * elapsed_s / _POWER_FADE_S))
+    ui["display"].brightness = from_brightness - (from_brightness - target) * ease
+    return False
+
+# ── Dirac quick-select buttons ────────────────────────────────────────────────
+# n is however many entries state.dirac_names has (filters + "Off") -- the row
+# is centred and evenly spaced for whatever n turns out to be, not hardcoded.
+
+def _dirac_btn_rects(n):
+    """Return [(x0, y0, x1, y1), ...] for n evenly-spaced, centred buttons."""
+    total_w = n * _DBTN_W + (n - 1) * _DBTN_GAP
+    x_start = CX - total_w // 2
+    rects = []
+    for i in range(n):
+        x0 = x_start + i * (_DBTN_W + _DBTN_GAP)
+        rects.append((x0, _DBTN_Y0, x0 + _DBTN_W, _DBTN_Y0 + _DBTN_H))
+    return rects
+
+
+def dirac_button_at(x, y, n):
+    """Return the tapped quick-select button index [0..n-1], or -1."""
+    for i, (x0, y0, x1, y1) in enumerate(_dirac_btn_rects(n)):
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return i
+    return -1
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 _GLYPHS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-. +/&()"
@@ -188,6 +280,14 @@ def _line(bmp, x0, y0, x1, y1, idx):
         e2 = 2 * err
         if e2 > -dy: err -= dy; x0 += sx
         if e2 <  dx: err += dx; y0 += sy
+
+
+def _rect_outline(bmp, x0, y0, x1, y1, idx):
+    """1-pixel rectangle outline."""
+    _line(bmp, x0, y0, x1, y0, idx)
+    _line(bmp, x0, y1, x1, y1, idx)
+    _line(bmp, x0, y0, x0, y1, idx)
+    _line(bmp, x1, y0, x1, y1, idx)
 
 
 def _arc(bmp, a_start, a_end, r_in, r_out, color, step=1.0):
@@ -273,6 +373,17 @@ def _tri(bmp, x0, y0, x1, y1, x2, y2, idx):
             bmp[x, y] = idx
 
 
+def _lerp_color(c0, c1, frac):
+    """Interpolate two 24-bit RGB ints. frac is clamped to [0, 1]."""
+    frac = max(0.0, min(1.0, frac))
+    r0, g0, b0 = (c0 >> 16) & 0xFF, (c0 >> 8) & 0xFF, c0 & 0xFF
+    r1, g1, b1 = (c1 >> 16) & 0xFF, (c1 >> 8) & 0xFF, c1 & 0xFF
+    r = int(r0 + (r1 - r0) * frac)
+    g = int(g0 + (g1 - g0) * frac)
+    b = int(b0 + (b1 - b0) * frac)
+    return (r << 16) | (g << 8) | b
+
+
 def _clear(bmp):
     if _BT:
         _bt.fill_region(bmp, 0, 0, _W, _H, _BG)
@@ -322,6 +433,13 @@ def _draw_power_symbol(bmp):
         else:
             for x in range(x0, x1):
                 bmp[x, y] = _PRR
+
+
+def _draw_dirac_buttons(bmp, n, selected_idx, selected_ci):
+    """Outline the n quick-select buttons; selected_idx gets selected_ci."""
+    for i, (x0, y0, x1, y1) in enumerate(_dirac_btn_rects(n)):
+        ci = selected_ci if i == selected_idx else _TK_L
+        _rect_outline(bmp, x0, y0, x1, y1, ci)
 
 
 def _restore_region(bmp, angle, muted):
@@ -420,6 +538,45 @@ def _hide_vol_and_status(ui):
     ui["input"].text   = ""
     ui["dirac"].text   = ""
     ui["menu"].text    = ""
+    for fl in ui["filters"]:
+        fl.text = ""
+
+
+def _draw_dirac_filter_buttons(ui, state):
+    """Draw the quick-select button outlines + numbers for state.dirac_names.
+
+    The selected button is orange for a real filter, light gray for Off --
+    a visual cue for on/off, not just which filter, at a glance. While
+    muted, a selected filter goes blue too, matching the rest of the muted
+    display; Off is unaffected by mute, so it's left alone either way.
+    """
+    n = min(len(state.dirac_names), len(ui["filters"]))
+    selected = -1
+    selected_is_off = False
+    for i, (val, name) in enumerate(state.dirac_names):
+        if val == state.dirac_filter:
+            selected = i
+            selected_is_off = (name == "Off")
+            break
+
+    if selected_is_off:
+        sel_ci, sel_color = _BTNSEL_OFF, _C_BTN_SEL
+    elif state.muted:
+        sel_ci, sel_color = _BTNSEL_MUTED, _C_MUTED
+    else:
+        sel_ci, sel_color = _BTNSEL_FILTER, _C_WARN
+
+    _draw_dirac_buttons(ui["bmp"], n, selected, sel_ci)
+    rects = _dirac_btn_rects(n)
+    for i, fl in enumerate(ui["filters"]):
+        if i < n:
+            x0, y0, x1, y1 = rects[i]
+            _val, name = state.dirac_names[i]
+            fl.anchored_position = ((x0 + x1) // 2, (y0 + y1) // 2)
+            fl.text  = "X" if name == "Off" else str(i + 1)
+            fl.color = sel_color if i == selected else _C_DIM
+        else:
+            fl.text = ""
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -440,7 +597,6 @@ def init():
     # ── Volume number: large integer left-of-centre, small decimal right ──────
     # vol_int  Inter 36 pt, anchor (1,1) → right-aligns to CX
     # vol_dec  Inter 24 pt, anchor (0,1) → left-aligns from CX (shorter)
-    # vol_lbl Inter 20 pt, just says "dB" -> anchored to the right of vol_dec
 
     _vol_y = CY - 8
     vol_int = label.Label(
@@ -451,13 +607,9 @@ def init():
         _F_MD, text=".-", color=_C_TEXT,
         anchor_point=(0.0, 1.0), anchored_position=(CX + 20, _vol_y),
     )
-    vol_lbl = label.Label(
-        _F_SM, text="dB", color=_C_DIM,
-        anchor_point=(0.0, 1.0), anchored_position=(CX + 47, _vol_y),
-    )
+
     group.append(vol_int)
     group.append(vol_dec)
-    group.append(vol_lbl)
 
     # ── Status info: input name & Dirac preset ────────────────────────────────
     # Input sits above the volume number, halfway between it and the arc gap.
@@ -468,10 +620,22 @@ def init():
     # Dirac filters sit below volume
     dirac_lbl = label.Label(
         _F_SM, text="", color=_C_DIM,
-        anchor_point=(0.5, 0.5), anchored_position=(CX, CY + 18),
+        anchor_point=(0.5, 0.5), anchored_position=(CX, DIRAC_NAME_Y),
     )
     group.append(input_lbl)
     group.append(dirac_lbl)
+
+    # ── Dirac quick-select buttons: numbered labels over the bitmap outlines ──
+    # Positioned dynamically each draw_main() call, since the row layout
+    # depends on how many filters state.dirac_names actually has.
+    filter_btns = []
+    for i in range(_DBTN_MAX):
+        fl = label.Label(
+            _F_SM, text="", color=_C_DIM,
+            anchor_point=(0.5, 0.5), anchored_position=(CX, _DBTN_Y0),
+        )
+        group.append(fl)
+        filter_btns.append(fl)
 
     # ── Menu hint (bottom centre, near-invisible – tap-zone cue) ─────────────
     menu_lbl = label.Label(
@@ -508,6 +672,7 @@ def init():
         "vol_dec":    vol_dec,
         "input":      input_lbl,
         "dirac":      dirac_lbl,
+        "filters":    filter_btns,
         "menu":       menu_lbl,
         "items":      menu_items,
         "status":     status_lbl,
@@ -522,7 +687,7 @@ def draw_main(ui, state):
         ml.text = ""
 
     if state.power != "ON":
-        ui["display"].brightness = BRIGHTNESS_OFF
+        ui["display"].brightness = state.brightness * _STANDBY_BRIGHTNESS_FRAC
         _render_gauge(ui["bmp"], 0, False, power_off=True)
         ui["_ptr_angle"] = None
         _hide_vol_and_status(ui)
@@ -535,7 +700,9 @@ def draw_main(ui, state):
     _set_vol_labels(ui, state.volume_db, state.muted)
     ui["input"].text = _denon.friendly_input(state.input)
     ui["dirac"].text = _dirac_name(state)
+    _draw_dirac_filter_buttons(ui, state)
     ui["menu"].text  = "MENU"
+    ui["menu"].color = _C_MENU
     ui["display"].refresh()
 
 
@@ -558,6 +725,31 @@ def draw_volume(ui, state):
     ui["display"].refresh()
 
 
+def mute_pulse_at_trough(elapsed_s):
+    """True near the trough of the mute breathing cycle -- the natural
+    low-motion point where a caller can do slow work (e.g. an AVR poll)
+    without a visible stutter -- see the "Mute pulse" note above."""
+    t = elapsed_s % _PULSE_PERIOD_S
+    frac = 0.5 * (1.0 - math.cos(2.0 * math.pi * t / _PULSE_PERIOD_S))
+    return frac < _PULSE_TROUGH_TH
+
+
+def pulse_mute(ui, elapsed_s):
+    """Render one frame of the mute breathing animation.
+
+    elapsed_s: seconds since the pulse phase started; wraps internally.
+    Callers that poll on the trough (mute_pulse_at_trough) should call this
+    LAST each tick, after the poll -- otherwise a poll-triggered draw_main()
+    can stomp this frame's color with the static muted color.
+    """
+    t = elapsed_s % _PULSE_PERIOD_S
+    frac = 0.5 * (1.0 - math.cos(2.0 * math.pi * t / _PULSE_PERIOD_S))
+    color = _pulse_color(frac)
+    ui["vol_int"].color = color
+    ui["vol_dec"].color = color
+    ui["display"].refresh()
+
+
 def draw_status(ui, msg):
     """Startup / connection-progress state.
 
@@ -575,6 +767,8 @@ def draw_status(ui, msg):
     ui["status"].text   = ""
     for ml in ui["items"]:
         ml.text = ""
+    for fl in ui["filters"]:
+        fl.text = ""
     ui["display"].refresh()
 
 
@@ -609,6 +803,8 @@ def draw_menu(ui, title, items, cursor, clear_bg=False):
     ui["input"].text   = ""
     ui["dirac"].text   = ""
     ui["menu"].text    = ""
+    for fl in ui["filters"]:
+        fl.text = ""
     # Center N items vertically: for odd N the middle item sits at CY;
     # for even N the midpoint between the two centre items sits at CY.
     n_vis = len(items)
