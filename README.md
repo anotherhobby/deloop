@@ -48,7 +48,7 @@ Note: the screen shots are pixel-accurate renders of `dial_ui.py`'s actual drawi
 
 ## Hardware
 
-- Only tested on the M5 Dial ([docs](https://docs.m5stack.com/en/core/M5Dial)). There are other ESP32 rotary encoders out there, but I would not expect them work out of the box with this project.
+- Only tested on the M5Dial ([docs](https://docs.m5stack.com/en/core/M5Dial)). The M5Dial is a panel mount device that mounts thru a 45mm hole. There are other ESP32 rotary encoders out there, but I would not expect them work out of the box with this project.
 - A modern Denon/Marantz AVR reachable over Wi-Fi (developed against an AVR-X4800H; see `src/denon.py` for the HTTP control API details)
 
 ## Setup
