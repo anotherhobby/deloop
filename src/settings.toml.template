@@ -29,6 +29,10 @@ AVR_HOST = "192.168.1.100"
 # MINIDSP_PORT          = "5380"
 # MINIDSP_DEVICE_INDEX  = "0"
 # MINIDSP_PRESET_COUNT  = "4"    # set to your unit's actual config slot count
+# Human-readable names for config slots 0..N-1, comma-separated and in
+# order. Any slot left unnamed (including all of them, if this is unset)
+# falls back to "Preset 1", "Preset 2", etc.
+# MINIDSP_PRESET_NAMES  = "Movie,Music,Night,Flat"
 # Switching config slots/presets is a full DSP reconfiguration -- minidsp-rs's
 # POST doesn't return until it's actually applied, measured ~4s on a real
 # Flex. Raise this if yours is slower; too short and the request silently
