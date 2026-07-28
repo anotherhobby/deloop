@@ -15,11 +15,19 @@ class AVRState:
         self.power = "STANDBY"
         self.input = ""
 
-        # Dirac Live -- loaded from AVR at boot via denon.get_dirac_filters().
-        # dirac_filter: '0'=Off, '1'=first filter, '2'=second filter
-        # dirac_names:  list of (value, name) from get_dirac_filters()
-        self.dirac_filter = "1"   # "1" = Off; real value fetched at boot
-        self.dirac_names  = [("2", "Filter 1"), ("1", "Off")]  # placeholder
+        # Presets -- a device-specific "pick one of a few stored configs"
+        # menu (Dirac Live filters on Denon, DSP config slots on MiniDSP;
+        # see driver.py's CAPS["presets"]). Loaded at boot via
+        # driver.get_presets(); empty for drivers that don't support it.
+        # preset:       currently selected slot's value, as a string
+        # preset_names: list of (value, name) from get_presets() -- real
+        #               slots only, never a synthetic "off" entry
+        # preset_enabled: whether that slot is actually engaged, independent
+        #               of which one is selected (see CAPS["preset_enable"]
+        #               and driver.get_preset_enabled()/set_preset_enabled())
+        self.preset         = ""
+        self.preset_names   = []
+        self.preset_enabled = True
 
         # Input list -- loaded from AVR at boot via denon.get_inputs().
         # input_names: list of (index, friendly_name)

@@ -7,11 +7,43 @@
 WIFI_SSID = "your_wifi_ssid"
 WIFI_PASS = "your_wifi_password"
 
-# Denon/Marantz AVR (required)
+# Which device backend to use: "denon" (default) or "minidsp".
+# See README.md "Device backends" for what each one supports.
+# DEVICE_DRIVER = "denon"
+
+# --- Denon/Marantz AVR (required if DEVICE_DRIVER = "denon") ---
 AVR_HOST = "192.168.1.100"
+# AVR_PORT          = "8080"
+
+# --- minidsp-rs daemon (required if DEVICE_DRIVER = "minidsp") ---
+# Host running minidsp-rs with the MiniDSP attached over USB -- NOT the
+# DSP's own address. Running it with no --config at all already binds the
+# HTTP API to 0.0.0.0:5380 (all interfaces) by default, so it may already
+# be reachable over the LAN with zero extra setup. If you do use a config
+# file, make sure its [http_server] bind_address isn't left at the
+# restrictive "127.0.0.1:5380" the docs' example ships with -- that's
+# localhost-only. A config file only takes effect if you pass it explicitly
+# via `--config /path/to/file.toml` on the daemon's command line; there's no
+# default path it looks for.
+# MINIDSP_HOST          = "192.168.1.101"
+# MINIDSP_PORT          = "5380"
+# MINIDSP_DEVICE_INDEX  = "0"
+# MINIDSP_PRESET_COUNT  = "4"    # set to your unit's actual config slot count
+# Switching config slots/presets is a full DSP reconfiguration -- minidsp-rs's
+# POST doesn't return until it's actually applied, measured ~4s on a real
+# Flex. Raise this if yours is slower; too short and the request silently
+# times out client-side before the display ever updates (and an abandoned
+# in-flight request seems able to crash minidsp-rs itself).
+# MINIDSP_PRESET_TIMEOUT = "10000"
+# Only needed if more than one MiniDSP unit is ever attached to that host at
+# once: /devices' array order depends on USB enumeration order, which isn't
+# stable across reconnects/reboots. Setting this pins to a specific unit by
+# serial number instead of index -- see "version.serial" in `make probe-minidsp`.
+# MINIDSP_SERIAL        = ""
 
 # Optional overrides (safe to leave commented out)
-# AVR_PORT          = "8080"
+# VOLUME_MIN        = "-80.0"  # dB; per-driver default set in config.py
+# VOLUME_MAX        = "18.0"   # dB; per-driver default set in config.py
 # VOLUME_STEP       = "0.5"    # dB per tick at normal speed
 # VOLUME_STEP_FAST  = "2.0"    # dB per tick when spinning fast
 # ACCEL_THRESHOLD   = "100"     # ms between ticks that triggers fast mode

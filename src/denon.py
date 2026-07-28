@@ -19,6 +19,14 @@
 
 import config
 
+# Capability flags + menu labels -- see driver.py for the full contract.
+# preset_select_enables=True: the AVR's DiracLive value IS the filter
+# selection -- there's no way to pick a filter without engaging it, so
+# set_preset() always implies enabled.
+CAPS = {"power": True, "input_select": True, "presets": True,
+        "preset_enable": True, "preset_select_enables": True}
+LABELS = {"input_select": "Input", "presets": "Dirac Live"}
+
 _session = None
 _BASE    = "{}://{}:{}".format(config.AVR_SCHEME, config.AVR_HOST, config.AVR_PORT)
 _BASE_UI = "http://{}:{}".format(config.AVR_HOST, config.AVR_PORT_UI)
@@ -287,19 +295,6 @@ def _ui_get(path, params=""):
         resp.close()
 
 
-def _ui_set(path, type_id, element, value):
-    """Send a set_config command via GET with URL-encoded XML data.
-
-    The web UI sends: GET /ajax/.../set_config?type=N&data=<Element>value</Element>
-    where the XML is percent-encoded.
-    """
-    xml  = "<{0}>{1}</{0}>".format(element, value)
-    qs   = "type={}&data={}".format(type_id, _xml_encode(xml))
-    url  = _BASE_UI + path + "?" + qs
-    resp = _session.get(url, timeout=_TIMEOUT)
-    resp.close()
-
-
 # ---------------------------------------------------------------------------
 # Source (input) list -- port 11080 web UI
 # ---------------------------------------------------------------------------
@@ -360,18 +355,64 @@ def set_input(index):
     resp.close()
 
 
-def get_dirac_filters():
-    """Return (current_value, names) for Dirac Live filters.
+# Two different endpoints are involved here, confirmed against a real
+# AVR-X4800H:
+#
+#   Read (GET /ajax/audio/set_config?type=14, web UI port): reliable for
+#   polling. "Value" uses index+2 (index=0 -> "2", index=1 -> "3", ...);
+#   "1" is reported when Off, but there's only one dimension on the wire --
+#   Off is just another value in the same enumeration as the real filters,
+#   not an independent bit, and the AVR forgets which filter was active
+#   once you leave this state.
+#
+#   Write: that same ajax endpoint (POST-via-GET /ajax/audio/set_config)
+#   silently ignores "0" and "1" -- there is no way to reach Off through
+#   it. Turning Dirac off (or back on) actually requires the legacy
+#   control API on port 8080 (the same command family already used for
+#   volume/mute/power elsewhere in this file): GET
+#   /goform/formiPhoneAppDirect.xml?PSDIRAC%20{arg}, where {arg} is "OFF"
+#   or a *1-indexed* slot number ("1","2","3",...) -- one less than the
+#   ajax Value for the same filter. This matches how the denonavr library
+#   (python-denonavr, used by Home Assistant) controls Dirac Live.
+#   Confirmed working, but the AVR takes several seconds (~5s observed) to
+#   actually apply a Dirac change -- code.py updates state optimistically
+#   rather than re-querying right after a set, same as volume/mute.
+#
+# get_presets()/set_preset() hide the Off value entirely and deal only in
+# real filters (ajax-value encoded); get_preset_enabled()/
+# set_preset_enabled() reconstruct an independent enabled/disabled
+# dimension on top, remembering the last real filter locally (in
+# _last_active) since the AVR itself forgets which one was selected once
+# you set it to Off.
+_OFF_VALUE = "1"
+_last_active = None   # last real (non-Off) filter value seen or set, ajax-encoded
 
-    Confirmed value encoding on AVR-X4800H:
-      "1"          = Off (no filter applied)
-      "2"          = first filter  (Name index="0")
-      "3"          = second filter (Name index="1")
-      str(index+2) = any filter
-    Off is always listed last in the menu.
-    """
+
+def _set_dirac_control(control_arg):
+    """GET /goform/formiPhoneAppDirect.xml?PSDIRAC%20{control_arg} (port 8080)."""
+    _send("/goform/formiPhoneAppDirect.xml?PSDIRAC%20{}".format(control_arg))
+
+
+def _ajax_value_to_control_slot(value):
+    """Ajax Value ('2','3',...) -> control API's 1-indexed slot ('1','2',...)."""
+    return str(int(value) - 1)
+
+
+def _get_dirac_value():
+    """Raw current DiracLive value straight off the AVR ("1" if Off)."""
     xml = _ui_get("/ajax/audio/get_config", "type=14")
-    current = (_tag(xml, "Value") or "1").strip()
+    return (_tag(xml, "Value") or _OFF_VALUE).strip()
+
+
+def get_presets():
+    """Return (current_value, [(value, name), ...]) -- real Dirac filters
+    only, no synthetic "Off" entry. This is the Denon driver's "presets"
+    capability -- see driver.py for the generic contract other drivers
+    implement differently.
+    """
+    global _last_active
+    xml = _ui_get("/ajax/audio/get_config", "type=14")
+    current = (_tag(xml, "Value") or _OFF_VALUE).strip()
 
     names = []
     pos = 0
@@ -392,10 +433,34 @@ def get_dirac_filters():
             names.append((value, name_str))
         pos = end + 7
 
-    names.append(("1", "Off"))  # Off = value "1", always last
-    return current, names
+    if current != _OFF_VALUE:
+        _last_active = current
+    elif _last_active is None and names:
+        # Booting while Off: the AVR has no memory of which filter was last
+        # active, so this is a best guess (first filter) rather than a fact.
+        _last_active = names[0][0]
+
+    return (_last_active if _last_active is not None else current), names
 
 
-def set_dirac_filter(value):
-    """Set Dirac Live filter. value: '0'=Off, '1'=first filter, '2'=second."""
-    _ui_set("/ajax/audio/set_config", "14", "DiracLive", value)
+def set_preset(value):
+    """Select and enable a Dirac filter. value: '2'=first filter, '3'=second,
+    etc. (the ajax-Value encoding get_presets() returns)."""
+    global _last_active
+    _last_active = value
+    _set_dirac_control(_ajax_value_to_control_slot(value))
+
+
+def get_preset_enabled():
+    """True unless Dirac Live is currently set to Off."""
+    return _get_dirac_value() != _OFF_VALUE
+
+
+def set_preset_enabled(enabled):
+    """Toggle Dirac Live on/off without forgetting which filter is selected."""
+    if enabled:
+        if _last_active is None:
+            return   # nothing known to re-enable yet
+        _set_dirac_control(_ajax_value_to_control_slot(_last_active))
+    else:
+        _set_dirac_control("OFF")

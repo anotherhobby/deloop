@@ -58,12 +58,14 @@ fonts:
 # Shared file copy step used by both targets above.
 _copy-files:
 	cp src/settings.toml $(CIRCUITPY)/settings.toml
-	cp src/config.py  $(CIRCUITPY)/config.py
-	cp src/denon.py   $(CIRCUITPY)/denon.py
-	cp src/state.py   $(CIRCUITPY)/state.py
-	cp src/dial_ui.py $(CIRCUITPY)/dial_ui.py
-	cp src/sound.py   $(CIRCUITPY)/sound.py
-	cp src/code.py    $(CIRCUITPY)/code.py
+	cp src/config.py   $(CIRCUITPY)/config.py
+	cp src/driver.py   $(CIRCUITPY)/driver.py
+	cp src/denon.py    $(CIRCUITPY)/denon.py
+	cp src/minidsp.py  $(CIRCUITPY)/minidsp.py
+	cp src/state.py    $(CIRCUITPY)/state.py
+	cp src/dial_ui.py  $(CIRCUITPY)/dial_ui.py
+	cp src/sound.py    $(CIRCUITPY)/sound.py
+	cp src/code.py     $(CIRCUITPY)/code.py
 	cp src/splash_logo.bmp $(CIRCUITPY)/splash_logo.bmp
 	mkdir -p $(CIRCUITPY)/fonts
 	cp src/fonts/FreeMonoBold_36.pcf $(CIRCUITPY)/fonts/FreeMonoBold_36.pcf
@@ -91,9 +93,18 @@ probe:
 	$(PYTHON) tools/probe_denon.py --host $(AVR_HOST) --port $(AVR_PORT) $(PROBE_ARGS)
 
 # Dump full AVR state using python-denonavr (same lib as Home Assistant).
-# Run once to discover API version, endpoints, and working command format.
+# Run once to discover API version, endpoint, and working command format.
 # Requires: ./.venv/bin/pip install denonavr
 dump-avr:
 	$(PYTHON) tools/dump_denonavr.py --host $(AVR_HOST)
 
-.PHONY: bootstrap install-libs full-deploy deploy _copy-files ls shell probe dump-avr renders
+# Run the host-side minidsp-rs HTTP probe (requires the daemon reachable
+# on the network -- see settings.toml.template's minidsp section).
+# Usage: make probe-minidsp
+#        make probe-minidsp PROBE_ARGS=--skip-write
+MINIDSP_HOST ?= $(shell grep '^MINIDSP_HOST' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
+MINIDSP_PORT ?= $(shell grep '^MINIDSP_PORT' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' | grep -o '[0-9]*')
+probe-minidsp:
+	$(PYTHON) tools/probe_minidsp.py --host $(or $(MINIDSP_HOST),127.0.0.1) --port $(or $(MINIDSP_PORT),5380) $(PROBE_ARGS)
+
+.PHONY: bootstrap install-libs full-deploy deploy _copy-files ls shell probe dump-avr probe-minidsp renders
