@@ -1,5 +1,7 @@
 # Local settings with WiFi credentials and AVR IP -- never commit
 src/settings.toml
+src/settings.toml.minidsp
+src/settings.toml.denon
 
 # Python
 .venv/

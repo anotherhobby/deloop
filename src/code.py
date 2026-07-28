@@ -5,11 +5,12 @@
 #                           (if muted, stays blue during the turn and
 #                           unmutes with a full-color reveal once it stops)
 #   - Encoder press      -> open menu / select item / confirm
-#   - Touch tap          -> above the dirac name line: mute toggle; at/below
-#                           it: Dirac quick-select button, else no-op
+#   - Touch tap          -> above the preset name line: mute toggle; at/below
+#                           it: preset quick-select button, else no-op
 #                           (MAIN mode); select / close (MENU mode)
-#   - Touch 1.5 s hold   -> power toggle (MAIN mode only)
-#   - Poll adaptive      -> AVR ground-truth sync
+#   - Touch 1.5 s hold   -> power toggle (MAIN mode only, if the driver
+#                           supports it -- see driver.CAPS["power"])
+#   - Poll adaptive      -> device ground-truth sync
 
 import time
 import gc
@@ -23,7 +24,7 @@ import adafruit_requests
 from adafruit_focaltouch import Adafruit_FocalTouch
 
 import config
-import denon
+import driver
 import dial_ui
 import sound
 from state import AVRState
@@ -34,7 +35,7 @@ _MAX_ERRORS = 5
 MODE_MAIN     = 0
 MODE_MENU_TOP = 1   # top-level menu
 MODE_MENU_DEV = 2   # Device submenu (Brightness, Sound, Restart)
-MODE_MENU_SUB = 3   # leaf submenu (inputs, Dirac, brightness adjuster, sound picker)
+MODE_MENU_SUB = 3   # leaf submenu (inputs, presets, brightness adjuster, sound picker)
 MODE_ERROR    = 4   # network/AVR error – tap anywhere to restart
 
 # NVM slot for persisting brightness (byte 0 = brightness * 100)
@@ -103,8 +104,20 @@ def _connect_wifi(ui):
     wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
 
 
+def _top_menu_entries():
+    """(sub_type, label) pairs for the top-level menu, filtered by what the
+    active driver actually supports -- see driver.CAPS / driver.LABELS."""
+    entries = []
+    if driver.CAPS["input_select"]:
+        entries.append(("input", driver.LABELS["input_select"]))
+    if driver.CAPS["presets"]:
+        entries.append(("preset", driver.LABELS["presets"]))
+    entries.append(("device", "Device"))
+    return entries
+
+
 def _build_top_menu():
-    return ["Input", "Dirac Live", "Device"]
+    return [label for _, label in _top_menu_entries()]
 
 
 def _build_dev_menu():
@@ -115,8 +128,8 @@ def _build_sub_items(sub_type, state):
     """Return list of display strings for a submenu."""
     if sub_type == "input":
         return [name for _, name in state.input_names]
-    if sub_type == "dirac":
-        return [name for _, name in state.dirac_names]
+    if sub_type == "preset":
+        return [name for _, name in state.preset_names]
     if sub_type == "brightness":
         pct = int(round(state.brightness * 100))
         return ["            {} %\n(rotate to adjust)".format(pct)]
@@ -125,25 +138,18 @@ def _build_sub_items(sub_type, state):
     return []
 
 
-def _open_submenu(menu_cursor, state):
-    """Resolve a non-Device top-menu item into (sub_type, sub_cursor, title, items)."""
-    item = _build_top_menu()[menu_cursor]
-    if item == "Input":
-        sub_type = "input"
-        sc = 0
+def _open_submenu(sub_type, label, state):
+    """Resolve a non-Device top-menu entry into (sub_type, sub_cursor, title, items)."""
+    sc = 0
+    if sub_type == "input":
         indices = [i for i, _ in state.input_names]
         if state.input_index in indices:
             sc = indices.index(state.input_index)
-    elif item == "Dirac Live":
-        sub_type = "dirac"
-        sc = 0
-        vals = [v for v, _ in state.dirac_names]
-        if state.dirac_filter in vals:
-            sc = vals.index(state.dirac_filter)
-    else:
-        sub_type = "input"  # fallback
-        sc = 0
-    return sub_type, sc, item.upper(), _build_sub_items(sub_type, state)
+    elif sub_type == "preset":
+        vals = [v for v, _ in state.preset_names]
+        if state.preset in vals:
+            sc = vals.index(state.preset)
+    return sub_type, sc, label.upper(), _build_sub_items(sub_type, state)
 
 
 def _enter_dev_sub(item, state, ui, sound_mod):
@@ -159,22 +165,37 @@ def _enter_dev_sub(item, state, ui, sound_mod):
     return None, 0
 
 
-def _confirm_sub(sub_type, sub_cursor, state):
+def _confirm_sub(sub_type, sub_cursor, state, ui):
     """Apply sub-menu selection (side-effects only)."""
     if sub_type == "input":
         index, _ = state.input_names[sub_cursor]
         try:
-            denon.set_input(index)
+            driver.set_input(index)
             state.input_index = index
         except Exception as e:
             print("set_input:", e)
-    elif sub_type == "dirac":
-        val, _ = state.dirac_names[sub_cursor]
+    elif sub_type == "preset":
+        val, _ = state.preset_names[sub_cursor]
         try:
-            denon.set_dirac_filter(val)
-            state.dirac_filter = val
+            # Some backends (confirmed on MiniDSP: ~4-10s) block for real
+            # seconds applying a preset change -- paint a static "please
+            # wait" frame first since the loop can't animate meanwhile.
+            dial_ui.draw_busy(ui, state)
+            driver.set_preset(val)
+            # Optimistic, like volume/mute elsewhere -- some backends (Denon)
+            # take several seconds to actually apply a preset change, so an
+            # immediate re-query would just read back stale state.
+            state.preset = val
+            # Only flip to enabled if this backend's set_preset() actually
+            # does that itself (see CAPS["preset_select_enables"] in
+            # driver.py) -- on MiniDSP, preset and Dirac on/off are
+            # independent, and a slot may deliberately want Dirac left off
+            # (e.g. a headphone config), so switching slots must leave
+            # state.preset_enabled exactly as it was.
+            if driver.CAPS["preset_select_enables"]:
+                state.preset_enabled = True
         except Exception as e:
-            print("set_dirac:", e)
+            print("set_preset:", e)
     elif sub_type == "brightness":
         _save_brightness(state.brightness)
     elif sub_type == "sound":
@@ -236,7 +257,7 @@ class _Loop:
         self.dev_cursor  = 0    # cursor within Device submenu
         self.sub_cursor  = 0
         self.sub_scroll  = 0    # first visible item in sub-menu (for long lists)
-        self.sub_type    = None    # "input", "dirac", "brightness", "sound"
+        self.sub_type    = None    # "input", "preset", "brightness", "sound"
         self.menu_idle   = 0.0     # monotonic time of last menu interaction
 
         self.mute_phase_origin  = 0.0     # monotonic time the current pulse cycle started
@@ -270,13 +291,13 @@ def _handle_encoder_button(loop, ui, state, btn, now):
     if loop.mode == MODE_MENU_TOP:
         if loop.menu_cursor < 0:
             return   # nothing highlighted yet; ignore button until rotary selects
-        item = _build_top_menu()[loop.menu_cursor]
-        if item == "Device":
+        sub_type, label = _top_menu_entries()[loop.menu_cursor]
+        if sub_type == "device":
             loop.dev_cursor = -1
             loop.mode = MODE_MENU_DEV
             dial_ui.draw_menu(ui, "DEVICE", _build_dev_menu(), loop.dev_cursor, clear_bg=True)
         else:
-            loop.sub_type, loop.sub_cursor, title, items = _open_submenu(loop.menu_cursor, state)
+            loop.sub_type, loop.sub_cursor, title, items = _open_submenu(sub_type, label, state)
             loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
             loop.mode = MODE_MENU_SUB
             vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
@@ -297,7 +318,7 @@ def _handle_encoder_button(loop, ui, state, btn, now):
 
     if loop.mode == MODE_MENU_SUB:
         if loop.sub_cursor >= 0:
-            _confirm_sub(loop.sub_type, loop.sub_cursor, state)
+            _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui)
         # sub_cursor < 0: no item selected yet — button press closes without applying
         loop.mode = MODE_MAIN
         dial_ui.exit_menu(ui)
@@ -360,8 +381,8 @@ def _handle_encoder_rotation(loop, ui, state, encoder, now):
         items = _build_sub_items(loop.sub_type, state)
         loop.sub_cursor = 0 if loop.sub_cursor < 0 else (loop.sub_cursor - delta) % len(items)
         loop.sub_scroll = _scroll_for(loop.sub_cursor, loop.sub_scroll, len(items))
-        if loop.sub_type == "input":     title = "INPUT"
-        elif loop.sub_type == "dirac":   title = "DIRAC LIVE"
+        if loop.sub_type == "input":     title = driver.LABELS["input_select"].upper()
+        elif loop.sub_type == "preset":  title = driver.LABELS["presets"].upper()
         elif loop.sub_type == "sound":   title = "SOUND"
         else:                            title = loop.sub_type.upper()
         vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
@@ -388,9 +409,9 @@ def _send_volume_debounced(loop, ui, state, now):
     was_muted = state.muted
     try:
         if was_muted:
-            denon.mute_off()
+            driver.mute_off()
             state.muted = False
-        denon.set_volume(state.volume_db)
+        driver.set_volume(state.volume_db)
         loop.error_count = 0
     except Exception as e:
         print("volume debounce send:", e)
@@ -445,7 +466,7 @@ def _handle_touch_down(loop, ui, state, touch, now):
             loop.touch_x = pt[0]
 
     held = now - loop.touch_start
-    if loop.touch_power_fired or held < TOUCH_POWER_S:
+    if not driver.CAPS["power"] or loop.touch_power_fired or held < TOUCH_POWER_S:
         return
 
     # Power toggle must be checked first – it works in any power state
@@ -454,19 +475,19 @@ def _handle_touch_down(loop, ui, state, touch, now):
     sound.click_heavy()
     try:
         if state.power == "ON":
-            denon.power_standby()
+            driver.power_standby()
             state.power = "STANDBY"
             # Ease brightness down instead of an instant cut; _fade_power_off
             # swaps in the power icon once dark and hands off to its pulse.
             loop.power_fade_from  = state.brightness
             loop.power_fade_start = now
         else:
-            denon.power_on()
+            driver.power_on()
             state.power = "ON"
             # Clear stale mute/volume so the display is clean
             # while the AVR boots. Poll will fill in real values.
             state.muted = False
-            state.volume_db = -80.0
+            state.volume_db = config.VOLUME_MIN
             dial_ui.flash_power_on(ui)
             dial_ui.draw_main(ui, state)
         loop.last_poll = time.monotonic() - 4.0  # poll in ~1s (5s interval - 4s)
@@ -509,13 +530,13 @@ def _tap_menu_top(loop, ui, state, now):
     sound.click()
     loop.menu_idle = now
     loop.menu_cursor = tapped
-    item = top_items[loop.menu_cursor]
-    if item == "Device":
+    sub_type, label = _top_menu_entries()[loop.menu_cursor]
+    if sub_type == "device":
         loop.dev_cursor = -1
         loop.mode = MODE_MENU_DEV
         dial_ui.draw_menu(ui, "DEVICE", _build_dev_menu(), loop.dev_cursor, clear_bg=True)
     else:
-        loop.sub_type, loop.sub_cursor, title, items = _open_submenu(loop.menu_cursor, state)
+        loop.sub_type, loop.sub_cursor, title, items = _open_submenu(sub_type, label, state)
         loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
         loop.mode = MODE_MENU_SUB
         vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
@@ -552,7 +573,7 @@ def _tap_menu_sub(loop, ui, state, now):
         sound.click()
         loop.menu_idle = now
         loop.sub_cursor = loop.sub_scroll + tapped
-        _confirm_sub(loop.sub_type, loop.sub_cursor, state)
+        _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui)
     else:
         sound.click()
     loop.mode = MODE_MAIN
@@ -579,10 +600,10 @@ def _tap_toggle_mute(loop, ui, state, now):
     sound.click()
     try:
         if state.muted:
-            denon.mute_off()
+            driver.mute_off()
             state.muted = False
         else:
-            denon.mute_on()
+            driver.mute_on()
             state.muted = True
             _start_mute_pulse(loop, now)
         dial_ui.draw_main(ui, state)
@@ -594,28 +615,58 @@ def _tap_toggle_mute(loop, ui, state, now):
 
 
 def _tap_main_screen(loop, ui, state, now):
-    """Tap above the dirac name line -> toggle mute. At or below that line,
+    """Tap above the preset name line -> toggle mute. At or below that line,
     only the quick-select buttons respond -- everything else there is a
     no-op, so the button row doesn't accidentally toggle mute too."""
-    if loop.touch_y < dial_ui.DIRAC_NAME_Y:
+    if loop.touch_y < dial_ui.PRESET_NAME_Y:
         _tap_toggle_mute(loop, ui, state, now)
         return
 
-    idx = dial_ui.dirac_button_at(loop.touch_x, loop.touch_y, len(state.dirac_names))
+    idx = dial_ui.preset_button_at(loop.touch_x, loop.touch_y, len(state.preset_names))
     if idx == -1:
         return
 
+    vals = [v for v, _ in state.preset_names]
+    selected_idx = vals.index(state.preset) if state.preset in vals else -1
+
+    if idx == selected_idx and not driver.CAPS["preset_enable"]:
+        return   # nothing to toggle -- this slot has no on/off concept
+
     sound.click()
-    val, _name = state.dirac_names[idx]
     try:
-        denon.set_dirac_filter(val)
-        state.dirac_filter = val
+        # Some backends (confirmed on MiniDSP: ~4-10s) block for real
+        # seconds applying a preset change -- paint a static "please wait"
+        # frame first since the loop can't animate meanwhile.
+        dial_ui.draw_busy(ui, state)
+        if idx == selected_idx:
+            # Tapping the already-active slot toggles it in place instead of
+            # switching slots -- keeps "which config is loaded" visible (see
+            # dial_ui.py's button coloring) even while disabled.
+            new_enabled = not state.preset_enabled
+            driver.set_preset_enabled(new_enabled)
+            state.preset_enabled = new_enabled
+        else:
+            val, _name = state.preset_names[idx]
+            driver.set_preset(val)
+            state.preset = val
+            # Only flip to enabled if this backend's set_preset() actually
+            # does that itself (see CAPS["preset_select_enables"] in
+            # driver.py) -- on MiniDSP, preset and Dirac on/off are
+            # independent, and a slot may deliberately want Dirac left off
+            # (e.g. a headphone config), so switching slots must leave
+            # state.preset_enabled exactly as it was.
+            if driver.CAPS["preset_select_enables"]:
+                state.preset_enabled = True
+        # Optimistic, like volume/mute elsewhere -- some backends (Denon)
+        # take several seconds to actually apply a preset change, so an
+        # immediate re-query would just read back stale state.
         dial_ui.draw_main(ui, state)
         loop.last_poll = time.monotonic()
         loop.error_count = 0
     except Exception as e:
-        print("set_dirac (quick):", e)
+        print("set_preset (quick):", e)
         loop.error_count += 1
+        dial_ui.draw_main(ui, state)   # clear the busy frame even on failure
 
 
 def _dispatch_tap(loop, ui, state, now):
@@ -691,12 +742,12 @@ def _poll_now(loop, ui, state, now):
         was_standby = state.power != "ON"
         was_on      = state.power == "ON"
         was_muted   = state.muted
-        status = denon.get_status()
+        status = driver.get_status()
         changed = state.apply_status(status)
 
         if was_standby and state.power == "ON" and not loop.first_poll:
             # AVR just powered on externally – show splash then normal UI.
-            state.volume_db = -80.0
+            state.volume_db = config.VOLUME_MIN
             changed = True
             dial_ui.flash_power_on(ui)
             powered_on_externally = True
@@ -851,23 +902,24 @@ def main():
             except Exception:
                 pass
 
-    # --- HTTP session (plain HTTP, port 8080 -- AVR-X4800H control API) ---
+    # --- HTTP session (device backend selected by config.DEVICE_DRIVER) ---
     pool = socketpool.SocketPool(wifi.radio)
     session = adafruit_requests.Session(pool)
-    denon.init(session)
+    driver.init(session)
 
-    # Fetch input friendly names and source list (for menu) once at boot
+    # Fetch input friendly names and source list (for menu) once at boot.
+    # No-ops for drivers that don't support input selection (driver.CAPS).
     try:
-        denon.load_input_names()
+        driver.load_input_names()
     except Exception as e:
         print("load_input_names:", e)
 
     try:
-        denon.load_source_list()
+        driver.load_source_list()
     except Exception as e:
         print("load_source_list:", e)
 
-    # --- AVR state ---
+    # --- device state ---
     state = AVRState()
     state.brightness = _load_brightness()
     sound.enabled    = _load_sound()
@@ -879,15 +931,16 @@ def main():
     # cumulative heap fragmentation, so this matters most right here.
     gc.collect()
     try:
-        state.input_index, state.input_names = denon.get_inputs()
+        state.input_index, state.input_names = driver.get_inputs()
     except Exception as e:
         print("get_inputs:", e, "| free mem:", gc.mem_free())
 
     gc.collect()
     try:
-        state.dirac_filter, state.dirac_names = denon.get_dirac_filters()
+        state.preset, state.preset_names = driver.get_presets()
+        state.preset_enabled = driver.get_preset_enabled()
     except Exception as e:
-        print("get_dirac_filters:", e, "| free mem:", gc.mem_free())
+        print("get_presets:", e, "| free mem:", gc.mem_free())
 
     loop = _Loop()
     loop.last_pos = encoder.position

@@ -256,11 +256,12 @@ def save(ui, name):
 
 def _base_state():
     state = AVRState()
-    state.power        = "ON"
-    state.brightness   = 1.0
-    state.input        = "SAT/CBL"
-    state.dirac_filter = "2"
-    state.dirac_names  = [("2", "Movie"), ("3", "Music"), ("1", "Off")]
+    state.power          = "ON"
+    state.brightness     = 1.0
+    state.input          = "SAT/CBL"
+    state.preset         = "2"
+    state.preset_names   = [("2", "Movie"), ("3", "Music")]
+    state.preset_enabled = True
     return state
 
 
@@ -286,6 +287,11 @@ def main():
     dial_ui.draw_main(ui, state)          # static muted frame (no live pulse here)
     save(ui, "main_muted")
     state.muted = False
+
+    state.preset_enabled = False          # tapped the active slot to disable it in place
+    dial_ui.draw_main(ui, state)
+    save(ui, "main_preset_disabled")
+    state.preset_enabled = True
 
     dial_ui.draw_status(ui, "connecting to wifi...")
     save(ui, "status_connecting")
