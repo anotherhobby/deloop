@@ -98,39 +98,33 @@ _DBTN_MAX  = 5     # pre-allocated label slots -- real AVRs use 2-3
 # _PRR and _BTNSEL_FILTER are aliases, not separate slots: both used to be
 # their own shade of orange, but they're the same colour as _ORG now, so
 # they just point at it instead of duplicating the palette entry.
-_BG    =  0   # black background
-_TRACK =  1   # dim arc track
-_GRN   =  2   # green   (≤ −20 dB)
-_AMB   =  3   # amber   (−20 … −10 dB)
-_ORG   =  4   # orange  (−10 … 0 dB); also power ring + selected-filter button
-_RED   =  5   # red     (≥   0 dB)
-_TK_S  =  6   # minor tick
-_TK_L  =  7   # major tick
-_TK_0  =  8   # 0 dB tick (bright)
-_PTR   =  9   # pointer wedge
-_BLUE  = 10   # muted arc fill
-_BLT   = 11   # muted arc track (dim blue)
-_BTNSEL_OFF    = 12   # dirac quick-select button: selected, and it's "Off"
-_BTNSEL_MUTED  = 13   # dirac quick-select button: selected filter, muted
+_BG    = 0   # black background
+_GRN   = 1   # green   (≤ −20 dB)
+_AMB   = 2   # amber   (−20 … −10 dB)
+_ORG   = 3   # orange  (−10 … 0 dB); also power ring + selected-filter button
+_RED   = 4   # red     (≥   0 dB)
+_TK_L  = 5   # tick mark (minor + major both use this)
+_TK_0  = 6   # 0 dB tick (bright)
+_PTR   = 7   # pointer wedge
+_BLUE  = 8   # muted arc fill
+_BTNSEL_OFF    = 9    # dirac quick-select button: selected, and it's "Off"
+_BTNSEL_MUTED  = 10   # dirac quick-select button: selected filter, muted
 _PRR            = _ORG   # power button ring / stem
 _BTNSEL_FILTER  = _ORG   # dirac quick-select button: selected filter, unmuted
 
 _PALETTE = [
     0x000000,  #  0 BG
-    0x181818,  #  1 TRACK
-    0x009940,  #  2 GREEN
-    0xBB8800,  #  3 AMBER
-    0xFF5500,  #  4 ORANGE (also power ring, selected-filter button outline)
-    0xAA1800,  #  5 RED
-    0x232323,  #  6 minor tick
-    0x474747,  #  7 major tick
-    0xDDDDDD,  #  8 zero-dB tick
-    0xEEEEEE,  #  9 pointer
-    0x0055BB,  # 10 blue (muted)
-    0x001133,  # 11 blue track dim (muted)
-    0xA7A7A7,  # 12 dirac button selected outline, Off            (matches _C_BTN_SEL)
-    0x2277CC,  # 13 dirac button selected outline, filter + muted  (matches _C_MUTED)
-]   # 14 entries; value_count=16 → 2 spare slots
+    0x009940,  #  1 GREEN
+    0xBB8800,  #  2 AMBER
+    0xFF5500,  #  3 ORANGE (also power ring, selected-filter button outline)
+    0xAA1800,  #  4 RED
+    0x474747,  #  5 tick mark
+    0xDDDDDD,  #  6 zero-dB tick
+    0xEEEEEE,  #  7 pointer
+    0x0055BB,  #  8 blue (muted)
+    0xA7A7A7,  #  9 dirac button selected outline, Off            (matches _C_BTN_SEL)
+    0x2277CC,  # 10 dirac button selected outline, filter + muted  (matches _C_MUTED)
+]   # 11 entries; value_count=16 → 5 spare slots
 
 # ── Label colours ─────────────────────────────────────────────────────────────
 _C_TEXT    = 0xEEEEEE
