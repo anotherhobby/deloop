@@ -260,7 +260,7 @@ def _base_state():
     state.brightness     = 1.0
     state.input          = "SAT/CBL"
     state.preset         = "2"
-    state.preset_names   = [("2", "Movie"), ("3", "Music")]
+    state.preset_names   = [("2", "Movie"), ("3", "Music"), ("4", "Night")]
     state.preset_enabled = True
     return state
 

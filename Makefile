@@ -25,21 +25,100 @@ install-libs:
 # full-deploy: everything from scratch -- libs, settings, code, fonts.
 # Run this after a fresh CircuitPython flash or when onboarding a new device.
 # Prerequisite: python -m venv .venv && make bootstrap (host tools, once per machine)
-full-deploy: install-libs _copy-files
+# Requires $(MPY_CROSS) -- see its comment below if you don't have it yet.
+full-deploy: install-libs deploy
 
-# deploy: fast iteration -- settings, code, fonts. No lib reinstall.
-deploy: _copy-files
+# deploy: what the device should actually run, day to day -- every module
+# except code.py precompiled to .mpy first (code.py must stay uncompiled
+# source; see its own header comment). Not just a flash-space optimization:
+# CircuitPython compiles a module's entire bytecode before running any of
+# it, so plain .py costs real heap at boot whether or not most of it has
+# run yet -- this used to be two separate targets (`deploy` for fast plain-
+# .py iteration, `deploy-mpy` for the real thing) until plain `deploy` got
+# run out of habit, silently regressing the device back into exactly the
+# low-headroom state that caused a real WiFi-boot failure investigation
+# (see "CircuitPython heap/boot-memory guardrails" in CLAUDE.md). Requires
+# $(MPY_CROSS) -- see its comment below if missing; compiling locally is
+# fast (milliseconds/file) so this isn't meaningfully slower than the old
+# plain-.py path was.
+deploy: _copy-files-mpy
+
+# deploy-src: plain, uncompiled .py -- NOT what the device should run day
+# to day (see `deploy` above). Real uses: no `local/mpy-cross` available
+# yet, or actively chasing a traceback where uncompiled source gives a
+# clearer on-device error than .mpy does. Requires no extra tooling.
+deploy-src: _copy-files
+
+# mpy-cross: path to the CircuitPython-matched mpy-cross binary -- NOT the
+# generic MicroPython one from pip (`pip install mpy-cross`); that targets
+# vanilla MicroPython and produces .mpy files this device's CircuitPython
+# will refuse to load. Check your device's exact version first:
+#   cat /Volumes/CIRCUITPY/boot_out.txt
+# then download the matching build from Adafruit's official bucket (linked
+# from https://learn.adafruit.com/welcome-to-circuitpython/library-file-types-and-frozen-libraries
+# -> "Creating an .mpy File"), e.g. for CircuitPython 10.2.1 on macOS arm64:
+#   curl -sL "https://adafruit-circuit-python.s3.amazonaws.com/bin/mpy-cross/macos/mpy-cross-macos-10.2.1-arm64" -o local/mpy-cross
+#   chmod +x local/mpy-cross
+# local/ is gitignored -- this binary is platform- and version-specific,
+# never commit it.
+MPY_CROSS := local/mpy-cross
+
+# Every module precompiled to .mpy by `deploy` -- everything except
+# code.py, which CircuitPython requires as uncompiled source (it's the boot
+# entry point, see code.py's own header comment). `.mpy` is more compact
+# than what the runtime compiler produces from `.py` source AND skips
+# paying that compile-time cost at all -- see CLAUDE.md's "CircuitPython
+# heap/boot-memory guardrails" for why that's not just a flash-space nicety.
+MPY_MODULES := config driver denon minidsp ha ha_ui state dial_ui sound app
+
+_copy-files-mpy:
+	cp src/settings.toml $(CIRCUITPY)/settings.toml
+	cp src/code.py     $(CIRCUITPY)/code.py
+	@rm -f $(addsuffix .py,$(addprefix $(CIRCUITPY)/,$(MPY_MODULES)))
+	@mkdir -p local/build
+	@for m in $(MPY_MODULES); do \
+	  $(MPY_CROSS) src/$$m.py -o local/build/$$m.mpy && \
+	  echo "  compiled $$m.mpy"; \
+	done
+	@# Compile to a local staging dir first, then cp to CIRCUITPY -- writing
+	@# mpy-cross's output directly to the mounted USB drive was observed to
+	@# take 100+ seconds per file (likely the mass-storage driver's flash
+	@# erase/write cycle); compiling locally (<10ms/file) then copying is
+	@# both far faster and consistent with how every other file in this
+	@# Makefile reaches the device.
+	@for m in $(MPY_MODULES); do \
+	  cp local/build/$$m.mpy $(CIRCUITPY)/$$m.mpy; \
+	done
+	cp src/splash_logo.bmp $(CIRCUITPY)/splash_logo.bmp
+	mkdir -p $(CIRCUITPY)/fonts
+	cp src/fonts/FreeMonoBold_36.pcf $(CIRCUITPY)/fonts/FreeMonoBold_36.pcf
+	@for s in $(FONT_SIZES); do \
+	  cp src/fonts/Inter_Medium_$${s}.pcf $(CIRCUITPY)/fonts/ && \
+	  echo "  copied Inter_Medium_$${s}.pcf"; \
+	done
 
 # fonts: (re)generate Inter PCF bitmaps from the TTF source.
 # Requires: brew install otf2bdf bdftopcf
-# Character set: printable ASCII 32-126 (A-Z a-z 0-9 punctuation), plus one
-# deliberate addition for the HA "Playing" status glyph: U+25B6 (9654,
-# BLACK RIGHT-POINTING TRIANGLE). Confirmed present in Inter Medium -- see
-# local/agent/project-context.md. "Paused" uses two plain capital I's
-# instead of a font addition -- U+2016 DOUBLE VERTICAL LINE was tried
-# first but renders far taller than every other glyph on that row (24px
-# vs 11-18px) and nearly touched the row above; capital I is already in
-# the base ASCII set and, at 14px, is much better proportioned.
+# Character set: printable ASCII 32-126 (A-Z a-z 0-9 punctuation) ONLY.
+#
+# Do not add a codepoint outside this contiguous range without reading
+# this note first. U+25B6 (BLACK RIGHT-POINTING TRIANGLE, for an HA
+# "Playing" glyph) was added here briefly and caused a real production
+# bug: PCF's encoding table apparently has to span from the lowest to the
+# highest included codepoint, so one glyph ~9500 codepoints above the
+# ASCII range ballooned every generated .pcf from ~8KB to ~20KB (confirmed
+# by isolating it: 32_126 alone -> 8184 bytes; +9654 -> 19564 bytes; +127
+# (adjacent to the existing range) -> 8184 bytes, no change). That's real
+# heap eaten at font-load time on every boot, before WiFi even connects --
+# it took down WiFi entirely on real hardware ("Unknown failure 2" /
+# WIFI_REASON_AUTH_EXPIRE, misleading since the real cause was upstream
+# memory pressure, not anything WiFi-specific) and cost a long real
+# debugging session to trace back to this. See project-context.md for the
+# full incident writeup. Both play and pause glyphs are plain ASCII now
+# ("|>" and "II") specifically to never hit this again -- if a Unicode
+# icon glyph is ever truly necessary, use otf2bdf's `-m mapfile` to
+# re-encode it onto a codepoint adjacent to the existing range instead of
+# just adding its real (possibly far-away) codepoint to `-l`.
 
 # splash: (re)generate the splash screen BMP from ui/hobbysprawl.png.
 # Requires: pip install pillow
@@ -54,22 +133,28 @@ renders:
 fonts:
 	@mkdir -p src/fonts
 	@for s in $(FONT_SIZES); do \
-	  otf2bdf -p $$s -l "32_126 9654" -r 72 $(FONT_TTF) \
+	  otf2bdf -p $$s -l "32_126" -r 72 $(FONT_TTF) \
 	    | bdftopcf -o src/fonts/Inter_Medium_$${s}.pcf && \
 	  echo "  Inter_Medium_$${s}.pcf  $$(ls -lh src/fonts/Inter_Medium_$${s}.pcf | awk '{print $$5}')"; \
 	done
 
-# Shared file copy step used by both targets above.
+# File copy step for deploy-src. Also strips any stale .mpy shadow of these
+# same modules left behind by a prior `deploy` -- CircuitPython's import
+# would otherwise have both a fresh .py and a stale .mpy for the same
+# module on the drive at once.
 _copy-files:
 	cp src/settings.toml $(CIRCUITPY)/settings.toml
+	@rm -f $(addsuffix .mpy,$(addprefix $(CIRCUITPY)/,$(MPY_MODULES)))
 	cp src/config.py   $(CIRCUITPY)/config.py
 	cp src/driver.py   $(CIRCUITPY)/driver.py
 	cp src/denon.py    $(CIRCUITPY)/denon.py
 	cp src/minidsp.py  $(CIRCUITPY)/minidsp.py
 	cp src/ha.py       $(CIRCUITPY)/ha.py
+	cp src/ha_ui.py    $(CIRCUITPY)/ha_ui.py
 	cp src/state.py    $(CIRCUITPY)/state.py
 	cp src/dial_ui.py  $(CIRCUITPY)/dial_ui.py
 	cp src/sound.py    $(CIRCUITPY)/sound.py
+	cp src/app.py      $(CIRCUITPY)/app.py
 	cp src/code.py     $(CIRCUITPY)/code.py
 	cp src/splash_logo.bmp $(CIRCUITPY)/splash_logo.bmp
 	mkdir -p $(CIRCUITPY)/fonts
@@ -124,4 +209,4 @@ probe-ha:
 	$(PYTHON) tools/probe_ha.py --host $(HA_HOST) --port $(or $(HA_PORT),8123) \
 	  --token "$(HA_TOKEN)" --entity $(or $(HA_ENTITY_ID),media_player.office) $(PROBE_ARGS)
 
-.PHONY: bootstrap install-libs full-deploy deploy _copy-files ls shell probe dump-avr probe-minidsp probe-ha renders
+.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha renders

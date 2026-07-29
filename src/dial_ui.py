@@ -131,16 +131,14 @@ _PLAYER_NAME_Y = PRESET_NAME_Y + 24
 _DBTN_Y0   = 156   # top of the button row
 
 # MENU hint position -- bottom-anchored on the normal/error screens (a
-# near-invisible tap-zone cue below everything else), but centered on the
-# power-off screen instead: the power icon is a ring (see _PWR_R_IN/_OUT
-# below), hollow in the middle apart from its stem near the top, so dead
-# center of the display is actually empty space there, not competing with
-# the icon the way a bottom placement copied verbatim from the main screen
-# would (see draw_main()'s power-off branch).
+# near-invisible tap-zone cue below everything else). On the power-off
+# screen, a backend with a UI extension (driver.ui_impl) can move it
+# instead -- see draw_main()'s power-off branch and ha_ui.standby_menu_pos(),
+# which centers it in the power icon's hollow middle for player_select
+# backends; a backend with none stays put, since standby's whole point
+# otherwise is "one button, nothing else competes for attention."
 _MENU_ANCHOR_MAIN    = (0.5, 1.0)
 _MENU_POS_MAIN       = (CX, 222)
-_MENU_ANCHOR_STANDBY = (0.5, 0.5)
-_MENU_POS_STANDBY    = (CX, CY)
 _DBTN_H    = 22    # button height
 _DBTN_W    = 22    # button width
 _DBTN_GAP  = 14    # horizontal gap between buttons
@@ -259,60 +257,47 @@ def preset_button_at(x, y, n):
 # (see _status_line() below), only ever populated for backends that set
 # state.media_state to "playing"/"paused" (currently ha.py -- see
 # driver.py's contract note). Lives at _PLAYER_NAME_Y, not PRESET_NAME_Y --
-# see _draw_status_rows()'s note on the swapped row order for HA. No x
-# range check: same "large touch target, ignore exact text width" approach
-# as the mute zone above PRESET_NAME_Y.
-_STATUS_TAP_HALF_H = 13
+# see _draw_status_rows()'s note on the swapped row order for HA.
+#
+# 42px is a middle ground for the skip icons' x-offset: the center content
+# isn't a fixed width ("Play" the word vs "II" the pause icon -- see
+# _PLAY_CHAR/_PAUSE_CHAR), and 42 was confirmed by rendering both states at
+# several offsets side by side as the value that keeps "Play" from touching
+# the icons without leaving "II" looking too sparse. Kept here (not in
+# ha_ui.py) because init() needs it below for initial label placement --
+# ha_ui.py's draw_status_rows() repositions from it every draw.
+_MEDIA_SIDE_X = 42   # x-offset from center for each icon
 
+# The actual hit-tests, row-swap logic, and standby-menu placement for
+# player_select backends all live in ha_ui.py (see driver.py's
+# "UI-extension contract") -- these four stay here, with these exact names,
+# because they're real entries in dial_ui's public API that app.py always
+# calls regardless of backend; they just no-op (return False) when no UI
+# extension is loaded, instead of app.py needing to know which backends
+# have one.
 
 def media_status_tap(x, y):
     """True if (x, y) falls within the play/pause status-text row. Only
     meaningful when state.media_state is "playing"/"paused" -- see
-    code.py's _tap_main_screen, which checks that first."""
-    return (_PLAYER_NAME_Y - _STATUS_TAP_HALF_H) <= y <= (_PLAYER_NAME_Y + _STATUS_TAP_HALF_H)
-
-
-# Skip-track icons ('<<'/'>>') flanking the Playing/Paused glyph, same row
-# -- checked before media_status_tap() in code.py so the narrow icon zones
-# take priority over that zone's own full-row "anywhere toggles play/pause"
-# target rather than shrinking it. 35px keeps the row tight and cohesive
-# now that the center content is a single glyph rather than a whole word
-# ("Playing"/"Paused") -- the original 55px offset was tuned for the word
-# and left a visibly large gap once it shrank to an icon (confirmed by
-# rendering 30/35/40/45px side by side; 35 was the best balance between
-# "tight" and not cramping the tap zones together).
-_MEDIA_SIDE_X      = 35   # x-offset from center for each icon
-_MEDIA_SIDE_HALF_W = 20   # tap zone half-width around each icon
-
-
-def _media_side_tap(x, y, center_x):
-    if not ((_PLAYER_NAME_Y - _STATUS_TAP_HALF_H) <= y <= (_PLAYER_NAME_Y + _STATUS_TAP_HALF_H)):
-        return False
-    return abs(x - center_x) <= _MEDIA_SIDE_HALF_W
+    app.py's _tap_main_screen, which checks that first."""
+    return _driver.ui_impl is not None and _driver.ui_impl.media_status_tap(x, y)
 
 
 def media_prev_tap(x, y):
-    """True if (x, y) falls on the '<' skip-back icon. Only meaningful
-    when state.media_state is "playing"/"paused"."""
-    return _media_side_tap(x, y, CX - _MEDIA_SIDE_X)
+    """True if (x, y) falls on the '<<' skip-back icon."""
+    return _driver.ui_impl is not None and _driver.ui_impl.media_prev_tap(x, y)
 
 
 def media_next_tap(x, y):
-    """True if (x, y) falls on the '>' skip-forward icon. Only meaningful
-    when state.media_state is "playing"/"paused"."""
-    return _media_side_tap(x, y, CX + _MEDIA_SIDE_X)
+    """True if (x, y) falls on the '>>' skip-forward icon."""
+    return _driver.ui_impl is not None and _driver.ui_impl.media_next_tap(x, y)
 
 
 def menu_standby_tap(x, y):
     """True if (x, y) falls within the power-off screen's centered MENU
-    zone -- the power ring's hollow middle (see _MENU_POS_STANDBY), radius
-    matching _PWR_R_IN so the tap target fills that empty space edge to
-    edge without spilling onto the ring itself. Only meaningful when
-    driver.CAPS["player_select"] -- see code.py's _dispatch_tap, which
-    checks that first."""
-    dx = x - CX
-    dy = y - CY
-    return (dx * dx + dy * dy) <= _PWR_R_IN * _PWR_R_IN
+    zone. Only meaningful when driver.CAPS["player_select"] -- see app.py's
+    _dispatch_tap, which checks that first."""
+    return _driver.ui_impl is not None and _driver.ui_impl.standby_menu_tap(x, y)
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 _GLYPHS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-. +/&()"
@@ -354,6 +339,22 @@ def _vol_to_angle(db):
 _FRAC_AMBER  = 0.60
 _FRAC_ORANGE = 0.70
 _FRAC_RED    = 0.80
+
+# Amber/orange above are just gradient waypoints with no dB meaning, but
+# red's start line IS meaningful whenever the range has an interior 0 dB
+# reference (_HAS_ZERO_REF): 0 dB is unity/reference level, a natural
+# "you're now loud" cutoff. That only lined up with the fixed 0.80 by
+# coincidence for one specific range (Denon's original -80..20); it drifted
+# audibly off 0 dB once VOLUME_MIN/MAX became configurable per-backend
+# (and per-install, via settings.toml). Realign red's start to the actual
+# 0 dB fraction instead -- but only when 0 dB sits in the range's interior,
+# past the orange waypoint and short of the range's own top extreme
+# (MiniDSP's 0 dB = max is already exactly the top of the arc; there's
+# nothing to realign there, and forcing it would make red vanish).
+if _HAS_ZERO_REF:
+    _zero_frac = (0.0 - _VOL_MIN) / (_VOL_MAX - _VOL_MIN)
+    if _FRAC_ORANGE < _zero_frac < 0.999:
+        _FRAC_RED = _zero_frac
 
 
 def _arc_color(angle):
@@ -571,6 +572,47 @@ def _draw_preset_buttons(bmp, n, selected_idx, selected_ci):
         _rect_outline(bmp, x0, y0, x1, y1, ci)
 
 
+# Play/pause icon geometry -- drawn directly into the gauge bitmap with the
+# same _tri() primitive the volume pointer uses, rather than as a font
+# glyph. This sidesteps the font-encoding-table-bloat risk entirely (see
+# the note above _PLAY_CHAR/_PAUSE_CHAR): a codepoint far outside the base
+# ASCII range balloons every generated .pcf's encoding table regardless of
+# how good the glyph itself looks (confirmed: U+25B6, the "right-pointing
+# triangle" Unicode glyph, renders fine at this size but still isn't worth
+# that cost when a few filled shapes do the same job with zero font
+# involvement). Sized to roughly match the row's font-rendered text height
+# (~16px) without touching the row above -- the exact failure mode that
+# sank an earlier Unicode pause-bar attempt.
+_ICON_HALF_H = 8    # half-height of both shapes
+_ICON_HALF_W = 7    # play triangle: tip-to-base half-width
+_ICON_BAR_W  = 4    # pause: width of each bar
+_ICON_GAP    = 4    # pause: gap between the two bars
+
+
+def draw_play_pause_icon(bmp, cx, cy, playing, ci):
+    """Draw a play triangle or pause bars centered at (cx, cy).
+
+    playing=True draws pause bars, not a pause icon's opposite -- a
+    play/pause control always shows the action a tap performs, not the
+    current state (see dial_ui.py's _MEDIA_STATE_TEXT note, same
+    convention, formerly font text, now this).
+    """
+    if playing:
+        for x0 in (cx - _ICON_GAP // 2 - _ICON_BAR_W, cx + _ICON_GAP // 2):
+            xa, xb = max(0, x0), min(_W, x0 + _ICON_BAR_W)
+            ya, yb = max(0, cy - _ICON_HALF_H), min(_H, cy + _ICON_HALF_H)
+            if _BT:
+                _bt.fill_region(bmp, xa, ya, xb, yb, ci)
+            else:
+                for y in range(ya, yb):
+                    for x in range(xa, xb):
+                        bmp[x, y] = ci
+    else:
+        _tri(bmp, cx - _ICON_HALF_W, cy - _ICON_HALF_H,
+                   cx - _ICON_HALF_W, cy + _ICON_HALF_H,
+                   cx + _ICON_HALF_W, cy, ci)
+
+
 def _restore_region(bmp, angle, muted):
     """Erase the pointer at `angle` by restoring the arc band and hollow.
 
@@ -660,39 +702,22 @@ def _preset_name(state):
     return ""
 
 
-def _player_name(state):
-    """Friendly name of the currently targeted device, for backends that
-    can switch between more than one (CAPS["player_select"], e.g. HA) --
-    shown so it's never ambiguous which one you're controlling. Blank for
-    everything else, and blank if the id somehow isn't in the discovered
-    list (load_players() always keeps at least one entry -- see ha.py --
-    but the lookup fails closed rather than showing a raw entity id)."""
-    if not _driver.CAPS["player_select"]:
-        return ""
-    for pid, name in state.player_names:
-        if pid == state.player_id:
-            return name
-    return ""
-
-
-# chr(9654) is an ASCII-safe escape for U+25B6 BLACK RIGHT-POINTING
-# TRIANGLE -- CircuitPython rejects non-ASCII bytes in source files (see
-# project-context.md's "Non-ASCII in source files" note), so this keeps
-# the source file itself pure ASCII while still resolving to the real
-# glyph at runtime. Confirmed present in the actual generated font via the
-# real adafruit_bitmap_font library (not just the source TTF) -- see
-# Makefile's `fonts` target; tools/dial_sim.py's render pipeline can't
-# validate this itself, since it renders labels via the source TTF
-# directly, bypassing the .pcf (see its module docstring).
-#
-# Pause is plain "II" (two capital I's), not a font glyph -- U+2016 DOUBLE
-# VERTICAL LINE was tried first but measured 24px tall in the real font
-# (vs 11-18px for every other glyph on this row) and nearly touched the
-# row above it. Capital I is already in the base ASCII set and measures a
-# well-proportioned 14px.
-_PLAY_CHAR  = chr(9654)   # 0x25B6 BLACK RIGHT-POINTING TRIANGLE
-_PAUSE_CHAR = "II"
-_MEDIA_STATE_TEXT = {"playing": _PLAY_CHAR, "paused": _PAUSE_CHAR}
+# Plain ASCII fallback text -- only actually rendered by the default (no
+# UI extension) path below, for a hypothetical future backend that reports
+# state.media_state without pairing a UI extension the way ha_ui.py does.
+# ha_ui.py itself draws real shapes instead (see draw_play_pause_icon()
+# above) -- avoids the font question entirely rather than picking a careful
+# ASCII substitute, after a Unicode glyph (U+25B6) balloon a generated
+# .pcf's encoding table enough to take down WiFi on real hardware (a
+# codepoint far outside the base ASCII range does that regardless of how
+# good the glyph itself looks -- see Makefile's `fonts` target).
+_PLAY_CHAR  = "Play"
+_PAUSE_CHAR = "Pause"
+# Shows the action a tap performs, not the current state -- same convention
+# as every other play/pause button (Spotify, YouTube, etc. show a pause
+# icon while playing, a play icon while paused). Inverted from a naive
+# state-name mapping on purpose.
+_MEDIA_STATE_TEXT = {"playing": _PAUSE_CHAR, "paused": _PLAY_CHAR}
 
 
 def _status_line(state):
@@ -706,54 +731,25 @@ def _status_line(state):
     return _MEDIA_STATE_TEXT.get(state.media_state, "")
 
 
-def _media_side_text(state):
-    """('<<', '>>') skip-track icon text when the status row is showing
-    Playing/Paused, else ('', '') -- same condition as _status_line()'s
-    media-state fallback, but only the two icons care about it, not the
-    preset-name case. Doubled rather than single '<'/'>' -- reads more
-    clearly as a "skip" chevron; Inter has no dedicated skip-track glyph
-    (checked: U+23ED/23EE/23E9/23EA are all absent), and a single '«'/'»'
-    (which Inter does have) renders too small/subtle to read as a skip icon
-    at this size -- confirmed by rendering both for comparison."""
-    if state.media_state in _MEDIA_STATE_TEXT:
-        return "<<", ">>"
-    return "", ""
-
-
 def _draw_status_rows(ui, state, dim_color):
-    """Render the two text rows below the volume number, plus the skip
-    icons (which flank whichever row ends up showing Playing/Paused).
+    """Render the text row(s) below the volume number, plus the skip icons.
 
-    Every backend except HA (CAPS["player_select"] False): preset/status
-    text in the upper row (PRESET_NAME_Y) exactly as before, lower row
-    blank -- unchanged from the original single-row layout.
-
-    HA: swapped from that -- the device name takes the upper row instead
-    of Playing/Paused, since which device you're controlling is always
-    relevant, while playback status is comparatively transient and reads
-    better below it. media_prev_tap()/media_next_tap()/media_status_tap()
-    hard-code the lower row's Y, matching wherever this puts the text they
-    flank -- keep them in sync if this ever becomes conditional on
-    something other than CAPS["player_select"].
+    Default (no UI extension loaded): preset/status text in the upper row
+    (PRESET_NAME_Y), lower row and skip icons blank -- one row, like the
+    original v1 layout. A backend with a paired UI extension (see driver.py's
+    "UI-extension contract") can replace this entirely -- ha_ui.py's
+    draw_status_rows() swaps in a two-row layout (device name up top,
+    Playing/Paused below it) plus the skip icons; see that module for why.
     """
-    if _driver.CAPS["player_select"]:
-        ui["preset"].text  = _player_name(state)
-        ui["preset"].color = _C_MENU
-        ui["player"].text  = _status_line(state)
-        ui["player"].color = dim_color
-        icon_y = _PLAYER_NAME_Y
-    else:
-        ui["preset"].text  = _status_line(state)
-        ui["preset"].color = dim_color
-        ui["player"].text  = ""
-        ui["player"].color = _C_MENU
-        icon_y = PRESET_NAME_Y
-
-    ui["media_prev"].anchored_position = (CX - _MEDIA_SIDE_X, icon_y)
-    ui["media_next"].anchored_position = (CX + _MEDIA_SIDE_X, icon_y)
-    ui["media_prev"].text, ui["media_next"].text = _media_side_text(state)
-    ui["media_prev"].color = dim_color
-    ui["media_next"].color = dim_color
+    if _driver.ui_impl is not None:
+        _driver.ui_impl.draw_status_rows(ui, state, dim_color)
+        return
+    ui["preset"].text  = _status_line(state)
+    ui["preset"].color = dim_color
+    ui["player"].text  = ""
+    ui["player"].color = _C_MENU
+    ui["media_prev"].text = ""
+    ui["media_next"].text = ""
 
 # ── Label helpers ─────────────────────────────────────────────────────────────
 
@@ -878,7 +874,8 @@ def init():
         _F_SM, text="", color=_C_DIM,
         anchor_point=(0.5, 0.5), anchored_position=(CX + _MEDIA_SIDE_X, PRESET_NAME_Y),
     )
-    # Device name, just below that -- see _player_name().
+    # Device name, just below that -- see ha_ui.py's _player_name(), the
+    # only thing that ever populates it.
     player_lbl = label.Label(
         _F_SM, text="", color=_C_TEXT,
         anchor_point=(0.5, 0.5), anchored_position=(CX, _PLAYER_NAME_Y),
@@ -962,9 +959,10 @@ def draw_main(ui, state):
         # e.g. HA's Media Player list) get a way back into the menu from here --
         # otherwise standby stays the deliberately bare "one button, nothing
         # else competes for attention" screen (see local/agent/design.md).
-        if _driver.CAPS["player_select"]:
-            ui["menu"].anchor_point      = _MENU_ANCHOR_STANDBY
-            ui["menu"].anchored_position = _MENU_POS_STANDBY
+        if _driver.CAPS["player_select"] and _driver.ui_impl is not None:
+            anchor, pos = _driver.ui_impl.standby_menu_pos()
+            ui["menu"].anchor_point      = anchor
+            ui["menu"].anchored_position = pos
             ui["menu"].text  = "MENU"
             ui["menu"].color = _C_MENU
         ui["display"].refresh()

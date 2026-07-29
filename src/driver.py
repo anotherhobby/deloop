@@ -94,15 +94,50 @@
 # only around the menu-construction logic that decides which capabilities
 # to offer in the first place (see code.py's _top_menu_entries()), and
 # around the preset-disable tap gesture (see CAPS["preset_enable"] above).
+#
+# ---------------------------------------------------------------------------
+# The UI-extension contract (optional, paired by convention with a driver)
+# ---------------------------------------------------------------------------
+# A backend with UI needs beyond dial_ui.py's generic gauge/volume/menu
+# chrome gets its own paired <backend>_ui.py (e.g. ha_ui.py), imported here
+# -- and ONLY here, exactly like the backend module itself -- so a backend
+# without one (denon, minidsp: neither needs any UI beyond the generic
+# chrome) never pays to import or compile it. This is the actual point:
+# CircuitPython compiles a module's entire bytecode before running any of
+# it, so an unimported file costs nothing, while an imported-but-unused one
+# still costs full compile-time heap -- see local/agent/project-context.md's
+# 2026-07-29 incident, where this module-bulk cost (not WiFi) was the real
+# root cause of a boot-time MemoryError.
+#
+# ui_impl is None for a backend with no UI extension. dial_ui.py checks for
+# that and calls through it -- see e.g. dial_ui.media_prev_tap(), which is
+# a real, always-present function in dial_ui.py's public API regardless of
+# backend, but only ever returns True by delegating to ui_impl when one is
+# loaded. A <backend>_ui.py module exposes whatever subset of this it needs
+# (nothing is required unconditionally, mirroring CAPS/LABELS above):
+#
+#   draw_status_rows(ui, state, dim_color)
+#     Replaces dial_ui's default single-row preset/status rendering.
+#   media_status_tap(x, y) / media_prev_tap(x, y) / media_next_tap(x, y)
+#     Hit-tests for the play/pause row and its flanking skip icons.
+#   standby_menu_tap(x, y) / standby_menu_pos() -> (anchor_point, position)
+#     Hit-test and label placement for the power-off screen's MENU zone,
+#     only relevant for backends that can reach the menu from standby
+#     (CAPS["player_select"]).
 
 import config
 
 if config.DEVICE_DRIVER == "minidsp":
     import minidsp as _impl
+    _ui_impl = None
 elif config.DEVICE_DRIVER == "ha":
     import ha as _impl
+    import ha_ui as _ui_impl
 else:
     import denon as _impl
+    _ui_impl = None
+
+ui_impl = _ui_impl
 
 # Every CAPS key this contract defines, with its safe "unsupported" default.
 # A backend's own CAPS dict only needs to set the keys it actually has an
