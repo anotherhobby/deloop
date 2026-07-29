@@ -289,7 +289,9 @@ def get_presets():
     """Return (current_value, [(value, name), ...]) for config slots 0..N-1.
 
     N comes from config.MINIDSP_PRESET_COUNT -- the API has no way to
-    report how many slots a given unit actually has. Also updates
+    report how many slots a given unit actually has. Names come from
+    config.MINIDSP_PRESET_NAMES if set (by index), falling back to
+    "Preset N" for any slot not named there. Also updates
     CAPS["preset_enable"] from whether this unit's status includes a
     "dirac" field at all (see get_preset_enabled()).
     """
@@ -300,7 +302,9 @@ def get_presets():
 
     CAPS["preset_enable"] = master.get("dirac") is not None
     current = str(master.get("preset", 0))
-    names = [(str(i), "Preset {}".format(i + 1))
+    custom_names = config.MINIDSP_PRESET_NAMES
+    names = [(str(i), custom_names[i] if i < len(custom_names)
+              else "Preset {}".format(i + 1))
              for i in range(config.MINIDSP_PRESET_COUNT)]
     return current, names
 

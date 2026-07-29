@@ -54,6 +54,14 @@ MINIDSP_SERIAL        = os.getenv("MINIDSP_SERIAL", "")
 # actually has -- set this to match your device if it's not 4 (the max
 # across MiniDSP's current lineup). See minidsp.py get_presets().
 MINIDSP_PRESET_COUNT  = int(os.getenv("MINIDSP_PRESET_COUNT", "4"))
+# Optional human-readable names for config slots 0..N-1, comma-separated
+# and in order (e.g. "Movie,Music,Night,Flat") -- the API has no way to
+# read back names, so this is the only way to label a slot. Any slot past
+# the end of this list, or all of them if left unset, falls back to the
+# "Preset N" default. See minidsp.py get_presets().
+MINIDSP_PRESET_NAMES = [n.strip() for n in
+                         os.getenv("MINIDSP_PRESET_NAMES", "").split(",")
+                         if n.strip()]
 
 # Home Assistant settings
 HA_HOST       = os.getenv("HA_HOST", "")
