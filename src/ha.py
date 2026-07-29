@@ -35,12 +35,35 @@
 # CAPS["presets"] is always False -- no generic media_player equivalent of
 # Dirac Live/config-slot switching worth building; deliberately not wired
 # to SUPPORT_SELECT_SOUND_MODE even though HA reports it.
+#
+# CAPS["player_select"] is always True -- discovering every media_player
+# entity HA knows about and letting the user switch which one deloop
+# targets is a backend-level feature, not something that depends on which
+# entity happens to be active. Discovery uses POST /api/template (a single
+# compact Jinja render) instead of GET /api/states (which would return
+# every entity in the house, not just media players -- a real payload/heap
+# risk on an ESP32):
+#
+#   POST /api/template
+#   {"template": "{{ {\"ids\": states.media_player | map(attribute=\"entity_id\") | list,
+#                      \"names\": states.media_player | map(attribute=\"name\") | list} | tojson }}"}
+#   -> a JSON *string* body, but Content-Type: text/plain -- confirmed live,
+#      so this must be parsed via json.loads(resp.text), not resp.json()
+#      (which may care about content-type).
+#
+# Switching the active entity (set_player()) re-runs the same
+# supported_features detection load_source_list() does at boot, for the
+# newly selected entity -- CAPS actually changes at runtime for this
+# backend, not just once at boot (see driver.py's contract note on this).
+
+import json
 
 import config
 
 CAPS = {"power": False, "input_select": False, "presets": False,
-        "preset_enable": False, "preset_select_enables": False}
-LABELS = {"input_select": "Source"}
+        "preset_enable": False, "preset_select_enables": False,
+        "player_select": True}
+LABELS = {"input_select": "Source", "player_select": "Media Player"}
 
 _SUPPORT_TURN_ON      = 128
 _SUPPORT_TURN_OFF     = 256
@@ -54,6 +77,10 @@ _HEADERS = {
     "Content-Type": "application/json",
 }
 
+# The entity deloop currently targets -- starts at the configured default,
+# but set_player() can repoint it at any entity load_players() discovered.
+_current_entity = config.HA_ENTITY_ID
+
 
 def init(session):
     """Supply the HTTP session. Must be called before any other function."""
@@ -66,8 +93,8 @@ def init(session):
 # ---------------------------------------------------------------------------
 
 def _get_state():
-    """GET the entity's current state+attributes. Raises on network failure."""
-    url = _BASE + "/api/states/" + config.HA_ENTITY_ID
+    """GET the current entity's state+attributes. Raises on network failure."""
+    url = _BASE + "/api/states/" + _current_entity
     resp = _session.get(url, headers=_HEADERS, timeout=_TIMEOUT)
     try:
         return resp.json()
@@ -76,10 +103,11 @@ def _get_state():
 
 
 def _call_service(domain, service, data):
-    """POST a media_player service call. Response discarded -- optimistic
-    UI already covers the round trip, same as minidsp.py's _post_master."""
+    """POST a media_player service call against the current entity.
+    Response discarded -- optimistic UI already covers the round trip,
+    same as minidsp.py's _post_master."""
     url = _BASE + "/api/services/{}/{}".format(domain, service)
-    body = {"entity_id": config.HA_ENTITY_ID}
+    body = {"entity_id": _current_entity}
     body.update(data)
     resp = _session.post(url, json=body, headers=_HEADERS, timeout=_TIMEOUT)
     resp.close()
@@ -161,6 +189,14 @@ def media_pause():
     _call_service("media_player", "media_pause", {})
 
 
+def media_previous():
+    _call_service("media_player", "media_previous_track", {})
+
+
+def media_next():
+    _call_service("media_player", "media_next_track", {})
+
+
 # ---------------------------------------------------------------------------
 # Input (source) selection
 # ---------------------------------------------------------------------------
@@ -168,12 +204,15 @@ def media_pause():
 _source_list = []   # [(name, name), ...] -- HA source names are already friendly
 
 
-def load_source_list():
-    """Fetch the entity's current state once at boot: populates the source
-    list and derives CAPS["power"]/CAPS["input_select"] from
-    supported_features (see module docstring). Silently does nothing on
-    network failure -- CAPS stays at its conservative False defaults and
-    the corresponding menu items/gestures just don't appear.
+def _refresh_entity():
+    """Query the current entity and derive CAPS["power"]/CAPS["input_select"]
+    + the source list from its supported_features (see module docstring).
+    Shared by load_source_list() (boot) and set_player() (runtime switch) --
+    the entity's capabilities can genuinely differ from one media_player to
+    another, so this needs to re-run every time the target changes, not
+    just once at boot. Silently does nothing on network failure -- CAPS
+    stays at whatever it was (conservative False defaults at boot; the
+    prior entity's values if a switch's refresh fails).
     """
     global _source_list
     try:
@@ -190,6 +229,12 @@ def load_source_list():
     _source_list = [(name, name) for name in names]
 
 
+def load_source_list():
+    """Fetch the boot-time entity's current state once at boot -- see
+    _refresh_entity()."""
+    _refresh_entity()
+
+
 def get_inputs():
     """Return (current_source, [(name, name), ...])."""
     try:
@@ -201,3 +246,62 @@ def get_inputs():
 
 def set_input(name):
     _call_service("media_player", "select_source", {"source": name})
+
+
+# ---------------------------------------------------------------------------
+# Media player discovery/switching -- see module docstring for the
+# /api/template discovery call and why CAPS is genuinely dynamic here.
+# ---------------------------------------------------------------------------
+
+_players = []   # [(entity_id, friendly_name), ...]
+
+_DISCOVER_TEMPLATE = (
+    '{{ {"ids": states.media_player | map(attribute="entity_id") | list,'
+    ' "names": states.media_player | map(attribute="name") | list} | tojson }}'
+)
+
+
+def load_players():
+    """Discover every media_player entity HA knows about, once at boot.
+
+    Falls back to a single entry for the configured HA_ENTITY_ID on any
+    failure (bad response, network error, empty result) -- guarantees
+    _players is never empty, so the Media Player submenu always has at
+    least one selectable item instead of a blank list that would divide
+    by zero when the menu tries to navigate it.
+    """
+    global _players
+    try:
+        url = _BASE + "/api/template"
+        resp = _session.post(url, json={"template": _DISCOVER_TEMPLATE},
+                              headers=_HEADERS, timeout=_TIMEOUT)
+        try:
+            # Content-Type on this endpoint is text/plain even though the
+            # body is a JSON string (the template renders to one via
+            # |tojson) -- parse the text directly rather than resp.json().
+            data = json.loads(resp.text)
+        finally:
+            resp.close()
+        ids   = data.get("ids") or []
+        names = data.get("names") or []
+        result = [(i, n) for i, n in zip(ids, names)]
+    except Exception:
+        result = []
+
+    _players = result or [(config.HA_ENTITY_ID, config.HA_ENTITY_ID)]
+
+
+def get_players():
+    """Return (current_entity_id, [(entity_id, friendly_name), ...])."""
+    return _current_entity, list(_players)
+
+
+def set_player(entity_id):
+    """Switch which entity deloop controls. No-op if entity_id wasn't in
+    the discovered list. Re-derives CAPS/source list for the new entity --
+    see _refresh_entity()."""
+    global _current_entity
+    if entity_id not in [i for i, _ in _players]:
+        return
+    _current_entity = entity_id
+    _refresh_entity()

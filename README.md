@@ -1,28 +1,30 @@
 # deloop
 
-deloop is Firmware for the [M5 Dial](https://shop.m5stack.com/products/m5stack-dial-v1-1) that turns it into a dedicated remote and volume knob for a Denon/Marantz AVR, intended for desktop use. You rotate the encoder to change volume, tap the scren to mute, and there is touch menu for inputs / Dirac Live presets / and device settings.
-
-It also has experimental support for a [MiniDSP](https://www.minidsp.com/) unit via [minidsp-rs](https://github.com/mrene/minidsp-rs), and for any [Home Assistant](https://www.home-assistant.io/) `media_player` entity -- see [Device backends](#device-backends) below for what each one does and doesn't get you.
+deloop is Firmware for the [M5 Dial](https://shop.m5stack.com/products/m5stack-dial-v1-1) that turns it into a dedicated remote and volume knob for a Denon/Marantz AVR, minidsp-rs, and media player entities in Home Assistant. It is wired, compact, and intended for desktop use, but is fairly universal. You rotate the encoder to change volume, tap the scren to mute, and there is touch menu for inputs / Dirac Live presets / and device settings. Home Assistant media players that support media controls will get basic pause/skip buttons as well.
 
 ![device](ui/device.jpeg)
 
+Be aware that the M5Dial is a panel mount device that mounts thru a 45mm hole. It can be mounted all sorts of ways, but does not stand well on it's own, so you'll need to sort out some kind of plan. Here it is mounted in a $6 wood phone stand off Amazon and drilled a 45mm hole thru. 
+
+![device](ui/wood-stand.jpeg)
+
 ## How was AI used in developing deloop?
 
-Not vibecoded, but step-by-step agentically assisted/written by Claude and an experienced engineer who has also been building hobby projects on ESP32 since shortly after release.
+This project is step-by-step agentically assisted/written/maintained by Claude and an experienced engineer who has been building hobby projects on ESP32 since shortly after release. This repo contains a [CLAUDE.md](.claude/CLAUDE.md) file that carries a huge amount of project context. Claude is directed continuously to update this file as the project evolves, and it is intended to be human readable if you are curious what went into it. If you decide you want to modify/extend the deloop code, this file will make Claude very good at working with this project, including things like how to use the tools for thinks like rendering screen mockups.
 
 ## Features
 
 - Volume up/down via the rotary encoder, with acceleration on a fast spin
-- State display: Volume, Current Input, Current Preset (Dirac Live filter on Denon)
+- State display: Volume, Current Input, Current preset/filter on Denon and miniDSP
 - Live circular color gauge display of volume (dB) with a moving indicator
-- Main screen tap controls: mute, preset selection, menu, power (long press, Denon only)
+- Main screen tap controls: mute, preset selection, dirac toggle, menu, power (long press, Denon only),
 - Tap the already-active preset to disable it in place (e.g. Dirac Live off) without losing which one is loaded -- it stays highlighted, just in gray instead of orange
-- Screen grays out (a static frame, no pulse) while a preset change is slow to apply (confirmed several seconds on MiniDSP config-slot switches), then returns to color once it's done
+- Screen grays out while a preset change is slowly appling (confirmed several seconds on MiniDSP config-slot switches), then returns to color once it's done.
 - Touch menu: input selection, preset selection, brightness, click sound on/off, restart device
 - Synced against the device so external changes (app, another remote) update deloop.
 - Runs on [CircuitPython](https://circuitpython.org/board/m5stack_dial/)
 - Pluggable device backend (`src/driver.py`) -- see [Device backends](#device-backends)
-- Note that deloop is not currently designed to support displaying and/or updating Audyssey filters and I don't know if it works.
+- Note that deloop is not currently designed to support displaying and/or updating Audyssey filters.
 
 ## User Interface
 
@@ -35,19 +37,21 @@ The main screen's color bar has a white triangular pointer that rotates around t
 - Major ticks indicate 10dB increemnts
 - Minor ticks indicate 5dB increments
 
-The range is configurable via settings file. For example, I like a volume range of -50 to 0 on miniDSP, even though the device goes to -127 dB.
+The device's volume range is configurable via settings file. For example, you may want a volume range of -50 to 0 on miniDSP, even though the device technically goes to -127 dB.
 
-![Main screen at a normal volume](ui/main_diagram.png)
+The user interface varies some depending on device capability (some devices have basic touch media controls as well), but the diagram below explains the main UI. The 0 dB white tick mark is only on devices with a negative volume range (Denon/miniDSP). The volume range in the diagram is -80 to +18.
+
+![Main screen at a normal volume](ui/UIDiagram.drawio.png)
 
 ### Mute
 
-Tapping the screen area anywhere above the preset name will mute the device. While muted, the volume number and all color elemnts on the display appear blue, and the number will slowly pulsate like a sleep indicator. Set `MUTE_PULSE = "false"` in `settings.toml` to keep it a static blue instead.
+Tapping the screen area anywhere above the preset name will mute the device. While muted, the volume number and all color elemnts on the display appear blue, and the number will slowly pulsate like a sleep indicator. Set `MUTE_PULSE = "false"` in `settings.toml` if you don't want the pulsing.
 
 ![Main screen muted](ui/main_muted.png)
 
 ### Standby
 
-Denon only -- see [Device backends](#device-backends). When the AVR is in standby mode, a dim power button is displayed. A long press will power the AVR on and cycle back to the main screen.
+For devices that support power on/off, when the device is in standby mode, a dim power button is displayed. A long press will power the AVR on and cycle back to the main screen.
 
 ![Standby screen](ui/power_off.png)
 
@@ -55,12 +59,12 @@ Note: the screen shots are pixel-accurate renders of `dial_ui.py`'s actual drawi
 
 ## Hardware
 
-- Only tested on the M5Dial ([docs](https://docs.m5stack.com/en/core/M5Dial)). The M5Dial is a panel mount device that mounts thru a 45mm hole. There are other ESP32 rotary encoders out there, but I would not expect them work out of the box with this project.
+- Only tested on the M5Dial ([docs](https://docs.m5stack.com/en/core/M5Dial)). There are other ESP32 rotary encoders out there, but I would not expect them work out of the box with this project.
 - A modern Denon/Marantz AVR reachable over Wi-Fi (developed against an AVR-X4800H; see `src/denon.py` for the HTTP control API details) -- **or** a MiniDSP unit driven via minidsp-rs, see below.
 
 ## Device backends
 
-deloop talks to the amp through a swappable driver module (`src/driver.py`), selected by the `DEVICE_DRIVER` key in `settings.toml`. `code.py` and `dial_ui.py` never talk to a specific backend directly -- they read a `CAPS` dict the active driver exports to decide which menu items and gestures to offer, so a backend that can't do something (e.g. no power state) simply doesn't advertise that capability rather than needing special-casing throughout the UI code. See the contract documented at the top of `src/driver.py` if you want to add another backend.
+deloop talks to the amp through a swappable driver module (`src/driver.py`), selected by the `DEVICE_DRIVER` key in `settings.toml`. `app.py` and `dial_ui.py` never talk to a specific backend directly -- they read a `CAPS` dict the active driver exports to decide which menu items and gestures to offer, so a backend that can't do something (e.g. no power state) simply doesn't advertise that capability rather than needing special-casing throughout the UI code. See the contract documented at the top of `src/driver.py` if you want to add another backend.
 
 |                    | `denon` (default)                          | `minidsp`                                          | `ha`                                                |
 |--------------------|---------------------------------------------|-----------------------------------------------------|------------------------------------------------------|
@@ -71,13 +75,16 @@ deloop talks to the amp through a swappable driver module (`src/driver.py`), sel
 | Presets            | Dirac Live filter picker. Selecting a filter always engages it -- there's no separate on/off bit, so switching filters and enabling are the same action | Always the DSP's config-slot switching (0..N-1) -- slot count isn't discoverable via the API, set `MINIDSP_PRESET_COUNT` to match your unit. Names default to "Preset 1", "Preset 2", etc. since the API can't read slot names back either -- set `MINIDSP_PRESET_NAMES` to override. If the unit also reports a `dirac` field (e.g. a Flex with a Dirac license), tapping the *active* slot additionally toggles Dirac on/off in place; switching to a *different* slot deliberately leaves that on/off state untouched, since a slot may want Dirac off on purpose (e.g. a headphone config) -- see `CAPS["preset_select_enables"]` in `src/driver.py` | Not supported -- there's no generic `media_player` equivalent of Dirac Live/config slots, so no preset menu is drawn at all |
 | Preset switch speed | Near-instant                                | Confirmed ~4s+ on real hardware -- minidsp-rs's POST blocks until the DSP finishes reconfiguring. The screen shows a static gray frame for the duration (see `dial_ui.draw_busy`); raise `MINIDSP_PRESET_TIMEOUT` if your unit is slower than the ~10s default | N/A -- no presets |
 | Volume range       | -80dB to +18dB (dB relative to reference)    | -127dB to 0dB (dB of attenuation below unity) -- the gauge's color bands and tick marks scale to whichever range is active | 0 to 100 percent -- HA always normalizes `volume_level` to a 0.0-1.0 fraction regardless of the underlying device, so there's no real dB value to show |
-| Playback control    | N/A                                            | N/A                                                   | Off by default -- set `HA_MEDIA_CONTROLS = true` to opt in. When on, the status line below the volume shows "Playing"/"Paused" (tap to toggle) whenever the entity reports one of those two states; blank/no tap target otherwise. Rougher than the other fields -- whether it does anything real depends on the currently selected source (e.g. a no-op on a plain analog input) |
+| Playback control    | N/A                                            | N/A                                                   | Off by default -- set `HA_MEDIA_CONTROLS = true` to opt in. When on, the status line below the volume shows "Playing"/"Paused" (tap to toggle) whenever the entity reports one of those two states, with `<`/`>` on either side to skip back/forward; blank/no tap targets otherwise. Rougher than the other fields -- whether it does anything real depends on the currently selected source (e.g. a no-op on a plain analog input) |
+| Media Player menu   | N/A                                            | N/A                                                   | Discovers every `media_player` entity in your HA instance at boot and adds a menu to switch which one deloop controls -- `HA_ENTITY_ID` is only the startup default. Switching re-checks the new entity's `supported_features` on the spot, so e.g. Input selection or Power can appear/disappear if the newly selected entity's capabilities differ from the previous one's. Since it's no longer always obvious which device you're looking at, the currently targeted device's name is always shown in dim gray below the status line, and if it's powered off, a MENU hint appears on that screen too (unlike the other backends' deliberately bare power-off screen) so you're never stuck needing to power on the wrong device just to switch away from it |
 
 The `minidsp` backend derives its input list and Dirac/preset behavior from what the unit itself reports (hw_id, dsp_version, and whether a "dirac" field comes back at all) rather than hardcoding one model, so it's meant to work across whatever minidsp-rs itself supports, not just the two units it's been verified against so far (a 2x4HD and a Dirac-licensed Flex).
 
 If more than one MiniDSP is ever attached to the same host at once, set `MINIDSP_SERIAL` instead of relying on `MINIDSP_DEVICE_INDEX` -- minidsp-rs's `/devices` array order follows USB enumeration order, which is not guaranteed stable across reconnects.
 
 The `ha` backend works with any `media_player` entity, not just Denon/Marantz ones -- it's the same REST API regardless of what HA integration actually created the entity. It's plain synchronous polling on the same adaptive schedule as the other two backends (no event subscription, no persistent connection) -- deliberately as simple as `denon`/`minidsp`, just pointed at HA instead of the device directly.
+
+Discovery (for the Media Player menu above) uses a single `POST /api/template` call rendering a compact Jinja expression instead of `GET /api/states`, which would return every entity in your house, not just media players -- a much bigger payload than an ESP32 needs to parse just to build a menu.
 
 Before flashing, `make probe-minidsp` / `make probe-ha` (host-side, needs the daemon/HA instance reachable) hit the same JSON endpoints `src/minidsp.py`/`src/ha.py` use and print the raw responses, so you can confirm the shapes match your setup before wiring up the device.
 
@@ -94,12 +101,13 @@ Before flashing, `make probe-minidsp` / `make probe-ha` (host-side, needs the da
    cp src/settings.toml.template src/settings.toml
    ```
    `src/settings.toml` is gitignored — it holds your Wi-Fi password and device address(es) and should never be committed.
-4. With the Dial mounted as `/Volumes/CIRCUITPY`, deploy everything:
+4. `make full-deploy` needs `local/mpy-cross`, a CircuitPython-version-matched compiler binary (not the generic `pip install mpy-cross` package) -- see the `MPY_CROSS` comment in the Makefile for where to download it and how to check your device's exact version. `local/` is gitignored; this binary is never committed.
+5. With the Dial mounted as `/Volumes/CIRCUITPY`, deploy everything:
    ```
    make full-deploy
    ```
 
-After the first deploy, `make deploy` is the fast path for iterating on firmware changes if you decide make your own tweaks (skips reinstalling CircuitPython libraries).
+After the first deploy, `make deploy` is the fast path for iterating on firmware changes if you decide to make your own tweaks (skips reinstalling CircuitPython libraries, but still needs `local/mpy-cross` -- see step 4). If you don't have `local/mpy-cross` set up yet, or you're chasing a traceback where uncompiled source gives a clearer on-device error, `make deploy-src` copies plain `.py` files instead and needs no extra tooling.
 
 ## Makefile targets
 
@@ -107,8 +115,9 @@ After the first deploy, `make deploy` is the fast path for iterating on firmware
 |----------------|-----------------------------------------------------------------------|
 | `bootstrap`    | Install host-side dev tools into `.venv` (run once per machine)      |
 | `install-libs` | Install required CircuitPython libraries onto the mounted device    |
-| `full-deploy`  | `install-libs` + copy all firmware files (fresh flash / onboarding)  |
-| `deploy`       | Copy firmware files only (fast iteration)                            |
+| `full-deploy`  | `install-libs` + `deploy` (fresh flash / onboarding)                 |
+| `deploy`       | Precompile every module to `.mpy` and copy to the device -- what it should actually run day to day (needs `local/mpy-cross`) |
+| `deploy-src`   | Copy plain, uncompiled `.py` files instead (fast iteration / clearer tracebacks; no `local/mpy-cross` needed) |
 | `fonts`        | Regenerate the Inter PCF bitmap fonts from the TTF source            |
 | `splash`       | Regenerate the splash screen BMP from `ui/hobbysprawl.png`           |
 | `renders`      | Render dial_ui.py's screens to PNGs without the device, into `local/renders/` (`tools/dial_sim.py`) |
@@ -127,17 +136,19 @@ Settings live in `src/settings.toml` (see `src/settings.toml.template` for all a
 
 ## Code layout
 
-- `src/code.py` — CircuitPython entry point: input handling (encoder, touch), menu state machine, and the main loop
+- `src/code.py` — CircuitPython entry point: must stay tiny, since it's the one file that can't be `.mpy`-compiled. Just `import app; app.main()`
+- `src/app.py` — the real entry-point logic: input handling (encoder, touch), menu state machine, and the main loop
 - `src/driver.py` — selects the active device backend and documents the driver contract other backends implement
 - `src/denon.py` — HTTP client for the Denon/Marantz control API (volume, power, mute, inputs, Dirac Live presets)
 - `src/minidsp.py` — HTTP client for a [minidsp-rs](https://github.com/mrene/minidsp-rs) daemon (volume, mute, input source, config-slot presets)
-- `src/ha.py` — REST client for a [Home Assistant](https://www.home-assistant.io/) `media_player` entity (volume, mute, power, source; no presets)
+- `src/ha.py` — REST client for a [Home Assistant](https://www.home-assistant.io/) `media_player` entity (volume, mute, power, source; no presets), plus playback control (play/pause/skip) and discovering/switching between every `media_player` entity HA knows about
+- `src/ha_ui.py` — the `ha` backend's paired UI extension (row layout, skip icons, play/pause icon); only imported when `DEVICE_DRIVER = "ha"`
 - `src/dial_ui.py` — display rendering: the circular gauge, volume readout, and menu overlay
 - `src/state.py` — in-memory model of device state, reconciled against periodic polls
 - `src/sound.py` — piezo buzzer click feedback for taps and menu actions
 - `src/config.py` — settings loader/defaults
-- `tools/` — host-side scripts used during development (AVR/minidsp-rs protocol probing, font/splash generation, off-device screen rendering); not deployed to the device
-- `local/` — gitignored, not shipped: the Inter font family download and `make renders` output land here
+- `tools/` — host-side scripts used during development (AVR/minidsp-rs/HA protocol probing, font/splash generation, off-device screen rendering); not deployed to the device
+- `local/` — gitignored, not shipped: the `mpy-cross` compiler binary, its `.mpy` build staging dir, the Inter font family download, and `make renders` output all land here
 
 ## What is hobbysprawl?
 

@@ -42,6 +42,15 @@ class AVRState:
         self.input_names    = []
         self.input_index    = ""
 
+        # Media player list -- backends that can target more than one
+        # device discovered at runtime (see driver.py's CAPS["player_select"];
+        # currently only ha.py, one entry per Home Assistant media_player
+        # entity). Loaded at boot via driver.get_players(); empty for
+        # drivers that don't support it. Same (id, name) shape as
+        # input_names/preset_names above.
+        self.player_id    = ""
+        self.player_names = []
+
         # Rotary encoder increments accumulated since the last volume command.
         self._pending_ticks = 0
 
