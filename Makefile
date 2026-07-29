@@ -32,7 +32,14 @@ deploy: _copy-files
 
 # fonts: (re)generate Inter PCF bitmaps from the TTF source.
 # Requires: brew install otf2bdf bdftopcf
-# Character set: printable ASCII 32-126 (A-Z a-z 0-9 punctuation).
+# Character set: printable ASCII 32-126 (A-Z a-z 0-9 punctuation), plus one
+# deliberate addition for the HA "Playing" status glyph: U+25B6 (9654,
+# BLACK RIGHT-POINTING TRIANGLE). Confirmed present in Inter Medium -- see
+# local/agent/project-context.md. "Paused" uses two plain capital I's
+# instead of a font addition -- U+2016 DOUBLE VERTICAL LINE was tried
+# first but renders far taller than every other glyph on that row (24px
+# vs 11-18px) and nearly touched the row above; capital I is already in
+# the base ASCII set and, at 14px, is much better proportioned.
 
 # splash: (re)generate the splash screen BMP from ui/hobbysprawl.png.
 # Requires: pip install pillow
@@ -45,12 +52,9 @@ renders:
 	$(PYTHON) tools/dial_sim.py
 
 fonts:
-# Requires: brew install otf2bdf bdftopcf
-# Character set: printable ASCII 32-126 (A-Z a-z 0-9 punctuation).
-fonts:
 	@mkdir -p src/fonts
 	@for s in $(FONT_SIZES); do \
-	  otf2bdf -p $$s -l "32_126" -r 72 $(FONT_TTF) \
+	  otf2bdf -p $$s -l "32_126 9654" -r 72 $(FONT_TTF) \
 	    | bdftopcf -o src/fonts/Inter_Medium_$${s}.pcf && \
 	  echo "  Inter_Medium_$${s}.pcf  $$(ls -lh src/fonts/Inter_Medium_$${s}.pcf | awk '{print $$5}')"; \
 	done

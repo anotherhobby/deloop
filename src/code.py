@@ -106,12 +106,19 @@ def _connect_wifi(ui):
 
 def _top_menu_entries():
     """(sub_type, label) pairs for the top-level menu, filtered by what the
-    active driver actually supports -- see driver.CAPS / driver.LABELS."""
+    active driver actually supports -- see driver.CAPS / driver.LABELS.
+
+    Read fresh every call, not cached -- this is what lets CAPS actually
+    change at runtime (see driver.py's CAPS["player_select"] note) show up
+    in the menu immediately, with no extra plumbing needed here.
+    """
     entries = []
     if driver.CAPS["input_select"]:
         entries.append(("input", driver.LABELS["input_select"]))
     if driver.CAPS["presets"]:
         entries.append(("preset", driver.LABELS["presets"]))
+    if driver.CAPS["player_select"]:
+        entries.append(("player", driver.LABELS["player_select"]))
     entries.append(("device", "Device"))
     return entries
 
@@ -130,6 +137,8 @@ def _build_sub_items(sub_type, state):
         return [name for _, name in state.input_names]
     if sub_type == "preset":
         return [name for _, name in state.preset_names]
+    if sub_type == "player":
+        return [name for _, name in state.player_names]
     if sub_type == "brightness":
         pct = int(round(state.brightness * 100))
         return ["            {} %\n(rotate to adjust)".format(pct)]
@@ -149,6 +158,10 @@ def _open_submenu(sub_type, label, state):
         vals = [v for v, _ in state.preset_names]
         if state.preset in vals:
             sc = vals.index(state.preset)
+    elif sub_type == "player":
+        ids = [i for i, _ in state.player_names]
+        if state.player_id in ids:
+            sc = ids.index(state.player_id)
     return sub_type, sc, label.upper(), _build_sub_items(sub_type, state)
 
 
@@ -196,6 +209,24 @@ def _confirm_sub(sub_type, sub_cursor, state, ui):
                 state.preset_enabled = True
         except Exception as e:
             print("set_preset:", e)
+    elif sub_type == "player":
+        entity_id, _ = state.player_names[sub_cursor]
+        try:
+            # Switching targets is a few sequential HTTP calls (set target,
+            # re-derive capabilities/source list, fetch status) -- same
+            # "please wait" treatment as a slow preset switch above.
+            dial_ui.draw_busy(ui, state)
+            driver.set_player(entity_id)
+            state.player_id = entity_id
+            # Refresh everything that's cached per-target rather than
+            # re-fetched live -- driver.set_player() already re-derived
+            # driver.CAPS in place (see driver.py's contract note), so the
+            # menu itself picks that up next time it's opened with no
+            # further action needed here.
+            state.input_index, state.input_names = driver.get_inputs()
+            state.apply_status(driver.get_status())
+        except Exception as e:
+            print("set_player:", e)
     elif sub_type == "brightness":
         _save_brightness(state.brightness)
     elif sub_type == "sound":
@@ -257,7 +288,7 @@ class _Loop:
         self.dev_cursor  = 0    # cursor within Device submenu
         self.sub_cursor  = 0
         self.sub_scroll  = 0    # first visible item in sub-menu (for long lists)
-        self.sub_type    = None    # "input", "preset", "brightness", "sound"
+        self.sub_type    = None    # "input", "preset", "player", "brightness", "sound"
         self.menu_idle   = 0.0     # monotonic time of last menu interaction
 
         self.mute_phase_origin  = 0.0     # monotonic time the current pulse cycle started
@@ -274,9 +305,18 @@ class _Loop:
 
 def _handle_encoder_button(loop, ui, state, btn, now):
     btn_pressed = not btn.value
-    fired = btn_pressed and not loop.last_btn_pressed and state.power == "ON"
+    fired = btn_pressed and not loop.last_btn_pressed
     loop.last_btn_pressed = btn_pressed
     if not fired:
+        return
+
+    # Standby, resting on the power-off screen: only backends that can
+    # switch to a different target (CAPS["player_select"], e.g. HA's Media
+    # Player list) can open the menu from here -- see dial_ui.draw_main's
+    # power-off branch, which shows a MENU hint only for those backends.
+    # Once inside a menu (loop.mode != MODE_MAIN), the button works
+    # regardless of power state, same as touch does in _dispatch_tap.
+    if state.power != "ON" and loop.mode == MODE_MAIN and not driver.CAPS["player_select"]:
         return
 
     loop.menu_idle = now
@@ -336,8 +376,12 @@ def _handle_encoder_rotation(loop, ui, state, encoder, now):
     delta = pos - loop.last_pos
     loop.last_pos = pos
 
-    if state.power != "ON":
-        return   # ignore encoder when standby
+    # Ignore the encoder while resting on the power-off screen -- there's no
+    # volume to adjust there, regardless of backend. Once a menu is open
+    # (see _handle_encoder_button/_dispatch_tap), rotation navigates it
+    # normally even in standby.
+    if state.power != "ON" and loop.mode == MODE_MAIN:
+        return
 
     loop.menu_idle = now
 
@@ -383,6 +427,7 @@ def _handle_encoder_rotation(loop, ui, state, encoder, now):
         loop.sub_scroll = _scroll_for(loop.sub_cursor, loop.sub_scroll, len(items))
         if loop.sub_type == "input":     title = driver.LABELS["input_select"].upper()
         elif loop.sub_type == "preset":  title = driver.LABELS["presets"].upper()
+        elif loop.sub_type == "player":  title = driver.LABELS["player_select"].upper()
         elif loop.sub_type == "sound":   title = "SOUND"
         else:                            title = loop.sub_type.upper()
         vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
@@ -595,10 +640,38 @@ def _start_mute_pulse(loop, now):
     loop.mute_trough_polled = False
 
 
+def _try_action(loop, label, action):
+    """Run `action()` (a no-arg callable -- usually a driver call, or a
+    closure wrapping one plus a local state flip), then reset the poll
+    timer + error count on success or print+count on failure. Shared tail
+    of every simple single-action tap handler below -- fires exactly once
+    per tap, no multi-step logic. Returns True on success so a caller with
+    something to redraw (a flipped state field) can branch on it; a caller
+    with nothing to redraw (media prev/next -- no local field changes)
+    can just ignore the return value.
+
+    Not used by every tap handler in this file -- the preset quick-select
+    and power-toggle handlers each have their own extra steps (a busy
+    screen, a non-default poll-timer offset, redrawing on failure too)
+    that don't fit this shared shape, and forcing them into it would cost
+    more in indirection than the duplication it would remove.
+    """
+    try:
+        action()
+        loop.last_poll = time.monotonic()
+        loop.error_count = 0
+        return True
+    except Exception as e:
+        print(label + ":", e)
+        loop.error_count += 1
+        return False
+
+
 def _tap_toggle_mute(loop, ui, state, now):
     """Tap anywhere else -> toggle mute."""
     sound.click()
-    try:
+
+    def action():
         if state.muted:
             driver.mute_off()
             state.muted = False
@@ -606,12 +679,9 @@ def _tap_toggle_mute(loop, ui, state, now):
             driver.mute_on()
             state.muted = True
             _start_mute_pulse(loop, now)
+
+    if _try_action(loop, "mute", action):
         dial_ui.draw_main(ui, state)
-        loop.last_poll = time.monotonic()
-        loop.error_count = 0
-    except Exception as e:
-        print("mute:", e)
-        loop.error_count += 1
 
 
 def _tap_toggle_playback(loop, ui, state, now):
@@ -622,19 +692,31 @@ def _tap_toggle_playback(loop, ui, state, now):
     minidsp) never populate that text or its tap zone in the first place.
     """
     sound.click()
-    try:
+
+    def action():
         if state.media_state == "playing":
             driver.media_pause()
             state.media_state = "paused"
         else:
             driver.media_play()
             state.media_state = "playing"
+
+    if _try_action(loop, "media play/pause", action):
         dial_ui.draw_main(ui, state)
-        loop.last_poll = time.monotonic()
-        loop.error_count = 0
-    except Exception as e:
-        print("media play/pause:", e)
-        loop.error_count += 1
+
+
+def _tap_media_prev(loop, ui, state, now):
+    """Tap the '<' beside the Playing/Paused status text -> previous track.
+    No local state to flip -- nothing to redraw either way, unlike the
+    toggle handlers above."""
+    sound.click()
+    _try_action(loop, "media previous", driver.media_previous)
+
+
+def _tap_media_next(loop, ui, state, now):
+    """Tap the '>' beside the Playing/Paused status text -> next track."""
+    sound.click()
+    _try_action(loop, "media next", driver.media_next)
 
 
 def _tap_main_screen(loop, ui, state, now):
@@ -643,10 +725,21 @@ def _tap_main_screen(loop, ui, state, now):
     no-op, so the button row doesn't accidentally toggle mute too. The
     play/pause status row (only populated when state.media_state is
     "playing"/"paused") is checked first since it overlaps the top of that
-    same "above the line" mute zone."""
-    if state.media_state in ("playing", "paused") and dial_ui.media_status_tap(loop.touch_x, loop.touch_y):
-        _tap_toggle_playback(loop, ui, state, now)
-        return
+    same "above the line" mute zone -- the narrow prev/next zones flanking
+    it are checked before the full-row toggle zone, so they take priority
+    over toggling play/pause without shrinking that zone's own generous
+    "anywhere in the row" target.
+    """
+    if state.media_state in ("playing", "paused"):
+        if dial_ui.media_prev_tap(loop.touch_x, loop.touch_y):
+            _tap_media_prev(loop, ui, state, now)
+            return
+        if dial_ui.media_next_tap(loop.touch_x, loop.touch_y):
+            _tap_media_next(loop, ui, state, now)
+            return
+        if dial_ui.media_status_tap(loop.touch_x, loop.touch_y):
+            _tap_toggle_playback(loop, ui, state, now)
+            return
 
     if loop.touch_y < dial_ui.PRESET_NAME_Y:
         _tap_toggle_mute(loop, ui, state, now)
@@ -706,8 +799,18 @@ def _dispatch_tap(loop, ui, state, now):
         microcontroller.reset()
         return
 
-    if state.power != "ON":
-        return   # standby taps handled elsewhere (power long-press only)
+    if state.power != "ON" and loop.mode == MODE_MAIN:
+        # Standby, resting on the power-off screen: nothing responds to a
+        # short tap except the centered MENU zone (the power ring's hollow
+        # middle -- see dial_ui.draw_main's power-off branch, which moves
+        # the MENU hint there instead of its normal bottom position), and
+        # only for backends that can switch to a different target
+        # (CAPS["player_select"], e.g. HA's Media Player list). Power
+        # itself is long-press only, handled in _handle_touch_down, not
+        # here.
+        if driver.CAPS["player_select"] and dial_ui.menu_standby_tap(loop.touch_x, loop.touch_y):
+            _tap_open_menu(loop, ui, now)
+        return
 
     if (loop.touch_x - loop.touch_x_start < -SWIPE_THRESHOLD
             and loop.mode in (MODE_MENU_TOP, MODE_MENU_DEV, MODE_MENU_SUB)):
@@ -958,6 +1061,14 @@ def main():
     except Exception as e:
         print("load_source_list:", e)
 
+    # Discover every controllable target this backend can see (currently
+    # only ha.py -- every media_player entity in the Home Assistant
+    # instance). No-op for drivers that don't support it (driver.CAPS).
+    try:
+        driver.load_players()
+    except Exception as e:
+        print("load_players:", e)
+
     # --- device state ---
     state = AVRState()
     state.brightness = _load_brightness()
@@ -980,6 +1091,12 @@ def main():
         state.preset_enabled = driver.get_preset_enabled()
     except Exception as e:
         print("get_presets:", e, "| free mem:", gc.mem_free())
+
+    gc.collect()
+    try:
+        state.player_id, state.player_names = driver.get_players()
+    except Exception as e:
+        print("get_players:", e, "| free mem:", gc.mem_free())
 
     loop = _Loop()
     loop.last_pos = encoder.position
