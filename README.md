@@ -41,7 +41,7 @@ The range is configurable via settings file. For example, I like a volume range 
 
 ### Mute
 
-Tapping the screen area anywhere above the preset name will mute the device. While muted, the volume number and all color elemnts on the display appear blue, and the number will slowly pulsate like a sleep indicator.
+Tapping the screen area anywhere above the preset name will mute the device. While muted, the volume number and all color elemnts on the display appear blue, and the number will slowly pulsate like a sleep indicator. Set `MUTE_PULSE = "false"` in `settings.toml` to keep it a static blue instead.
 
 ![Main screen muted](ui/main_muted.png)
 

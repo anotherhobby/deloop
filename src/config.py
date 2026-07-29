@@ -6,6 +6,19 @@
 
 import os
 
+
+def _get_bool(key, default):
+    """Parse a settings.toml value as a bool. Accepts either a real TOML
+    boolean (true/false, unquoted) or a quoted string ("true"/"false") --
+    every other key in this file is a quoted string by convention, and a
+    bare `if os.getenv(key)` would treat the *string* "false" as truthy,
+    silently enabling something the user tried to turn off."""
+    val = os.getenv(key, default)
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() == "true"
+
+
 # WiFi -- set in settings.toml
 WIFI_SSID = os.getenv("WIFI_SSID", "")
 WIFI_PASS = os.getenv("WIFI_PASS", "")
@@ -74,16 +87,7 @@ HA_TIMEOUT_MS = int(os.getenv("HA_TIMEOUT", "2000"))
 # volume/mute/power/source: it depends on whatever source is currently
 # selected (e.g. no-op on a plain analog input) and isn't tested as
 # thoroughly. Opt in once you've confirmed it behaves well with your setup.
-# Accepts either a real TOML boolean (true/false, no quotes) or a quoted
-# string ("true"/"false") -- CircuitPython's settings.toml supports typed
-# bools, but every other key in this file is a quoted string, so this is
-# normalized explicitly rather than trusting a bare `if os.getenv(...)`,
-# which would treat the *string* "false" as truthy and silently enable it.
-_ha_media_controls = os.getenv("HA_MEDIA_CONTROLS", False)
-HA_MEDIA_CONTROLS = (
-    _ha_media_controls if isinstance(_ha_media_controls, bool)
-    else str(_ha_media_controls).strip().lower() == "true"
-)
+HA_MEDIA_CONTROLS = _get_bool("HA_MEDIA_CONTROLS", False)
 
 # Polling interval -- display state is truth; poll is error correction only
 POLL_INTERVAL_S  = float(os.getenv("POLL_INTERVAL", "30.0"))
@@ -122,3 +126,10 @@ ACCEL_SAFETY_CAP = float(os.getenv("ACCEL_SAFETY_CAP", "-15.0"))
 # setting (not a fixed value) -- dim room, dim standby indicator; bright
 # room, brighter one. 0.0-1.0.
 STANDBY_BRIGHTNESS_FRAC = float(os.getenv("STANDBY_BRIGHTNESS_FRAC", "0.25"))
+
+# Mute "breathing" animation (the volume number slowly pulses while muted) --
+# on by default. Turning this off also disables the trough-timed poll that
+# rides along with it (see code.py's _pulse_mute) -- polling while muted
+# falls back to the normal adaptive schedule instead, since there's no
+# animation left to hide a poll's brief pause inside.
+MUTE_PULSE = _get_bool("MUTE_PULSE", True)

@@ -820,10 +820,12 @@ def _poll_avr(loop, ui, state, now):
       - Recently active (encoder/touch in last 30s): POLL_INTERVAL_S (30s)
         -- prevents polls chaining immediately after commands
       - Truly idle: 5s -- catch remote/app changes promptly
-    Always skipped while the encoder is moving, or while muted in MAIN
-    (_pulse_mute polls at the pulse trough instead).
+    Always skipped while the encoder is moving, or while muted in MAIN with
+    config.MUTE_PULSE on (_pulse_mute polls at the pulse trough instead --
+    with the pulse off there's no trough to hide a poll's pause in, so this
+    just runs on the normal schedule like any other time).
     """
-    if loop.mode == MODE_MAIN and state.power == "ON" and state.muted:
+    if loop.mode == MODE_MAIN and state.power == "ON" and state.muted and config.MUTE_PULSE:
         return
 
     in_standby = state.power != "ON"
@@ -851,7 +853,14 @@ def _pulse_mute(loop, ui, state, now):
     the pulse's natural pause at the bottom of each cycle to sneak in an
     AVR poll. Suspended while the encoder is actively turning -- see
     _handle_encoder_rotation and _send_volume_debounced for that path.
+
+    A no-op entirely when config.MUTE_PULSE is off -- the volume number
+    just stays the static muted color _set_vol_labels() already set, and
+    _poll_avr() falls back to its normal adaptive schedule instead of
+    relying on the trough poll this function would otherwise provide.
     """
+    if not config.MUTE_PULSE:
+        return
     if loop.mode != MODE_MAIN or state.power != "ON" or not state.muted:
         return
     if loop.enc_last_move > 0.0:

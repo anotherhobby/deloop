@@ -67,3 +67,4 @@ AVR_HOST = "192.168.1.100"
 # ACCEL_SAFETY_CAP  = "-15.0"  # max volume (dB) allowed during fast upward spin
 # POLL_INTERVAL     = "30.0"
 # STANDBY_BRIGHTNESS_FRAC = "0.25"  # standby/off brightness, as a fraction (0.0-1.0) of your own
+# MUTE_PULSE        = "false"  # mute "breathing" animation -- on by default, set false to disable
