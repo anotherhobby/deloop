@@ -62,6 +62,7 @@ _copy-files:
 	cp src/driver.py   $(CIRCUITPY)/driver.py
 	cp src/denon.py    $(CIRCUITPY)/denon.py
 	cp src/minidsp.py  $(CIRCUITPY)/minidsp.py
+	cp src/ha.py       $(CIRCUITPY)/ha.py
 	cp src/state.py    $(CIRCUITPY)/state.py
 	cp src/dial_ui.py  $(CIRCUITPY)/dial_ui.py
 	cp src/sound.py    $(CIRCUITPY)/sound.py
@@ -107,4 +108,16 @@ MINIDSP_PORT ?= $(shell grep '^MINIDSP_PORT' src/settings.toml 2>/dev/null | gre
 probe-minidsp:
 	$(PYTHON) tools/probe_minidsp.py --host $(or $(MINIDSP_HOST),127.0.0.1) --port $(or $(MINIDSP_PORT),5380) $(PROBE_ARGS)
 
-.PHONY: bootstrap install-libs full-deploy deploy _copy-files ls shell probe dump-avr probe-minidsp renders
+# Run the host-side Home Assistant REST probe (requires HA reachable on
+# the network -- see settings.toml.template's HA section).
+# Usage: make probe-ha
+#        make probe-ha PROBE_ARGS=--skip-write
+HA_HOST     ?= $(shell grep '^HA_HOST' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
+HA_PORT     ?= $(shell grep '^HA_PORT' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' | grep -o '[0-9]*')
+HA_TOKEN    ?= $(shell grep '^HA_TOKEN' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
+HA_ENTITY_ID ?= $(shell grep '^HA_ENTITY_ID' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
+probe-ha:
+	$(PYTHON) tools/probe_ha.py --host $(HA_HOST) --port $(or $(HA_PORT),8123) \
+	  --token "$(HA_TOKEN)" --entity $(or $(HA_ENTITY_ID),media_player.office) $(PROBE_ARGS)
+
+.PHONY: bootstrap install-libs full-deploy deploy _copy-files ls shell probe dump-avr probe-minidsp probe-ha renders

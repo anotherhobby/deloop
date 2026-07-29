@@ -614,10 +614,40 @@ def _tap_toggle_mute(loop, ui, state, now):
         loop.error_count += 1
 
 
+def _tap_toggle_playback(loop, ui, state, now):
+    """Tap the Playing/Paused status text -> toggle HA media playback.
+
+    Only ever reachable when state.media_state is "playing"/"paused" (see
+    _tap_main_screen) -- backends that never set media_state (denon,
+    minidsp) never populate that text or its tap zone in the first place.
+    """
+    sound.click()
+    try:
+        if state.media_state == "playing":
+            driver.media_pause()
+            state.media_state = "paused"
+        else:
+            driver.media_play()
+            state.media_state = "playing"
+        dial_ui.draw_main(ui, state)
+        loop.last_poll = time.monotonic()
+        loop.error_count = 0
+    except Exception as e:
+        print("media play/pause:", e)
+        loop.error_count += 1
+
+
 def _tap_main_screen(loop, ui, state, now):
     """Tap above the preset name line -> toggle mute. At or below that line,
     only the quick-select buttons respond -- everything else there is a
-    no-op, so the button row doesn't accidentally toggle mute too."""
+    no-op, so the button row doesn't accidentally toggle mute too. The
+    play/pause status row (only populated when state.media_state is
+    "playing"/"paused") is checked first since it overlaps the top of that
+    same "above the line" mute zone."""
+    if state.media_state in ("playing", "paused") and dial_ui.media_status_tap(loop.touch_x, loop.touch_y):
+        _tap_toggle_playback(loop, ui, state, now)
+        return
+
     if loop.touch_y < dial_ui.PRESET_NAME_Y:
         _tap_toggle_mute(loop, ui, state, now)
         return
@@ -790,10 +820,12 @@ def _poll_avr(loop, ui, state, now):
       - Recently active (encoder/touch in last 30s): POLL_INTERVAL_S (30s)
         -- prevents polls chaining immediately after commands
       - Truly idle: 5s -- catch remote/app changes promptly
-    Always skipped while the encoder is moving, or while muted in MAIN
-    (_pulse_mute polls at the pulse trough instead).
+    Always skipped while the encoder is moving, or while muted in MAIN with
+    config.MUTE_PULSE on (_pulse_mute polls at the pulse trough instead --
+    with the pulse off there's no trough to hide a poll's pause in, so this
+    just runs on the normal schedule like any other time).
     """
-    if loop.mode == MODE_MAIN and state.power == "ON" and state.muted:
+    if loop.mode == MODE_MAIN and state.power == "ON" and state.muted and config.MUTE_PULSE:
         return
 
     in_standby = state.power != "ON"
@@ -821,7 +853,14 @@ def _pulse_mute(loop, ui, state, now):
     the pulse's natural pause at the bottom of each cycle to sneak in an
     AVR poll. Suspended while the encoder is actively turning -- see
     _handle_encoder_rotation and _send_volume_debounced for that path.
+
+    A no-op entirely when config.MUTE_PULSE is off -- the volume number
+    just stays the static muted color _set_vol_labels() already set, and
+    _poll_avr() falls back to its normal adaptive schedule instead of
+    relying on the trough poll this function would otherwise provide.
     """
+    if not config.MUTE_PULSE:
+        return
     if loop.mode != MODE_MAIN or state.power != "ON" or not state.muted:
         return
     if loop.enc_last_move > 0.0:
