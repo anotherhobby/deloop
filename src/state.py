@@ -15,6 +15,13 @@ class AVRState:
         self.power = "STANDBY"
         self.input = ""
 
+        # Raw playback-state string from backends that track it (currently
+        # only ha.py -- "playing"/"paused"/"on"/"idle"/etc, or "" for
+        # backends that never report this). dial_ui.py shows a play/pause
+        # status line + code.py offers a matching tap target only when this
+        # is exactly "playing" or "paused" -- see driver.py's contract note.
+        self.media_state = ""
+
         # Presets -- a device-specific "pick one of a few stored configs"
         # menu (Dirac Live filters on Denon, DSP config slots on MiniDSP;
         # see driver.py's CAPS["presets"]). Loaded at boot via
@@ -47,16 +54,19 @@ class AVRState:
 
         Returns True if any visible field changed.
         """
+        media_state = status.get("media_state", "")
         changed = (
             status["volume_db"] != self.volume_db
             or status["muted"] != self.muted
             or status["power"] != self.power
             or status["input"] != self.input
+            or media_state != self.media_state
         )
         self.volume_db = status["volume_db"]
         self.muted = status["muted"]
         self.power = status["power"]
         self.input = status["input"]
+        self.media_state = media_state
         return changed
 
     # ------------------------------------------------------------------

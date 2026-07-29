@@ -2,6 +2,7 @@
 src/settings.toml
 src/settings.toml.minidsp
 src/settings.toml.denon
+src/settings.toml.ha
 
 # Python
 .venv/

@@ -17,6 +17,7 @@
 #   draw_menu(ui, title, items, cursor)
 #   exit_menu(ui)
 #   preset_button_at(x, y, n)          hit-test for the quick-select buttons
+#   media_status_tap(x, y)             hit-test for the play/pause status row
 #   BRIGHTNESS_ON                      constant used by code.py
 #
 # Screen layout:
@@ -64,10 +65,20 @@ _ARC_SWEEP  = 240.0  # total span → ends at 4 o'clock
 
 # Gauge range comes straight from config.py -- it differs by driver (a Denon
 # AVR's volume is dB-relative-to-reference; a MiniDSP's is dB-of-attenuation
-# below unity). Color bands below are proportional fractions of this span
+# below unity; an HA media_player entity is a 0-100 percent scale with no dB
+# concept at all). Color bands below are proportional fractions of this span
 # rather than fixed dB thresholds, so they scale to whatever range is active.
 _VOL_MIN    = config.VOLUME_MIN
 _VOL_MAX    = config.VOLUME_MAX
+
+# 0 dB is only a meaningful reference point (unity gain) when it actually
+# falls inside or at the top of the range -- true for Denon (mid-range) and
+# MiniDSP (0 dB = max, no attenuation), false for HA's 0-100 percent scale,
+# where 0 is just the bottom of the range and has no special meaning beyond
+# that (highlighting it would just double-mark the arc's own start). Derived
+# from the range itself, not a driver-name check, so any future all-positive
+# range gets the same treatment automatically.
+_HAS_ZERO_REF = _VOL_MIN < 0.0 <= _VOL_MAX
 
 # ── Power button geometry ─────────────────────────────────────────────────────
 _PWR_R_OUT  = 78    # ring outer radius
@@ -80,8 +91,9 @@ _PWR_STEM_BOT = CY - _PWR_R_IN  + 4   # y ≈ 66
 BRIGHTNESS_ON = 1.0
 
 # Standby screen brightness is relative to the user's own brightness setting,
-# not a fixed value -- dim room, dim standby indicator; bright room, brighter one.
-_STANDBY_BRIGHTNESS_FRAC = 0.25
+# not a fixed value -- dim room, dim standby indicator; bright room, brighter
+# one. Configurable via STANDBY_BRIGHTNESS_FRAC in settings.toml.
+_STANDBY_BRIGHTNESS_FRAC = config.STANDBY_BRIGHTNESS_FRAC
 
 # ── Menu geometry (exported so code.py can map touch_y → item index) ─────────
 MENU_ITEM_Y0  = 44    # y-centre of first visible item
@@ -207,6 +219,21 @@ def preset_button_at(x, y, n):
         if x0 <= x <= x1 and y0 <= y <= y1:
             return i
     return -1
+
+
+# Play/pause status row -- shares the same text slot as the preset name
+# (see _status_line() below), only ever populated for backends that set
+# state.media_state to "playing"/"paused" (currently ha.py -- see
+# driver.py's contract note). No x range check: same "large touch target,
+# ignore exact text width" approach as the mute zone above PRESET_NAME_Y.
+_STATUS_TAP_HALF_H = 13
+
+
+def media_status_tap(x, y):
+    """True if (x, y) falls within the play/pause status-text row. Only
+    meaningful when state.media_state is "playing"/"paused" -- see
+    code.py's _tap_main_screen, which checks that first."""
+    return (PRESET_NAME_Y - _STATUS_TAP_HALF_H) <= y <= (PRESET_NAME_Y + _STATUS_TAP_HALF_H)
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 _GLYPHS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-. +/&()"
@@ -423,7 +450,7 @@ def _draw_ticks(bmp):
     """Tick marks just outside the arc band, every 5 dB."""
     for db in _tick_values():
         angle = _vol_to_angle(db)
-        if abs(db) < 0.01:
+        if _HAS_ZERO_REF and abs(db) < 0.01:
             r_out, ci, thick = _R_TK_ZERO, _TK_0, 3
         elif round(db) % 10 == 0:
             r_out, ci, thick = _R_TK_MAJOR, _TK_L, 2
@@ -486,7 +513,8 @@ def _restore_region(bmp, angle, muted):
     for db in _tick_values():
         ta = _vol_to_angle(db)
         if a0 <= ta <= a1:
-            if abs(db) < 0.01:          r_out, ci, thick = _R_TK_ZERO, _TK_0, 3
+            if _HAS_ZERO_REF and abs(db) < 0.01:
+                r_out, ci, thick = _R_TK_ZERO, _TK_0, 3
             elif round(db) % 10 == 0:  r_out, ci, thick = _R_TK_MAJOR, _TK_L, 2
             else:                       r_out, ci, thick = _R_TK_MINOR, _TK_L, 1
             ix, iy = _axy(_R_TK_BASE, ta)
@@ -541,6 +569,20 @@ def _preset_name(state):
         if val == state.preset:
             return name
     return ""
+
+
+_MEDIA_STATE_TEXT = {"playing": "Playing", "paused": "Paused"}
+
+
+def _status_line(state):
+    """Text for the row below the volume number: the active preset/filter
+    name if this backend has any, else a play/pause status word if the
+    backend reports one (state.media_state), else blank -- same slot,
+    whichever's relevant for the active backend."""
+    name = _preset_name(state)
+    if name:
+        return name
+    return _MEDIA_STATE_TEXT.get(state.media_state, "")
 
 # ── Label helpers ─────────────────────────────────────────────────────────────
 
@@ -726,7 +768,7 @@ def draw_main(ui, state):
     _set_vol_labels(ui, state.volume_db, state.muted)
     ui["input"].text  = _driver.friendly_input(state.input)
     ui["input"].color = _C_DIM
-    ui["preset"].text  = _preset_name(state)
+    ui["preset"].text  = _status_line(state)
     ui["preset"].color = _C_DIM
     _draw_preset_filter_buttons(ui, state)
     ui["menu"].text  = "MENU"
@@ -752,7 +794,7 @@ def draw_busy(ui, state):
     _set_vol_labels(ui, state.volume_db, busy=True)
     ui["input"].text   = _driver.friendly_input(state.input)
     ui["input"].color  = _C_BUSY
-    ui["preset"].text  = _preset_name(state)
+    ui["preset"].text  = _status_line(state)
     ui["preset"].color = _C_BUSY
     for fl in ui["filters"]:
         fl.color = _C_DIM

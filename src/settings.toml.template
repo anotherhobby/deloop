@@ -7,7 +7,7 @@
 WIFI_SSID = "your_wifi_ssid"
 WIFI_PASS = "your_wifi_password"
 
-# Which device backend to use: "denon" (default) or "minidsp".
+# Which device backend to use: "denon" (default), "minidsp", or "ha".
 # See README.md "Device backends" for what each one supports.
 # DEVICE_DRIVER = "denon"
 
@@ -41,11 +41,25 @@ AVR_HOST = "192.168.1.100"
 # serial number instead of index -- see "version.serial" in `make probe-minidsp`.
 # MINIDSP_SERIAL        = ""
 
+# --- Home Assistant media_player entity (required if DEVICE_DRIVER = "ha") ---
+# Any entity in the media_player domain -- volume/mute/power/source only;
+# no preset/filter support (see README.md "Device backends").
+# HA_HOST      = "192.168.1.102"
+# HA_PORT      = "8123"
+# HA_TOKEN     = "your_long_lived_access_token"
+# HA_ENTITY_ID = "media_player.office"
+# Play/pause status text + tap-to-toggle -- off by default. This is a rougher
+# fit than volume/mute/power/source: whether it actually does anything
+# depends on the currently selected source (e.g. no-op on a plain analog
+# input), so it's opt-in rather than on by default.
+# HA_MEDIA_CONTROLS = "true"
+
 # Optional overrides (safe to leave commented out)
-# VOLUME_MIN        = "-80.0"  # dB; per-driver default set in config.py
-# VOLUME_MAX        = "18.0"   # dB; per-driver default set in config.py
-# VOLUME_STEP       = "0.5"    # dB per tick at normal speed
-# VOLUME_STEP_FAST  = "2.0"    # dB per tick when spinning fast
+# VOLUME_MIN        = "-80.0"  # per-driver default set in config.py (dB, or
+# VOLUME_MAX        = "18.0"   # 0-100 percent for DEVICE_DRIVER = "ha")
+# VOLUME_STEP       = "0.5"    # per tick at normal speed (dB or percent)
+# VOLUME_STEP_FAST  = "2.0"    # per tick when spinning fast (dB or percent)
 # ACCEL_THRESHOLD   = "100"     # ms between ticks that triggers fast mode
 # ACCEL_SAFETY_CAP  = "-15.0"  # max volume (dB) allowed during fast upward spin
 # POLL_INTERVAL     = "30.0"
+# STANDBY_BRIGHTNESS_FRAC = "0.25"  # standby/off brightness, as a fraction (0.0-1.0) of your own

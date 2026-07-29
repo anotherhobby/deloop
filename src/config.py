@@ -18,6 +18,9 @@ WIFI_PASS = os.getenv("WIFI_PASS", "")
 #            minidsp-rs binds to 127.0.0.1:5380 by default, so its own
 #            config needs `bind_address = "0.0.0.0:5380"` (or similar) for
 #            deloop to reach it at all.
+# "ha": any Home Assistant media_player entity, via HA's REST API -- see
+#       ha.py. No preset/filter support (no generic media_player
+#       equivalent of Dirac Live/config slots).
 DEVICE_DRIVER = os.getenv("DEVICE_DRIVER", "denon")
 
 # AVR network settings
@@ -52,6 +55,28 @@ MINIDSP_SERIAL        = os.getenv("MINIDSP_SERIAL", "")
 # across MiniDSP's current lineup). See minidsp.py get_presets().
 MINIDSP_PRESET_COUNT  = int(os.getenv("MINIDSP_PRESET_COUNT", "4"))
 
+# Home Assistant settings
+HA_HOST       = os.getenv("HA_HOST", "")
+HA_PORT       = int(os.getenv("HA_PORT", "8123"))
+HA_TOKEN      = os.getenv("HA_TOKEN", "")
+HA_ENTITY_ID  = os.getenv("HA_ENTITY_ID", "media_player.office")
+HA_TIMEOUT_MS = int(os.getenv("HA_TIMEOUT", "2000"))
+# Play/pause status text + tap-to-toggle (see ha.py's get_status()) -- off by
+# default. media_player playback state/control is a rougher fit than
+# volume/mute/power/source: it depends on whatever source is currently
+# selected (e.g. no-op on a plain analog input) and isn't tested as
+# thoroughly. Opt in once you've confirmed it behaves well with your setup.
+# Accepts either a real TOML boolean (true/false, no quotes) or a quoted
+# string ("true"/"false") -- CircuitPython's settings.toml supports typed
+# bools, but every other key in this file is a quoted string, so this is
+# normalized explicitly rather than trusting a bare `if os.getenv(...)`,
+# which would treat the *string* "false" as truthy and silently enable it.
+_ha_media_controls = os.getenv("HA_MEDIA_CONTROLS", False)
+HA_MEDIA_CONTROLS = (
+    _ha_media_controls if isinstance(_ha_media_controls, bool)
+    else str(_ha_media_controls).strip().lower() == "true"
+)
+
 # Polling interval -- display state is truth; poll is error correction only
 POLL_INTERVAL_S  = float(os.getenv("POLL_INTERVAL", "30.0"))
 POLL_INTERVAL_MS = int(POLL_INTERVAL_S * 1000)
@@ -59,18 +84,33 @@ POLL_INTERVAL_MS = int(POLL_INTERVAL_S * 1000)
 # Volume limits and acceleration
 # Range differs by backend: a Denon AVR's master volume is dB-relative-to-
 # reference (0 dB = reference, positive = above it); a MiniDSP's master
-# volume is dB-of-attenuation (0 dB = unity/max, no positive headroom).
+# volume is dB-of-attenuation (0 dB = unity/max, no positive headroom); a
+# Home Assistant media_player entity has no dB concept at all -- HA always
+# normalizes volume_level to a 0.0-1.0 fraction, so ha.py maps that to a
+# plain 0-100 percent range instead.
 if DEVICE_DRIVER == "minidsp":
     VOLUME_MIN = float(os.getenv("VOLUME_MIN", "-127.0"))
     VOLUME_MAX = float(os.getenv("VOLUME_MAX", "0.0"))
+    VOLUME_STEP      = float(os.getenv("VOLUME_STEP", "0.5"))
+    VOLUME_STEP_FAST = float(os.getenv("VOLUME_STEP_FAST", "2.0"))
+elif DEVICE_DRIVER == "ha":
+    VOLUME_MIN = float(os.getenv("VOLUME_MIN", "0.0"))
+    VOLUME_MAX = float(os.getenv("VOLUME_MAX", "100.0"))
+    VOLUME_STEP      = float(os.getenv("VOLUME_STEP", "2.0"))      # percent/tick normal
+    VOLUME_STEP_FAST = float(os.getenv("VOLUME_STEP_FAST", "5.0")) # percent/tick fast spin
 else:
     VOLUME_MIN = float(os.getenv("VOLUME_MIN", "-80.0"))
     VOLUME_MAX = float(os.getenv("VOLUME_MAX", "18.0"))
-VOLUME_STEP      = float(os.getenv("VOLUME_STEP", "0.5"))      # dB/tick normal
-VOLUME_STEP_FAST = float(os.getenv("VOLUME_STEP_FAST", "2.0")) # dB/tick fast spin
+    VOLUME_STEP      = float(os.getenv("VOLUME_STEP", "0.5"))      # dB/tick normal
+    VOLUME_STEP_FAST = float(os.getenv("VOLUME_STEP_FAST", "2.0")) # dB/tick fast spin
 # Inter-tick interval (ms) below which fast mode kicks in.
 # 50ms = ~20 ticks/sec = ~1.3 revolutions/sec -- feels like a deliberate quick sweep.
 ACCEL_THRESHOLD_MS = int(os.getenv("ACCEL_THRESHOLD", "100"))
 # When spinning fast and increasing volume, stop here. Prevents accidental blasting.
 # Slow down to push past it intentionally.
 ACCEL_SAFETY_CAP = float(os.getenv("ACCEL_SAFETY_CAP", "-15.0"))
+
+# Standby/off screen brightness, as a fraction of the user's own brightness
+# setting (not a fixed value) -- dim room, dim standby indicator; bright
+# room, brighter one. 0.0-1.0.
+STANDBY_BRIGHTNESS_FRAC = float(os.getenv("STANDBY_BRIGHTNESS_FRAC", "0.25"))

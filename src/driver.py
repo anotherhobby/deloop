@@ -41,6 +41,16 @@
 #   get_status() -> {"volume_db", "muted", "power", "input"}
 #   set_volume(db) / mute_on() / mute_off() -- always required
 #
+#   get_status()'s dict may also include an optional "media_state" key --
+#   the driver's raw playback-state string (e.g. "playing"/"paused"), for
+#   backends whose underlying entity can report that. There's no CAPS flag
+#   for this: state.py defaults it to "" via .get() for any backend that
+#   doesn't return the key at all, and dial_ui.py/code.py only ever look
+#   for the exact values "playing"/"paused" -- so a backend that never sets
+#   it is simply never treated as playback-capable, no special-casing
+#   needed elsewhere. media_play()/media_pause() are the matching optional
+#   controls, called only when state.media_state is "playing"/"paused".
+#
 #   power_on() / power_standby()           -- required only if CAPS["power"]
 #   load_input_names() / load_source_list() / get_inputs() -> (index, [(index, name)])
 #     / set_input(index) / friendly_input(raw) -- required only if CAPS["input_select"]
@@ -65,6 +75,8 @@ import config
 
 if config.DEVICE_DRIVER == "minidsp":
     import minidsp as _impl
+elif config.DEVICE_DRIVER == "ha":
+    import ha as _impl
 else:
     import denon as _impl
 
@@ -79,6 +91,9 @@ mute_off   = _impl.mute_off
 
 power_on      = getattr(_impl, "power_on", lambda: None)
 power_standby = getattr(_impl, "power_standby", lambda: None)
+
+media_play  = getattr(_impl, "media_play", lambda: None)
+media_pause = getattr(_impl, "media_pause", lambda: None)
 
 load_input_names = getattr(_impl, "load_input_names", lambda: None)
 load_source_list  = getattr(_impl, "load_source_list", lambda: None)

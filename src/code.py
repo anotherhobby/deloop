@@ -614,10 +614,40 @@ def _tap_toggle_mute(loop, ui, state, now):
         loop.error_count += 1
 
 
+def _tap_toggle_playback(loop, ui, state, now):
+    """Tap the Playing/Paused status text -> toggle HA media playback.
+
+    Only ever reachable when state.media_state is "playing"/"paused" (see
+    _tap_main_screen) -- backends that never set media_state (denon,
+    minidsp) never populate that text or its tap zone in the first place.
+    """
+    sound.click()
+    try:
+        if state.media_state == "playing":
+            driver.media_pause()
+            state.media_state = "paused"
+        else:
+            driver.media_play()
+            state.media_state = "playing"
+        dial_ui.draw_main(ui, state)
+        loop.last_poll = time.monotonic()
+        loop.error_count = 0
+    except Exception as e:
+        print("media play/pause:", e)
+        loop.error_count += 1
+
+
 def _tap_main_screen(loop, ui, state, now):
     """Tap above the preset name line -> toggle mute. At or below that line,
     only the quick-select buttons respond -- everything else there is a
-    no-op, so the button row doesn't accidentally toggle mute too."""
+    no-op, so the button row doesn't accidentally toggle mute too. The
+    play/pause status row (only populated when state.media_state is
+    "playing"/"paused") is checked first since it overlaps the top of that
+    same "above the line" mute zone."""
+    if state.media_state in ("playing", "paused") and dial_ui.media_status_tap(loop.touch_x, loop.touch_y):
+        _tap_toggle_playback(loop, ui, state, now)
+        return
+
     if loop.touch_y < dial_ui.PRESET_NAME_Y:
         _tap_toggle_mute(loop, ui, state, now)
         return
