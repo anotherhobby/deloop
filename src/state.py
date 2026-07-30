@@ -22,6 +22,13 @@ class AVRState:
         # is exactly "playing" or "paused" -- see driver.py's contract note.
         self.media_state = ""
 
+        # Input channel count, from backends that can determine it (currently
+        # only camilladsp.py). None for backends that never report this --
+        # deliberately None, not 0, so "no data" and "confirmed silent/zero
+        # channels" (not a real scenario, but keep the distinction) aren't
+        # conflated. Not shown anywhere yet -- see driver.py's contract note.
+        self.channels = None
+
         # Presets -- a device-specific "pick one of a few stored configs"
         # menu (Dirac Live filters on Denon, DSP config slots on MiniDSP;
         # see driver.py's CAPS["presets"]). Loaded at boot via
@@ -35,6 +42,15 @@ class AVRState:
         self.preset         = ""
         self.preset_names   = []
         self.preset_enabled = True
+
+        # Main-screen quick-select button subset -- usually identical to
+        # preset_names (see driver.py's get_quick_presets() contract note),
+        # but can be a smaller, separately-configured list for a backend
+        # whose full preset_names can outgrow the button row (currently only
+        # camilladsp.py). Loaded at boot via driver.get_quick_presets();
+        # dial_ui.py's button row and its tap-rect math both read this, not
+        # preset_names.
+        self.preset_quick_names = []
 
         # Input list -- loaded from AVR at boot via denon.get_inputs().
         # input_names: list of (index, friendly_name)
@@ -64,18 +80,21 @@ class AVRState:
         Returns True if any visible field changed.
         """
         media_state = status.get("media_state", "")
+        channels = status.get("channels")
         changed = (
             status["volume_db"] != self.volume_db
             or status["muted"] != self.muted
             or status["power"] != self.power
             or status["input"] != self.input
             or media_state != self.media_state
+            or channels != self.channels
         )
         self.volume_db = status["volume_db"]
         self.muted = status["muted"]
         self.power = status["power"]
         self.input = status["input"]
         self.media_state = media_state
+        self.channels = channels
         return changed
 
     # ------------------------------------------------------------------

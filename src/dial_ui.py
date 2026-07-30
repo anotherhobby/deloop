@@ -235,8 +235,8 @@ def fade_power_off(ui, elapsed_s, from_brightness, state):
     return False
 
 # ── Preset quick-select buttons ───────────────────────────────────────────────
-# n is however many entries state.preset_names has -- the row is centred and
-# evenly spaced for whatever n turns out to be, not hardcoded.
+# n is however many entries state.preset_quick_names has -- the row is
+# centred and evenly spaced for whatever n turns out to be, not hardcoded.
 
 def _preset_btn_rects(n):
     """Return [(x0, y0, x1, y1), ...] for n evenly-spaced, centred buttons."""
@@ -650,8 +650,26 @@ def _restore_region(bmp, angle, muted):
     Only redraws the small angular window around the pointer – the bitmap
     dirty region stays tiny so the SPI transfer is near-instant.
     """
-    a0 = angle - _PTR_HALF - 2
-    a1 = angle + _PTR_HALF + 2
+    # Clamped to the gauge's actual sweep -- angle ± the pointer's half-angle
+    # margin can overshoot _ARC_START/_ARC_START+_ARC_SWEEP when the pointer
+    # sits near either end (i.e. near min or max volume). _arc_solid() has no
+    # bounds-check of its own (it's a generic primitive that paints exactly
+    # the range it's given, including a wraparound past 360°), and
+    # _arc_color() still returns a real color for an out-of-range angle
+    # (clamped internally to green/red rather than "no color") -- so an
+    # unclamped window here was repainting extra colored pixels just past
+    # the true arc tip on every incremental encoder tick near an extreme,
+    # visibly extending the green/red end of the arc past its real boundary
+    # after repeated ticks (confirmed live: red visibly crept ~5% further
+    # around at max volume; the mirror bug exists at min volume with green,
+    # just less noticed). A full draw_main() repaints the exact bounds and
+    # masks this every time, which is why it only showed up during a live,
+    # sustained encoder spin -- confirmed by simulating one off-device
+    # (many draw_volume() calls in sequence) and diffing against a clean
+    # full render at the same final angle: identical after this clamp,
+    # divergent before it.
+    a0 = max(_ARC_START, angle - _PTR_HALF - 2)
+    a1 = min(_ARC_START + _ARC_SWEEP, angle + _PTR_HALF + 2)
     arc_col = _BLUE if muted else _arc_color
     # 1. Erase with a slightly-expanded black triangle – same algorithm as draw,
     #    guarantees every pointer pixel is covered with no mismatched gaps.
@@ -812,7 +830,11 @@ def _hide_vol_and_status(ui):
 
 
 def _draw_preset_filter_buttons(ui, state):
-    """Draw the quick-select button outlines + numbers for state.preset_names.
+    """Draw the quick-select button outlines + numbers for
+    state.preset_quick_names -- usually the same list as state.preset_names,
+    but can be a smaller, separately-configured subset (see driver.py's
+    get_quick_presets() contract note; currently only camilladsp.py uses
+    that distinction).
 
     There's no separate "off" button -- tapping the already-selected slot
     toggles state.preset_enabled in place (see code.py), so the same slot
@@ -822,9 +844,9 @@ def _draw_preset_filter_buttons(ui, state):
     blue too, matching the rest of the muted display; a disabled slot is
     unaffected by mute, so it's left alone either way.
     """
-    n = min(len(state.preset_names), len(ui["filters"]))
+    n = min(len(state.preset_quick_names), len(ui["filters"]))
     selected = -1
-    for i, (val, _name) in enumerate(state.preset_names):
+    for i, (val, _name) in enumerate(state.preset_quick_names):
         if val == state.preset:
             selected = i
             break
@@ -919,7 +941,7 @@ def init():
 
     # ── Preset quick-select buttons: numbered labels over the bitmap outlines ──
     # Positioned dynamically each draw_main() call, since the row layout
-    # depends on how many presets state.preset_names actually has.
+    # depends on how many presets state.preset_quick_names actually has.
     filter_btns = []
     for i in range(_DBTN_MAX):
         fl = label.Label(

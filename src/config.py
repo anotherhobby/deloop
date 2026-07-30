@@ -37,6 +37,12 @@ WIFI_PASS = os.getenv("WIFI_PASS", "")
 # "wiim": a WiiM/LinkPlay streamer, direct over its own HTTPS API -- see
 #         wiim.py. HTTPS-only with a self-signed (but fixed, not per-device)
 #         cert -- see wiim.py's module docstring.
+# "camilladsp": a CamillaDSP process (https://github.com/HEnquist/camilladsp)
+#               running on some host, over its WebSocket control API -- see
+#               camilladsp.py. That host must be running CamillaDSP and
+#               reachable over the LAN, same topology as "minidsp". The only
+#               backend with a hand-rolled (not adafruit_requests) transport
+#               besides "wiim" -- see camilladsp.py's module docstring.
 DEVICE_DRIVER = os.getenv("DEVICE_DRIVER", "denon")
 
 # AVR network settings
@@ -116,6 +122,76 @@ WIIM_PRESET_NAMES = [n.strip() for n in
                       os.getenv("WIIM_PRESET_NAMES", "").split(",")
                       if n.strip()]
 
+# CamillaDSP settings
+CAMILLADSP_HOST       = os.getenv("CAMILLADSP_HOST", "")
+CAMILLADSP_PORT       = int(os.getenv("CAMILLADSP_PORT", "1234"))
+CAMILLADSP_TIMEOUT_MS = int(os.getenv("CAMILLADSP_TIMEOUT", "2000"))
+# Switching the active config file (see camilladsp.py's presets) reloads the
+# whole filter pipeline. Measured ~1-3ms live (2026-07-30) against a trivial
+# test config (SignalGenerator capture + one filter, no FIR/convolution files
+# to load) -- that's a lower bound, not a general answer, since a real room-
+# correction config with large filter files could be much slower to load.
+# Left at the same generous headroom minidsp.py needed for its own full-DSP-
+# reconfiguration case until someone times a real production config.
+CAMILLADSP_PRESET_TIMEOUT_MS = int(os.getenv("CAMILLADSP_PRESET_TIMEOUT", "10000"))
+# Presets -- CamillaDSP config files to offer, as "Name:/path/to/config.yml"
+# pairs, comma-separated, in menu order. Unlike MINIDSP_PRESET_NAMES/
+# WIIM_PRESET_NAMES (a plain name list matched up against a separately
+# configured slot count), CamillaDSP presets have no slot count at all --
+# they're just config file paths on the host running CamillaDSP -- so name
+# and path are configured together, one pair per preset. The path must be
+# absolute and resolvable by the CamillaDSP process itself, not by this
+# device. Splits on the first ":" only, so a path may not itself start with
+# a colon-separated prefix (fine for normal Linux/Mac paths).
+def _parse_camilladsp_presets(raw):
+    presets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        name, path = part.split(":", 1)
+        name, path = name.strip(), path.strip()
+        if name and path:
+            presets.append((path, name))
+    return presets
+
+
+CAMILLADSP_PRESETS = _parse_camilladsp_presets(os.getenv("CAMILLADSP_PRESETS", ""))
+
+# Main-screen quick-select buttons -- a subset of CAMILLADSP_PRESETS (by
+# name, comma-separated, up to 4 -- see dial_ui.py's _DBTN_MAX and
+# driver.py's CAPS["preset_quickbuttons"]/get_quick_presets() contract notes
+# for why a subset at all: CamillaDSP presets have no real ceiling on count,
+# so unlike minidsp.py/denon.py (whose full lists already fit the button
+# row), CAMILLADSP_PRESETS itself stays reachable only through the
+# scrollable Preset submenu, and this separate, deliberately small list is
+# what gets main-screen buttons. Leave unset for no quick buttons at all
+# (submenu-only). Names not found in CAMILLADSP_PRESETS are skipped with a
+# warning printed at boot; more than 4 names are truncated to the first 4,
+# also with a warning.
+def _parse_camilladsp_quick_presets(raw, presets):
+    by_name = {name: (path, name) for path, name in presets}
+    quick = []
+    for name in raw.split(","):
+        name = name.strip()
+        if not name:
+            continue
+        pair = by_name.get(name)
+        if pair is None:
+            print("config: CAMILLADSP_QUICK_PRESETS name {!r} not found in "
+                  "CAMILLADSP_PRESETS, skipping".format(name))
+            continue
+        quick.append(pair)
+    if len(quick) > 4:
+        print("config: CAMILLADSP_QUICK_PRESETS has {} entries, only the "
+              "first 4 get main-screen buttons".format(len(quick)))
+        quick = quick[:4]
+    return quick
+
+
+CAMILLADSP_QUICK_PRESETS = _parse_camilladsp_quick_presets(
+    os.getenv("CAMILLADSP_QUICK_PRESETS", ""), CAMILLADSP_PRESETS)
+
 # Polling interval -- display state is truth; poll is error correction only
 POLL_INTERVAL_S  = float(os.getenv("POLL_INTERVAL", "30.0"))
 POLL_INTERVAL_MS = int(POLL_INTERVAL_S * 1000)
@@ -128,9 +204,35 @@ POLL_INTERVAL_MS = int(POLL_INTERVAL_S * 1000)
 # normalizes volume_level to a 0.0-1.0 fraction, so ha.py maps that to a
 # plain 0-100 percent range instead. A WiiM streamer lands on the same 0-100
 # range but natively -- its API takes and reports a plain integer percent,
-# with no conversion needed on wiim.py's side.
+# with no conversion needed on wiim.py's side. CamillaDSP's SetVolume takes
+# a real dB value like MiniDSP's, clamped server-side to -150..+50 (per its
+# own docs), but -150..0 (the full attenuation-only portion of that) is a
+# poor default in practice -- it's far wider than anyone actually uses, so
+# most of the dial's rotation would land in inaudibly-quiet territory. -50..0
+# is instead confirmed from a real, well-sourced reference point: CamillaGUI
+# (HEnquist/camillagui-backend, the official companion web GUI, same author
+# as CamillaDSP itself) ships this exact range as its own hardcoded default
+# (`volume_range: 50` / `volume_max: 0` in config/gui-config.yml and
+# backend/settings.py) -- confirmed by reading that repo directly, not a
+# forum guess. It's also a coincidentally exact match for VOLUME_MIN=-50
+# already used for `minidsp` here (see the "-127..0" default below, commonly
+# narrowed to -50..0 in practice) -- worth knowing that match is about
+# digital gain math, not necessarily identical loudness: both systems use
+# the same 20*log10(amplitude) dB convention for volume (confirmed in
+# CamillaDSP's own src/utils/decibels.rs), so -50dB attenuates the digital
+# signal by the identical amount on both -- but how loud that actually
+# sounds also depends on each system's downstream analog gain (DAC output
+# level, amp gain, speaker sensitivity), which differs per setup and neither
+# DSP's own volume number encodes. Override VOLUME_MAX if a config
+# genuinely needs headroom above unity (positive gain risks clipping
+# downstream unless deliberately configured for make-up gain).
 if DEVICE_DRIVER == "minidsp":
     VOLUME_MIN = float(os.getenv("VOLUME_MIN", "-127.0"))
+    VOLUME_MAX = float(os.getenv("VOLUME_MAX", "0.0"))
+    VOLUME_STEP      = float(os.getenv("VOLUME_STEP", "0.5"))
+    VOLUME_STEP_FAST = float(os.getenv("VOLUME_STEP_FAST", "2.0"))
+elif DEVICE_DRIVER == "camilladsp":
+    VOLUME_MIN = float(os.getenv("VOLUME_MIN", "-50.0"))
     VOLUME_MAX = float(os.getenv("VOLUME_MAX", "0.0"))
     VOLUME_STEP      = float(os.getenv("VOLUME_STEP", "0.5"))
     VOLUME_STEP_FAST = float(os.getenv("VOLUME_STEP_FAST", "2.0"))

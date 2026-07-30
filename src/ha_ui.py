@@ -53,7 +53,8 @@ def draw_status_rows(ui, state, dim_color):
     still use the text label.
     """
     ui["preset"].text  = _player_name(state)
-    ui["preset"].color = _ui._C_MENU
+    ui["preset"].color = _ui._C_DIM   # match the input row's brightness,
+                                       # not the near-invisible MENU-hint dim
 
     name = _ui._preset_name(state)
     ui["player"].text  = name

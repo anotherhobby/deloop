@@ -69,7 +69,7 @@ MPY_CROSS := local/mpy-cross
 # than what the runtime compiler produces from `.py` source AND skips
 # paying that compile-time cost at all -- see CLAUDE.md's "CircuitPython
 # heap/boot-memory guardrails" for why that's not just a flash-space nicety.
-MPY_MODULES := config driver denon minidsp ha ha_ui wiim wiim_ui state dial_ui sound app
+MPY_MODULES := config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app
 
 _copy-files-mpy:
 	cp src/settings.toml $(CIRCUITPY)/settings.toml
@@ -130,6 +130,35 @@ splash:
 renders:
 	$(PYTHON) tools/dial_sim.py
 
+# ui-renders: regenerate the polished per-backend screenshots in ui/ that
+# README.md actually embeds (ui-denon.png, ui-minidsp.png, ui-wiim.png,
+# ui-camilladsp.png, ui-homeassistant.png, ui-muted.png, ui-standby.png). One subprocess per
+# backend -- DEVICE_DRIVER binds at import time, so a single process can't
+# switch mid-run; see tools/render_ui_screenshots.py's module docstring.
+# Run this after any dial_ui.py change that affects layout/colors/text.
+# MINIDSP_HOST/CAMILLADSP_HOST etc. are never touched -- rendering only
+# imports config.py/dial_ui.py, no network calls, no real device needed.
+# CAMILLADSP_PRESETS/CAMILLADSP_QUICK_PRESETS below are NOT optional --
+# camilladsp.py's CAPS["preset_quickbuttons"] is derived from
+# len(config.CAMILLADSP_QUICK_PRESETS) at import time, so leaving it unset
+# renders a real-looking but buttonless screenshot even though
+# render_ui_screenshots.py's fixture sets state.preset_quick_names -- CAPS
+# gates whether dial_ui.py draws the row at all, regardless of what's in
+# state. Confirmed live: this was exactly the first bug in this target.
+ui-renders:
+	DEVICE_DRIVER=denon \
+	  $(PYTHON) tools/render_ui_screenshots.py --backend denon
+	DEVICE_DRIVER=minidsp VOLUME_MIN=-50.0 VOLUME_MAX=0.0 \
+	  $(PYTHON) tools/render_ui_screenshots.py --backend minidsp
+	DEVICE_DRIVER=wiim WIIM_PRESET_COUNT=3 WIIM_PRESET_NAMES="Bass +8,Preset 1,Preset 2" \
+	  $(PYTHON) tools/render_ui_screenshots.py --backend wiim
+	DEVICE_DRIVER=camilladsp \
+	  CAMILLADSP_PRESETS="Flat:/path/to/flat.yml,Quiet:/path/to/quiet.yml,Muffled:/path/to/muffled.yml" \
+	  CAMILLADSP_QUICK_PRESETS="Flat,Quiet,Muffled" \
+	  $(PYTHON) tools/render_ui_screenshots.py --backend camilladsp
+	DEVICE_DRIVER=ha VOLUME_MIN=0.0 VOLUME_MAX=100.0 HA_MEDIA_CONTROLS=true \
+	  $(PYTHON) tools/render_ui_screenshots.py --backend ha
+
 fonts:
 	@mkdir -p src/fonts
 	@for s in $(FONT_SIZES); do \
@@ -149,6 +178,7 @@ _copy-files:
 	cp src/driver.py   $(CIRCUITPY)/driver.py
 	cp src/denon.py    $(CIRCUITPY)/denon.py
 	cp src/minidsp.py  $(CIRCUITPY)/minidsp.py
+	cp src/camilladsp.py $(CIRCUITPY)/camilladsp.py
 	cp src/ha.py       $(CIRCUITPY)/ha.py
 	cp src/ha_ui.py    $(CIRCUITPY)/ha_ui.py
 	cp src/wiim.py     $(CIRCUITPY)/wiim.py
@@ -219,4 +249,16 @@ WIIM_HOST ?= $(shell grep '^WIIM_HOST' src/settings.toml 2>/dev/null | grep -o '
 probe-wiim:
 	$(PYTHON) tools/probe_wiim.py --host $(WIIM_HOST) $(PROBE_ARGS)
 
-.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha probe-wiim renders
+# Run the host-side CamillaDSP websocket probe (requires the process
+# reachable on the network -- see settings.toml.template's camilladsp
+# section). Uses the `websocket-client` package (a known-good WebSocket
+# implementation) rather than src/camilladsp.py's own hand-rolled client --
+# a failure here means "check CAMILLADSP_HOST/PORT", not "check the driver".
+# Usage: make probe-camilladsp
+#        make probe-camilladsp PROBE_ARGS=--skip-write
+CAMILLADSP_HOST ?= $(shell grep '^CAMILLADSP_HOST' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
+CAMILLADSP_PORT ?= $(shell grep '^CAMILLADSP_PORT' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' | grep -o '[0-9]*')
+probe-camilladsp:
+	$(PYTHON) tools/probe_camilladsp.py --host $(CAMILLADSP_HOST) --port $(or $(CAMILLADSP_PORT),1234) $(PROBE_ARGS)
+
+.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp renders ui-renders

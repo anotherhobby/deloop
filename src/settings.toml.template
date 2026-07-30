@@ -7,8 +7,8 @@
 WIFI_SSID = "your_wifi_ssid"
 WIFI_PASS = "your_wifi_password"
 
-# Which device backend to use: "denon" (default), "minidsp", "ha", or "wiim".
-# See README.md "Device backends" for what each one supports.
+# Which device backend to use: "denon" (default), "minidsp", "ha", "wiim",
+# or "camilladsp". See README.md "Device backends" for what each one supports.
 # DEVICE_DRIVER = "denon"
 
 # --- Denon/Marantz AVR (required if DEVICE_DRIVER = "denon") ---
@@ -78,6 +78,37 @@ AVR_HOST = "192.168.1.100"
 # left unnamed falls back to "Preset N". See src/wiim.py's module docstring.
 # WIIM_PRESET_COUNT = "2"
 # WIIM_PRESET_NAMES = "Morning Radio,Jazz Station"
+
+# --- CamillaDSP (required if DEVICE_DRIVER = "camilladsp") ---
+# Confirmed working end to end on real M5 Dial hardware (2026-07-30) -- run
+# `make probe-camilladsp` first regardless, to confirm your own instance
+# behaves as expected before flashing.
+# Host running CamillaDSP -- NOT anything about the audio devices it's
+# processing, just where its own websocket control server is reachable.
+# Same "must already be running, must be LAN-reachable" topology as minidsp,
+# except CamillaDSP's control API is websocket-only, no HTTP option -- see
+# src/camilladsp.py.
+# CAMILLADSP_HOST = "192.168.1.104"
+# CAMILLADSP_PORT = "1234"   # whatever port CamillaDSP was started with -p
+# CAMILLADSP_TIMEOUT = "2000"
+# Presets -- CamillaDSP config files to offer, as "Name:/path/to/config.yml"
+# pairs, comma-separated, in menu order. Path must be absolute and resolvable
+# by the CamillaDSP process itself (not this device). Leave unset for no
+# Preset menu at all. Reachable through the scrollable Preset menu regardless
+# of size -- CAMILLADSP_QUICK_PRESETS below is a separate, smaller list for
+# main-screen buttons.
+# CAMILLADSP_PRESETS = "Movie:/home/user/configs/movie.yml,Music:/home/user/configs/music.yml"
+# Up to 4 names from CAMILLADSP_PRESETS (must match exactly) to also show as
+# main-screen quick-select buttons, comma-separated. Leave unset for no quick
+# buttons at all (submenu-only). Unlike minidsp/denon, CAMILLADSP_PRESETS
+# itself has no size limit, so this is a deliberately separate, capped list
+# rather than "show buttons for everything" -- see src/camilladsp.py.
+# CAMILLADSP_QUICK_PRESETS = "Movie,Music"
+# Switching presets triggers a full filter-pipeline reload -- raise this if
+# your config is slow to reload. Measured ~1-3ms against a trivial test
+# config (no FIR/convolution files to load) -- a real production config
+# could be much slower; not yet measured for that case.
+# CAMILLADSP_PRESET_TIMEOUT = "10000"
 
 # Optional overrides (safe to leave commented out)
 # VOLUME_MIN        = "-80.0"  # per-driver default set in config.py (dB, or 0-100

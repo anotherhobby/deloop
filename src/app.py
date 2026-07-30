@@ -787,11 +787,11 @@ def _tap_main_screen(loop, ui, state, now):
             _tap_open_preset_menu(loop, ui, state, now)
         return   # otherwise: presets (if any) are only reachable via the top menu
 
-    idx = dial_ui.preset_button_at(loop.touch_x, loop.touch_y, len(state.preset_names))
+    idx = dial_ui.preset_button_at(loop.touch_x, loop.touch_y, len(state.preset_quick_names))
     if idx == -1:
         return
 
-    vals = [v for v, _ in state.preset_names]
+    vals = [v for v, _ in state.preset_quick_names]
     selected_idx = vals.index(state.preset) if state.preset in vals else -1
 
     if idx == selected_idx and not driver.CAPS["preset_enable"]:
@@ -811,7 +811,7 @@ def _tap_main_screen(loop, ui, state, now):
             driver.set_preset_enabled(new_enabled)
             state.preset_enabled = new_enabled
         else:
-            val, _name = state.preset_names[idx]
+            val, _name = state.preset_quick_names[idx]
             driver.set_preset(val)
             state.preset = val
             # Only flip to enabled if this backend's set_preset() actually
@@ -1127,6 +1127,15 @@ def main():
         ssl_context = ssl.create_default_context()
         ssl_context.load_verify_locations(cadata=wiim.LINKPLAY_CA_PEM)
         wiim.init_transport(pool, ssl_context)
+    elif config.DEVICE_DRIVER == "camilladsp":
+        # CamillaDSP's control protocol is WebSocket-only -- adafruit_requests
+        # doesn't speak that at all, so this backend needs the raw socket pool
+        # directly, same reason (different protocol) as wiim.py above. No TLS
+        # here (plain ws://), so no ssl_context needed. See camilladsp.py's
+        # module docstring for the transport details -- confirmed working on
+        # real hardware, same as wiim's.
+        import camilladsp
+        camilladsp.init_transport(pool)
     driver.init(session)
 
     # Fetch input friendly names and source list (for menu) once at boot.
@@ -1169,6 +1178,7 @@ def main():
     try:
         state.preset, state.preset_names = driver.get_presets()
         state.preset_enabled = driver.get_preset_enabled()
+        state.preset_quick_names = driver.get_quick_presets()
     except Exception as e:
         print("get_presets:", e, "| free mem:", gc.mem_free())
 
