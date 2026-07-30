@@ -694,11 +694,11 @@ def _tap_toggle_mute(loop, ui, state, now):
 
 
 def _tap_toggle_playback(loop, ui, state, now):
-    """Tap the Playing/Paused status text -> toggle HA media playback.
+    """Tap the play/pause status row -> toggle media playback.
 
     Only ever reachable when state.media_state is "playing"/"paused" (see
     _tap_main_screen) -- backends that never set media_state (denon,
-    minidsp) never populate that text or its tap zone in the first place.
+    minidsp) never populate that row or its tap zone in the first place.
     """
     sound.click()
 
@@ -728,16 +728,38 @@ def _tap_media_next(loop, ui, state, now):
     _try_action(loop, "media next", driver.media_next)
 
 
+def _tap_open_preset_menu(loop, ui, state, now):
+    """Tap the preset/status text row -> jump straight into the Preset
+    submenu, same as selecting "Preset" from the top menu and pressing the
+    encoder button. Only reachable for a backend with presets but no
+    main-screen quick-select buttons (see _tap_main_screen) -- e.g. wiim,
+    where the row is otherwise just a static name/placeholder with nothing
+    else to tap."""
+    sound.click()
+    loop.menu_idle = now
+    label = driver.LABELS["presets"]
+    loop.sub_type, loop.sub_cursor, title, items = _open_submenu("preset", label, state)
+    loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
+    loop.mode = MODE_MENU_SUB
+    vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
+    dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True)
+
+
 def _tap_main_screen(loop, ui, state, now):
-    """Tap above the preset name line -> toggle mute. At or below that line,
-    only the quick-select buttons respond -- everything else there is a
-    no-op, so the button row doesn't accidentally toggle mute too. The
-    play/pause status row (only populated when state.media_state is
-    "playing"/"paused") is checked first since it overlaps the top of that
-    same "above the line" mute zone -- the narrow prev/next zones flanking
-    it are checked before the full-row toggle zone, so they take priority
-    over toggling play/pause without shrinking that zone's own generous
-    "anywhere in the row" target.
+    """Tap above the preset name line -> toggle mute. The play/pause status
+    row (only ever populated via a UI extension -- see driver.py's
+    contract -- currently at _PLAYER_NAME_Y, one row below the preset name)
+    is checked first since a backend with both presets and playback (e.g.
+    wiim) needs both rows tappable independently, not one sharing a slot
+    with the other. The narrow prev/next zones flanking it are checked
+    before the full-row toggle zone, so they take priority without
+    shrinking that zone's own generous "anywhere in the row" target.
+
+    At the preset name row itself (PRESET_NAME_Y): quick-select buttons
+    respond if the backend has them (CAPS["preset_quickbuttons"]);
+    otherwise, for a backend with presets but no quick buttons (e.g. wiim),
+    tapping that row instead opens the Preset submenu directly (see
+    _tap_open_preset_menu).
     """
     if state.media_state in ("playing", "paused"):
         if dial_ui.media_prev_tap(loop.touch_x, loop.touch_y):
@@ -753,6 +775,17 @@ def _tap_main_screen(loop, ui, state, now):
     if loop.touch_y < dial_ui.PRESET_NAME_Y:
         _tap_toggle_mute(loop, ui, state, now)
         return
+
+    if not driver.CAPS["preset_quickbuttons"]:
+        # No fixed lower bound needed here (e.g. matching wherever a UI
+        # extension draws its own play/pause row) -- _dispatch_tap already
+        # only calls this function for touch_y < MENU_TAP_Y (below that is
+        # the bottom MENU-tap zone), and the media-tap checks above already
+        # ran first and would have claimed their own zone whenever
+        # state.media_state qualifies -- this only fires for whatever's left.
+        if driver.CAPS["presets"]:
+            _tap_open_preset_menu(loop, ui, state, now)
+        return   # otherwise: presets (if any) are only reachable via the top menu
 
     idx = dial_ui.preset_button_at(loop.touch_x, loop.touch_y, len(state.preset_names))
     if idx == -1:
@@ -1077,6 +1110,23 @@ def main():
     # --- HTTP session (device backend selected by config.DEVICE_DRIVER) ---
     pool = socketpool.SocketPool(wifi.radio)
     session = adafruit_requests.Session(pool)
+    if config.DEVICE_DRIVER == "wiim":
+        # WiiM's httpapi.asp is HTTPS-only with a self-signed cert whose CN
+        # (www.linkplay.com) never matches WIIM_HOST (an IP) -- and
+        # adafruit_requests has no way to use a different SNI/verification
+        # hostname than the request URL's literal host, so wiim.py can't use
+        # the shared Session above at all. It gets its own raw-socket
+        # transport instead, wired up directly here rather than through the
+        # generic driver.init(session) contract -- see wiim.py's module
+        # docstring for the full story (confirmed live on real hardware).
+        # Imported here, not at module level, so a denon/minidsp/ha build
+        # never pays to import or compile either module (see the heap/boot-
+        # memory guardrails in .claude/CLAUDE.md).
+        import ssl
+        import wiim
+        ssl_context = ssl.create_default_context()
+        ssl_context.load_verify_locations(cadata=wiim.LINKPLAY_CA_PEM)
+        wiim.init_transport(pool, ssl_context)
     driver.init(session)
 
     # Fetch input friendly names and source list (for menu) once at boot.

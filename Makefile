@@ -69,7 +69,7 @@ MPY_CROSS := local/mpy-cross
 # than what the runtime compiler produces from `.py` source AND skips
 # paying that compile-time cost at all -- see CLAUDE.md's "CircuitPython
 # heap/boot-memory guardrails" for why that's not just a flash-space nicety.
-MPY_MODULES := config driver denon minidsp ha ha_ui state dial_ui sound app
+MPY_MODULES := config driver denon minidsp ha ha_ui wiim wiim_ui state dial_ui sound app
 
 _copy-files-mpy:
 	cp src/settings.toml $(CIRCUITPY)/settings.toml
@@ -151,6 +151,8 @@ _copy-files:
 	cp src/minidsp.py  $(CIRCUITPY)/minidsp.py
 	cp src/ha.py       $(CIRCUITPY)/ha.py
 	cp src/ha_ui.py    $(CIRCUITPY)/ha_ui.py
+	cp src/wiim.py     $(CIRCUITPY)/wiim.py
+	cp src/wiim_ui.py  $(CIRCUITPY)/wiim_ui.py
 	cp src/state.py    $(CIRCUITPY)/state.py
 	cp src/dial_ui.py  $(CIRCUITPY)/dial_ui.py
 	cp src/sound.py    $(CIRCUITPY)/sound.py
@@ -209,4 +211,12 @@ probe-ha:
 	$(PYTHON) tools/probe_ha.py --host $(HA_HOST) --port $(or $(HA_PORT),8123) \
 	  --token "$(HA_TOKEN)" --entity $(or $(HA_ENTITY_ID),media_player.office) $(PROBE_ARGS)
 
-.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha renders
+# Run the host-side WiiM/LinkPlay HTTPS probe (requires the streamer
+# reachable on the network -- see settings.toml.template's WiiM section).
+# Usage: make probe-wiim
+#        make probe-wiim PROBE_ARGS=--skip-write
+WIIM_HOST ?= $(shell grep '^WIIM_HOST' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
+probe-wiim:
+	$(PYTHON) tools/probe_wiim.py --host $(WIIM_HOST) $(PROBE_ARGS)
+
+.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha probe-wiim renders

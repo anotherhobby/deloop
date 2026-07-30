@@ -13,7 +13,7 @@
 #
 #   CAPS: dict of {"power": bool, "input_select": bool, "presets": bool,
 #                  "preset_enable": bool, "preset_select_enables": bool,
-#                  "player_select": bool}
+#                  "player_select": bool, "preset_quickbuttons": bool}
 #     Declares which optional features the device/backend actually supports.
 #     code.py uses this to decide which menu items to build and whether the
 #     power long-press / preset-disable gestures do anything -- it never
@@ -35,6 +35,18 @@
 #     slot may deliberately want Dirac left off -- e.g. a headphone
 #     preset). code.py reads this to decide whether switching slots
 #     should also flip state.preset_enabled to True, or leave it alone.
+#
+#     "preset_quickbuttons" (default True) says whether the main-screen
+#     quick-select button row (dial_ui.py's _draw_preset_filter_buttons,
+#     up to _DBTN_MAX=5 pre-allocated slots) should render CAPS["presets"]'
+#     list at all. Denon (2 presets) and MiniDSP (<=4) leave this at the
+#     default; wiim.py sets it False because a WiiM unit's favorites list
+#     can be much longer than 5 -- past that point the quick-button row's
+#     fixed-slot drawing and its tap-rect math (which lays out rects for
+#     the *full* list length, not just the drawn slots) go out of sync.
+#     Backends with this False still get their presets via the always-
+#     generic, always-scrollable Preset submenu -- see CAPS["presets"]
+#     above -- just never the main-screen shortcut.
 #
 #   LABELS: dict of {"input_select": str, "presets": str}
 #     Display label for each optional feature's top-menu entry and submenu
@@ -124,6 +136,11 @@
 #     Hit-test and label placement for the power-off screen's MENU zone,
 #     only relevant for backends that can reach the menu from standby
 #     (CAPS["player_select"]).
+#
+# wiim_ui.py is the minimal-case example: it implements only
+# draw_status_rows/media_status_tap/media_prev_tap/media_next_tap (no
+# standby_menu_* -- wiim.py's CAPS["player_select"] is False, so app.py
+# never calls those on it regardless of whether they exist).
 
 import config
 
@@ -133,6 +150,9 @@ if config.DEVICE_DRIVER == "minidsp":
 elif config.DEVICE_DRIVER == "ha":
     import ha as _impl
     import ha_ui as _ui_impl
+elif config.DEVICE_DRIVER == "wiim":
+    import wiim as _impl
+    import wiim_ui as _ui_impl
 else:
     import denon as _impl
     _ui_impl = None
@@ -151,7 +171,7 @@ ui_impl = _ui_impl
 _CAPS_DEFAULTS = {
     "power": False, "input_select": False, "presets": False,
     "preset_enable": False, "preset_select_enables": False,
-    "player_select": False,
+    "player_select": False, "preset_quickbuttons": True,
 }
 for _key, _default in _CAPS_DEFAULTS.items():
     _impl.CAPS.setdefault(_key, _default)
