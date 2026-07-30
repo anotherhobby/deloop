@@ -7,7 +7,7 @@
 WIFI_SSID = "your_wifi_ssid"
 WIFI_PASS = "your_wifi_password"
 
-# Which device backend to use: "denon" (default), "minidsp", or "ha".
+# Which device backend to use: "denon" (default), "minidsp", "ha", or "wiim".
 # See README.md "Device backends" for what each one supports.
 # DEVICE_DRIVER = "denon"
 
@@ -58,9 +58,30 @@ AVR_HOST = "192.168.1.100"
 # input), so it's opt-in rather than on by default.
 # HA_MEDIA_CONTROLS = "true"
 
+# --- WiiM / LinkPlay streamer (required if DEVICE_DRIVER = "wiim") ---
+# The streamer's own IP -- deloop talks straight to it, no bridge/daemon and
+# no token or auth of any kind (unlike Home Assistant). Its API is HTTPS-only
+# with a self-signed certificate, which deloop already knows about and trusts
+# (LinkPlay ships the same cert on every unit) -- nothing to configure.
+# WIIM_HOST = "192.168.1.103"
+# Sources to offer in the Source menu, comma-separated, in menu order. The
+# default below was confirmed working on a WiiM Pro; other WiiM/LinkPlay
+# models expose a different physical set and there's no API that reports
+# which, so adjust to match your unit. Recognized keys: wifi, bluetooth,
+# line-in, optical, co-axial, udisk, hdmi, phono, pcusb.
+# WIIM_INPUTS = "wifi,bluetooth,line-in,optical"
+# WIIM_TIMEOUT = "2000"
+# WiiM-app Favorites can't be listed back reliably over the plain HTTP API
+# (confirmed live: getPresetInfo stays empty even with real Favorites
+# configured) -- set how many you've actually set up (1-12) to show a Preset
+# menu at all, and optionally name them, comma-separated in order. Any slot
+# left unnamed falls back to "Preset N". See src/wiim.py's module docstring.
+# WIIM_PRESET_COUNT = "2"
+# WIIM_PRESET_NAMES = "Morning Radio,Jazz Station"
+
 # Optional overrides (safe to leave commented out)
-# VOLUME_MIN        = "-80.0"  # per-driver default set in config.py (dB, or
-# VOLUME_MAX        = "18.0"   # 0-100 percent for DEVICE_DRIVER = "ha")
+# VOLUME_MIN        = "-80.0"  # per-driver default set in config.py (dB, or 0-100
+# VOLUME_MAX        = "18.0"   # percent for DEVICE_DRIVER = "ha" / "wiim")
 # VOLUME_STEP       = "0.5"    # per tick at normal speed (dB or percent)
 # VOLUME_STEP_FAST  = "2.0"    # per tick when spinning fast (dB or percent)
 # ACCEL_THRESHOLD   = "100"     # ms between ticks that triggers fast mode

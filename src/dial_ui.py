@@ -160,6 +160,7 @@ _BLUE  = 8   # muted arc fill
 _BTNSEL_OFF    = 9    # preset quick-select button: selected, but disabled
 _BTNSEL_MUTED  = 10   # preset quick-select button: selected preset, muted
 _GRAY  = 11  # busy arc fill -- see draw_busy()
+_TK_MENU = 12  # MENU-home frame -- see _draw_menu_home()
 _PRR            = _ORG   # power button ring / stem
 _BTNSEL_FILTER  = _ORG   # preset quick-select button: selected preset, enabled
 
@@ -176,7 +177,10 @@ _PALETTE = [
     0xA7A7A7,  #  9 preset button selected outline, disabled        (matches _C_BTN_SEL)
     0x2277CC,  # 10 preset button selected outline, preset + muted  (matches _C_MUTED)
     0x555555,  # 11 gray (busy -- a blocking device call is in flight)
-]   # 12 entries; value_count=16 → 4 spare slots
+    0x383838,  # 12 MENU-home frame -- matches _C_MENU exactly, not close to
+               #    any existing entry, so the frame reads as the same
+               #    barely-visible dimness as the MENU text itself
+]   # 13 entries; value_count=16 → 3 spare slots
 
 # ── Label colours ─────────────────────────────────────────────────────────────
 _C_TEXT    = 0xEEEEEE
@@ -570,6 +574,33 @@ def _draw_preset_buttons(bmp, n, selected_idx, selected_ci):
     for i, (x0, y0, x1, y1) in enumerate(_preset_btn_rects(n)):
         ci = selected_ci if i == selected_idx else _TK_L
         _rect_outline(bmp, x0, y0, x1, y1, ci)
+
+
+# "Home" frame behind the MENU hint -- a roof line + two flared legs, no
+# bottom edge. Meant to make the bottom MENU tap zone feel anchored/grounded
+# rather than a floating label, without reading as a competing UI element --
+# same barely-visible dimness as the MENU text itself (_TK_MENU == _C_MENU).
+# An earlier ellipse/arc concept (a partial ring bracketing MENU, sized to
+# match the preset button frame thickness) was mocked up off-device via
+# tools/dial_sim.py and rejected as visual noise; this shape and its exact
+# geometry were chosen the same way -- mocked up and confirmed before
+# writing this real version. Legs deliberately don't close into a full
+# trapezoid (no bottom line) -- confirmed live that a fully enclosed shape
+# read as "boxing in" rather than "grounding."
+_MENU_HOME_TOP_Y     = 196   # roof line, just below the preset button row
+_MENU_HOME_BOTTOM_Y  = 236   # where the legs end, near the visible rim
+_MENU_HOME_TOP_HW    = 28    # roof line half-width
+_MENU_HOME_LEG_HW    = 68    # leg half-width at the bottom
+
+
+def _draw_menu_home(bmp):
+    tl = (CX - _MENU_HOME_TOP_HW, _MENU_HOME_TOP_Y)
+    tr = (CX + _MENU_HOME_TOP_HW, _MENU_HOME_TOP_Y)
+    br = (CX + _MENU_HOME_LEG_HW, _MENU_HOME_BOTTOM_Y)
+    bl = (CX - _MENU_HOME_LEG_HW, _MENU_HOME_BOTTOM_Y)
+    _line(bmp, tl[0], tl[1], tr[0], tr[1], _TK_MENU)
+    _line(bmp, tr[0], tr[1], br[0], br[1], _TK_MENU)
+    _line(bmp, bl[0], bl[1], tl[0], tl[1], _TK_MENU)
 
 
 # Play/pause icon geometry -- drawn directly into the gauge bitmap with the
@@ -975,7 +1006,9 @@ def draw_main(ui, state):
     ui["input"].text  = _driver.friendly_input(state.input)
     ui["input"].color = _C_DIM
     _draw_status_rows(ui, state, _C_DIM)
-    _draw_preset_filter_buttons(ui, state)
+    if _driver.CAPS["preset_quickbuttons"]:
+        _draw_preset_filter_buttons(ui, state)
+    _draw_menu_home(ui["bmp"])
     ui["menu"].anchor_point      = _MENU_ANCHOR_MAIN
     ui["menu"].anchored_position = _MENU_POS_MAIN
     ui["menu"].text  = "MENU"

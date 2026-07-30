@@ -34,6 +34,9 @@ WIFI_PASS = os.getenv("WIFI_PASS", "")
 # "ha": any Home Assistant media_player entity, via HA's REST API -- see
 #       ha.py. No preset/filter support (no generic media_player
 #       equivalent of Dirac Live/config slots).
+# "wiim": a WiiM/LinkPlay streamer, direct over its own HTTPS API -- see
+#         wiim.py. HTTPS-only with a self-signed (but fixed, not per-device)
+#         cert -- see wiim.py's module docstring.
 DEVICE_DRIVER = os.getenv("DEVICE_DRIVER", "denon")
 
 # AVR network settings
@@ -89,6 +92,30 @@ HA_TIMEOUT_MS = int(os.getenv("HA_TIMEOUT", "2000"))
 # thoroughly. Opt in once you've confirmed it behaves well with your setup.
 HA_MEDIA_CONTROLS = _get_bool("HA_MEDIA_CONTROLS", False)
 
+# WiiM/LinkPlay streamer settings
+WIIM_HOST       = os.getenv("WIIM_HOST", "")
+WIIM_TIMEOUT_MS = int(os.getenv("WIIM_TIMEOUT", "2000"))
+# Physical/network sources to offer in the Source menu, as switchmode keys
+# (comma-separated). The default set (wifi, bluetooth, line-in, optical) was
+# empirically confirmed against a WiiM Pro -- see wiim.py's module
+# docstring. Other WiiM/LinkPlay models (Amp, Ultra, Pro Plus) may expose a
+# different physical set; there's no API endpoint that reports it, so this
+# is the escape hatch (same role MINIDSP_PRESET_NAMES plays for a similarly
+# per-unit list).
+WIIM_INPUTS = [s.strip() for s in
+               os.getenv("WIIM_INPUTS", "wifi,bluetooth,line-in,optical").split(",")
+               if s.strip()]
+# WiiM-app Favorites (activated via MCUKeyShortClick:1-12) can't be listed
+# back reliably over the plain HTTP API -- getPresetInfo's preset_list stays
+# empty even with Favorites configured; real names require the much heavier
+# UPnP/SOAP interface (GetKeyMapping), not implemented here. Same fallback
+# minidsp.py already uses for its own API-can't-report-names gap: set the
+# count you've actually configured and optionally name them.
+WIIM_PRESET_COUNT = int(os.getenv("WIIM_PRESET_COUNT", "0"))
+WIIM_PRESET_NAMES = [n.strip() for n in
+                      os.getenv("WIIM_PRESET_NAMES", "").split(",")
+                      if n.strip()]
+
 # Polling interval -- display state is truth; poll is error correction only
 POLL_INTERVAL_S  = float(os.getenv("POLL_INTERVAL", "30.0"))
 POLL_INTERVAL_MS = int(POLL_INTERVAL_S * 1000)
@@ -99,13 +126,15 @@ POLL_INTERVAL_MS = int(POLL_INTERVAL_S * 1000)
 # volume is dB-of-attenuation (0 dB = unity/max, no positive headroom); a
 # Home Assistant media_player entity has no dB concept at all -- HA always
 # normalizes volume_level to a 0.0-1.0 fraction, so ha.py maps that to a
-# plain 0-100 percent range instead.
+# plain 0-100 percent range instead. A WiiM streamer lands on the same 0-100
+# range but natively -- its API takes and reports a plain integer percent,
+# with no conversion needed on wiim.py's side.
 if DEVICE_DRIVER == "minidsp":
     VOLUME_MIN = float(os.getenv("VOLUME_MIN", "-127.0"))
     VOLUME_MAX = float(os.getenv("VOLUME_MAX", "0.0"))
     VOLUME_STEP      = float(os.getenv("VOLUME_STEP", "0.5"))
     VOLUME_STEP_FAST = float(os.getenv("VOLUME_STEP_FAST", "2.0"))
-elif DEVICE_DRIVER == "ha":
+elif DEVICE_DRIVER in ("ha", "wiim"):
     VOLUME_MIN = float(os.getenv("VOLUME_MIN", "0.0"))
     VOLUME_MAX = float(os.getenv("VOLUME_MAX", "100.0"))
     VOLUME_STEP      = float(os.getenv("VOLUME_STEP", "2.0"))      # percent/tick normal

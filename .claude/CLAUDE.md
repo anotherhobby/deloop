@@ -1,12 +1,12 @@
 # deloop Project Context
 
-Last updated: 2026-07-29 (v2.1 -- three backends shipping (Denon, MiniDSP, HA media_player);
-`code.py` is now a thin entry point importing `app.py`; the device runs precompiled `.mpy` via
-`make deploy-mpy`, not plain `.py`)
+Last updated: 2026-07-29 (v2.2 -- four backends shipping (Denon, MiniDSP, HA media_player, WiiM/
+LinkPlay); `code.py` is now a thin entry point importing `app.py`; the device runs precompiled
+`.mpy` via `make deploy-mpy`, not plain `.py`)
 
 This file captures the current project discussion so a future agent session can build a full project plan without needing the whole conversation repeated. This file itself lives at `.claude/CLAUDE.md` -- if you see an older reference to `local/agent/project-context.md` anywhere (in code comments, old commit messages, etc.), that's this same file before it moved.
 
-**If you're adding a fourth device backend, skip to [Device Driver Architecture](#device-driver-architecture-v20) below** -- that section is the recipe (three backends already follow it: Denon, MiniDSP, HA). Everything before it is v1.0 history (Denon-only POC) kept for hardware/protocol reference.
+**If you're adding a fifth device backend, skip to [Device Driver Architecture](#device-driver-architecture-v20) below** -- that section is the recipe (four backends already follow it: Denon, MiniDSP, HA, WiiM). Everything before it is v1.0 history (Denon-only POC) kept for hardware/protocol reference.
 
 ## Project Summary
 
@@ -266,7 +266,7 @@ Known Denon command families discussed:
 
 Dirac preset and speaker preset commands need to be confirmed against the specific AVR model/protocol docs or by observing known working calls.
 
-## Actual Project Shape (as of v2.1)
+## Actual Project Shape (as of v2.2)
 
 The original proposed shape below was Denon-only and pre-dates the driver split; kept for history. The real, current layout is:
 
@@ -288,6 +288,9 @@ deloop/
     ha.py              # Home Assistant media_player backend
     ha_ui.py           # HA's paired UI extension (row-swap, skip icons, play/pause icon) --
                       # only imported when DEVICE_DRIVER=ha; see driver.py's UI-extension contract
+    wiim.py            # WiiM/LinkPlay streamer backend -- first backend needing TLS
+    wiim_ui.py         # WiiM's paired UI extension (play/pause + skip tap targets only) --
+                      # only imported when DEVICE_DRIVER=wiim
     dial_ui.py        # display rendering -- generic gauge/volume/menu chrome only
     state.py          # in-memory device state model
     sound.py          # piezo click feedback
@@ -297,13 +300,14 @@ deloop/
     probe_denon.py     # host-side Denon HTTP API probe
     probe_minidsp.py   # host-side minidsp-rs HTTP API probe
     probe_ha.py        # host-side HA REST API probe
+    probe_wiim.py      # host-side WiiM/LinkPlay HTTPS API probe
     dump_denonavr.py
     dial_sim.py        # renders dial_ui.py off-device to PNGs (make renders)
     make_splash.py, gen_click.py
   Makefile
 ```
 
-See [Device Driver Architecture](#device-driver-architecture-v20) below for what `driver.py`/`denon.py`/`minidsp.py`/`ha.py` actually look like and how to add a fourth backend, and "CircuitPython heap/boot-memory guardrails" for why `code.py`/`app.py` are split the way they are.
+See [Device Driver Architecture](#device-driver-architecture-v20) below for what `driver.py`/`denon.py`/`minidsp.py`/`ha.py`/`wiim.py` actually look like and how to add a fifth backend, and "CircuitPython heap/boot-memory guardrails" for why `code.py`/`app.py` are split the way they are.
 
 ### Original proposed shape (v1.0, historical -- superseded)
 
@@ -488,11 +492,11 @@ Original v1.0 key list (historical, Denon-only, some now removed):
 | `ACCEL_SAFETY_CAP` | `-15.0` | Max volume during fast upward spin |
 | `POLL_INTERVAL` | `30.0` | Seconds between polls when recently active |
 
-As of v2.0, `config.py` also has: `DEVICE_DRIVER` (`"denon"`, `"minidsp"`, or `"ha"`), per-driver
-`VOLUME_MIN`/`VOLUME_MAX` defaults, the `MINIDSP_*` keys (`HOST`, `PORT`, `DEVICE_INDEX`,
-`SERIAL`, `PRESET_COUNT`, `TIMEOUT`, `PRESET_TIMEOUT`), and the `HA_*` keys (`HOST`, `PORT`,
-`TOKEN`, `ENTITY_ID`, `TIMEOUT`) -- see `settings.toml.template` for current defaults and comments
-on each.
+As of v2.2, `config.py` also has: `DEVICE_DRIVER` (`"denon"`, `"minidsp"`, `"ha"`, or `"wiim"`),
+per-driver `VOLUME_MIN`/`VOLUME_MAX` defaults, the `MINIDSP_*` keys (`HOST`, `PORT`,
+`DEVICE_INDEX`, `SERIAL`, `PRESET_COUNT`, `TIMEOUT`, `PRESET_TIMEOUT`), the `HA_*` keys (`HOST`,
+`PORT`, `TOKEN`, `ENTITY_ID`, `TIMEOUT`), and the `WIIM_*` keys (`HOST`, `TIMEOUT`, `INPUTS`) --
+see `settings.toml.template` for current defaults and comments on each.
 
 ## Device Driver Architecture (v2.0)
 
@@ -885,6 +889,316 @@ repeated here:
   non-ASCII codepoint -- it's unambiguous, and verify any such edit with the same grep rather than
   trusting it stayed ASCII.
 
+## Backend #4: WiiM / LinkPlay streamer (added 2026-07-29)
+
+`src/wiim.py`, `DEVICE_DRIVER = "wiim"` -- controls a WiiM (or any LinkPlay-based) streamer
+directly over its own `httpapi.asp` HTTP API, same "talk straight to the device" shape as
+`denon.py` (no bridge/daemon like `minidsp.py`, no intermediary service like `ha.py`). Tested live
+against a real WiiM Pro at `10.0.1.75` (firmware `Linkplay.4.8.814756`) throughout development --
+see `tools/probe_wiim.py`. Requested by the user explicitly as "direct support," with the
+`local/uc-intg-wiim` Unfolded Circle integration provided as a protocol reference (its
+`client.py`/`device.py`/`const.py` supplied the confirmed command set and mode-code tables below).
+
+Scope, confirmed with the user up front via a clarifying question before implementation: volume/
+mute, always-on play/pause/skip (no opt-in flag like `HA_MEDIA_CONTROLS` -- a streaming source
+either is or isn't currently playing, none of `ha`'s "rougher fit" caveat applies), input/source
+selection, and presets -- but explicitly *not* device discovery/switching like `ha`'s Media Player
+menu (`CAPS["player_select"]` is `False`; WiiM only ever controls itself).
+
+### HTTPS-only API with a self-signed cert -- the first backend needing TLS at all, and the first
+### needing a raw-socket transport instead of the shared `adafruit_requests.Session`
+
+Confirmed live: plain HTTP (port 80) returns nothing whatsoever; every command must go over HTTPS
+on port 443. `denon.py`/`minidsp.py`/`ha.py` are all plain HTTP, so `app.py`'s single shared
+`adafruit_requests.Session` had never needed an `ssl_context` before this backend.
+
+The cert itself (confirmed via `openssl s_client -connect <host>:443`) is self-signed --
+`CN=www.linkplay.com`, issued 2018-11-14, expires 2028-11-11. Per hard lesson #3 above (don't
+trust a summarized doc, verify against the real thing): this is **LinkPlay's fixed firmware
+cert, not generated per-device** -- confirmed by its subject and issuer both being the identical
+generic `linkplay.com` identity rather than anything unit-specific (serial, MAC, hostname). That
+means it can be embedded once, as `wiim.LINKPLAY_CA_PEM`, and trusted for any WiiM/LinkPlay unit
+without asking every user to extract their own -- consistent with this project's "clone repo, plug
+in device" simplicity goal.
+
+**Hard lesson, confirmed live against a real M5 Dial (2026-07-29), that cost a real debugging
+session and directly contradicts what the CircuitPython docs imply:** `ssl.SSLContext.check_hostname
+= False` does **not** disable hostname/CN verification. The first implementation set it False,
+loaded `LINKPLAY_CA_PEM` via `load_verify_locations(cadata=...)`, and passed that context into the
+shared `Session` -- and every single poll failed with `OSError(-9984)`
+(`MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`, i.e. `-0x2700`), reliably, on a freshly booted device with
+WiFi confirmed connected (ruled out via `wifi.radio.ipv4_address` and a raw TCP connect test first,
+since the initial symptom -- the Dial hanging, then landing on the "no AVR" error screen -- looked
+enough like a network problem to check that before touching TLS code at all).
+
+Isolated by wrapping a raw socket manually (bypassing `adafruit_requests` entirely) and testing the
+exact same handshake two ways: `ctx.wrap_socket(sock, server_hostname="10.0.1.75")` (the real IP)
+failed with the identical `-9984` every time; `ctx.wrap_socket(sock,
+server_hostname="www.linkplay.com")` (the cert's actual CN) succeeded. So the mbedtls binding
+verifies the peer cert's CN against whatever `server_hostname` was passed to `wrap_socket()`
+regardless of `check_hostname` -- that attribute exists and is assignable (no `AttributeError`),
+it just doesn't do what its name says.
+
+That alone would be fixable by always passing the right `server_hostname` -- except
+`adafruit_connection_manager` (the library underneath `adafruit_requests.Session`, confirmed by
+reading `_get_connected_socket` in its source) hardcodes `ssl_context.wrap_socket(socket,
+server_hostname=host)` where `host` is the literal hostname parsed from the request URL. There is
+no parameter anywhere in `Session.get()` to use a different string for TLS/SNI purposes than the
+actual connection target. Since this backend necessarily connects by IP (`WIIM_HOST`) and the
+cert's CN will never match an IP, **the shared `Session` can never work for this backend, no
+matter how `ssl_context` is configured** -- this isn't a bug to work around, it's a real
+architectural mismatch between "connect by IP" and "verify by hostname."
+
+**The fix:** `wiim.py` bypasses `adafruit_requests` entirely and speaks raw HTTP/1.0 over a
+manually TLS-wrapped socket (`init_transport(pool, ssl_context)` + `_request(cmd)`), forcing
+`server_hostname="www.linkplay.com"` independently of `WIIM_HOST`. This is still real certificate
+verification (the peer's chain/signature must still validate against `LINKPLAY_CA_PEM`) --
+decoupling "which name the cert is checked against" from "which IP is actually dialed," not
+disabling verification. `app.py` calls `wiim.init_transport(pool, ssl_context)` directly from its
+`DEVICE_DRIVER == "wiim"` block (bypassing the generic `driver.init(session)` contract for this
+one backend's transport setup; `wiim.py`'s `init(session)` still exists to satisfy the contract's
+call signature, but is a no-op). CircuitPython's `SSLSocket` only exposes `send()`/`recv_into()`
+(no `recv()`, confirmed by hitting `AttributeError: 'SSLSocket' object has no attribute 'recv'`
+mid-debugging) -- `_request()` loops on `recv_into()` until it returns 0, relying on the
+`Connection: close` header to signal EOF. Confirmed live end-to-end: full HTTP/1.0 response
+(status line, `Content-Length` header, JSON body) received correctly.
+
+**Debugging-session lessons worth keeping for next time a device needs live REPL diagnosis:**
+- Ctrl-C'ing into the REPL mid-network-call can leave WiFi/socket state weird enough to produce a
+  misleading `EHOSTUNREACH` on the next attempt -- reconnect explicitly
+  (`wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)`) at the top of any REPL diagnostic
+  rather than assuming whatever state an interrupt left behind.
+- `mpremote`'s plain interactive REPL needs a blank line to close a compound statement
+  (`while`/`if`/etc.) -- pasting a multi-line block with another statement immediately after it
+  (no blank line) gets silently mis-parsed. Use paste mode (Ctrl-E, paste, Ctrl-D) for anything
+  with a loop or nested block.
+- `sys.print_exception` is not available on this CircuitPython build -- use `print(type(e), e)` in
+  REPL diagnostics instead.
+
+### Confirmed API shapes (all live against the real unit, not just read from the reference)
+
+```
+GET https://<host>/httpapi.asp?command=getPlayerStatus
+  -> {"vol": "0"-"100" (plain int, NOT a 0.0-1.0 fraction like ha.py's volume_level),
+      "mute": "0"/"1", "status": "play"/"pause"/"stop", "mode": "<code>"}
+GET .../httpapi.asp?command=setPlayerCmd:vol:<0-100>
+GET .../httpapi.asp?command=setPlayerCmd:mute:<0|1>
+GET .../httpapi.asp?command=setPlayerCmd:resume|pause|prev|next
+GET .../httpapi.asp?command=setPlayerCmd:switchmode:<source-key>
+GET .../httpapi.asp?command=getPresetInfo -> {"preset_num": N, "preset_list": [...]}
+GET .../httpapi.asp?command=MCUKeyShortClick:<1-based-number>   (no "setPlayerCmd:" prefix --
+  confirmed against local/uc-intg-wiim's client.py; every other command above has one)
+```
+All confirmed to return `OK` (or JSON for the two GETs that return status) via live `curl`, then
+again via `tools/probe_wiim.py --skip-write` and its write-testing mode (volume set to a target
+and restored, mute toggled both ways and restored, source switched and restored). Track metadata
+(`getMetaInfo`) comes back hex-encoded (e.g. `"Title": "556E6B6E6F776E"` = hex for "Unknown") --
+confirmed live, not used by this driver (no title/artist display in scope), noted only so a future
+session touching metadata isn't caught off guard by it.
+
+### Input list: empirically confirmed per-unit, not assumed from the reference
+
+The reference integration's `PHYSICAL_SOURCES` dict lists every source key LinkPlay's protocol
+supports across all models (wifi, bluetooth, line-in, optical, HDMI, phono, udisk) with no attempt
+to detect which ones a given unit actually has -- there's no capability-bitmask endpoint worth
+reverse-engineering for this (`getStatusEx`'s `plm_support`/`streams` fields are undocumented
+bitmasks). Per hard lesson #3, this was checked empirically instead of assumed: cycling every
+source key live via `setPlayerCmd:switchmode:<key>` and reading back the resulting `getPlayerStatus`
+`mode` afterward (then restoring the original mode) showed `wifi` (mode 10), `bluetooth` (41),
+`line-in` (40, "AUX-In"), and `optical` (43) all really switch on this WiiM Pro; `co-axial`,
+`udisk`, `PCUSB`, `HDMI`, `phono` all left `mode` at `0`/`status` `none` -- not present on this
+unit. `config.WIIM_INPUTS` (default `"wifi,bluetooth,line-in,optical"`) is the configurable
+override for other WiiM/LinkPlay models (Amp, Ultra, Pro Plus) that may expose a different
+physical set -- same escape-hatch role `MINIDSP_PRESET_NAMES` already plays for a similarly
+per-unit list that the API can't enumerate.
+
+### Presets: config-driven count/names, not auto-discovered -- quick-select buttons deliberately skipped
+
+First implementation tried the same runtime-discovery pattern as `minidsp.py`'s
+`CAPS["preset_enable"]`: have `get_presets()` set `CAPS["presets"] = bool(preset_list)` from
+`getPresetInfo`, since it returned an empty `preset_list` on this unit at the time (no Favorites
+configured yet). **That assumption turned out to be wrong, not just untested** -- confirmed live
+after the user configured 2 real Favorites via the WiiM app's Favorites screen and rebooted the
+Dial: `getPresetInfo` still reported `{"preset_num": 0, "preset_list": []}`. This isn't a
+boot-timing issue (`get_presets()` is only called once at boot, which was considered, but a fresh
+reboot after configuring Favorites ruled that out) -- the plain HTTP API genuinely does not report
+this feature's contents. Confirmed via WiiM's own forum (a thread titled "Recall Presets using the
+Wiim API"): retrieving real preset names requires WiiM's UPnP/SOAP interface (`GetKeyMapping` via
+a `PlayQueueSCPD.xml` service) -- a materially heavier protocol than the GET-and-parse-JSON calls
+everything else in this project uses. `MCUKeyShortClick:<1-12>` (`set_preset()`) is confirmed to
+still work for *activating* a preset regardless -- it's specifically *listing* them back that the
+plain API can't do.
+
+Given a straight choice between implementing UPnP/SOAP (real names, zero settings.toml upkeep, but
+a new protocol/complexity class on a memory-constrained device, untested against this unit's
+actual UPnP service layout) and falling back to config, the user chose config. `wiim.py` now
+mirrors `minidsp.py`'s own established answer to an analogous "API can't report names" gap exactly:
+`CAPS["presets"] = config.WIIM_PRESET_COUNT > 0` (set once, at import time, not runtime-discovered
+at all now), and `get_presets()` returns `("", [(str(i), name) for i in 1..COUNT])` with names from
+`WIIM_PRESET_NAMES` falling back to `"Preset N"` -- same shape, same reasoning, different backend.
+
+The user's own framing, when asked what capabilities to add, was to make WiiM's presets "work like
+the HA device selection" -- meaning reachable only through a scrollable list menu, not a fixed
+row of buttons. This surfaced a real latent bug rather than just a preference: `getStatusEx`
+reports `"preset_key": "12"` (12 favorite slots) on this unit, confirmed live, and the existing
+main-screen quick-select button row (`dial_ui.py`'s `_draw_preset_filter_buttons`) has only
+`_DBTN_MAX = 5` pre-allocated label slots -- fine for Denon (2 presets)/MiniDSP (<=4), but for a
+list that size the row's drawing would silently truncate to 5 while `preset_button_at`'s tap-rect
+math (driven by the *full* list length, not the drawn count) would still lay out rects across all
+12 -- a real draw/tap mismatch, not just a cosmetic one. Fixed with a new capability flag,
+**`CAPS["preset_quickbuttons"]`** (default `True` in `driver.py`'s `_CAPS_DEFAULTS`, `False` in
+`wiim.py`), gating both `dial_ui.py`'s button-drawing call and `app.py`'s quick-button tap
+dispatch. The existing scrollable Preset submenu (`app.py`'s `_open_submenu`/`_confirm_sub`,
+already generic and already exercised by `ha.py`'s equally-unbounded player list) needed zero
+changes to handle a 12-entry list correctly -- this is the same "device-behavior difference is a
+CAPS flag, not a driver-name check" principle as every capability flag before it (hard lesson #6
+in the Denon->MiniDSP section above), just applied to *how many* of something exists rather than
+*whether* it exists at all.
+
+### Media controls needed their own minimal UI extension, not just `state.media_state`
+
+Surfaced during implementation, not anticipated from the contract docs alone: `dial_ui.py`'s
+`media_status_tap`/`media_prev_tap`/`media_next_tap` **unconditionally delegate to
+`driver.ui_impl`** and return `False` if it's `None` (`dial_ui.py`'s "the actual hit-tests... all
+live in ha_ui.py" comment, written when `ha.py` was the only backend that needed any of this) --
+even though the underlying status *text* (`dial_ui._status_line()`) already renders generically
+off `state.media_state` with no UI extension required. A backend can report `media_state` and
+still get completely dead play/pause/skip taps if it doesn't pair a UI module, which would have
+silently broken "basic media controls" for this backend despite `wiim.py` doing everything the
+driver contract asks of it.
+
+Fixed with `src/wiim_ui.py` -- deliberately not a copy of `ha_ui.py`, but the minimal slice: just
+`draw_status_rows`/`media_status_tap`/`media_prev_tap`/`media_next_tap`, reusing
+`dial_ui._status_line()`/`_MEDIA_STATE_TEXT`/`_MEDIA_SIDE_X`/`PRESET_NAME_Y`/`CX` rather than
+duplicating them. No `standby_menu_tap`/`standby_menu_pos` -- those are only ever called behind an
+`if CAPS["player_select"]` check in both `app.py` and `dial_ui.py`, and `wiim.py`'s is `False`, so
+they're simply never reached. This is `driver.py`'s "UI-extension contract" working as documented
+("a `<backend>_ui.py` module exposes whatever subset of this it needs") -- `wiim_ui.py` is now the
+reference example for the minimal case, the way `ha_ui.py` is for the full one.
+
+### Two more real-use papercuts, from actually using it after it first booted
+
+Both surfaced from live use, not planning, same as HA's "follow-up UX papercuts" round:
+
+**A preset name and play/pause status turned out to need to coexist, not take turns.**
+`dial_ui._status_line()`'s "same slot, whichever's relevant" precedence (preset name if one
+exists, else a play/pause word, else blank) was designed around every backend before this one
+having exactly one of those concepts, never both at once -- Denon/MiniDSP have presets and no
+playback tracking, HA has playback tracking (`CAPS["presets"]` always `False`) and no presets.
+WiiM has both, genuinely simultaneously (a favorite can be selected while something is actively
+playing), so sharing one text slot meant one of them was always getting hidden.
+
+This surfaced in three rounds, confirmed live each time:
+1. First attempt kept them sharing `PRESET_NAME_Y` (matching the existing precedent) and just
+   moved the skip icons to the row below (`_PLAYER_NAME_Y`) to stop their fixed `+-_MEDIA_SIDE_X`
+   offsets from visually colliding with a preset name's text. That fixed the collision but not the
+   underlying problem: with playback active, "Pause" permanently occupied the slot and the preset
+   name (or the "(Preset)" placeholder, see below) never got a chance to show at all -- confirmed
+   live ("the word pause is still on the line... preset is absent").
+2. Split them onto genuinely separate rows, same structure `ha_ui.py` already established
+   (persistent "identity" info above, transient status below) -- just with preset name/placeholder
+   in the upper role instead of a device name. `wiim_ui.py`'s `draw_status_rows()` now puts the
+   preset name (or a literal `"(Preset)"` placeholder while `CAPS["presets"]` is true and nothing's
+   been picked yet -- `wiim.get_presets()` always returns `current_value=""`, since
+   `MCUKeyShortClick` is a one-shot action with no persistent "active" concept to report) on
+   `PRESET_NAME_Y` unconditionally, and draws play/pause as an *icon* (`dial_ui.draw_play_pause_icon()`,
+   the same helper `ha_ui.py` already uses, not text) on a second row below it, flanked by the skip
+   icons. Both are always visible together now -- no precedence, no hiding. First pass reused
+   `dial_ui._PLAYER_NAME_Y` for that second row (simplest option, already existed) and centered it
+   between `PRESET_NAME_Y` and the bottom MENU hint -- confirmed live as visually too far down
+   ("my eyes don't like the spacing"), and reusing `_PLAYER_NAME_Y` at all was the wrong call
+   regardless, since that constant is shared with `ha_ui.py`'s device-name row -- moving it to
+   reposition WiiM's icon row would have shifted HA's layout too.
+3. Final position: `wiim_ui.py`'s own `_icon_row_y()`, independent of `_PLAYER_NAME_Y` entirely, set
+   to match the *existing* vertical rhythm instead of centering in leftover space -- measured via
+   `tools/dial_sim.py`'s font metrics (rendering a real frame off-device and inspecting actual label
+   bounding boxes, not guessing) that the gap between the volume number's bottom edge and the preset
+   row's top edge is 16px, then reapplied that same 16px gap below the preset row before centering
+   the play/pause icon there: `PRESET_NAME_Y + 34` (10 for the preset text's own half-height since
+   it's center-anchored, + the 16px gap, + 8 for `_ICON_HALF_H`). Confirmed by re-measuring the
+   re-rendered frame that both gaps come out to exactly 16px.
+
+That last fix exposed a real bug, not just a positioning one: `_icon_row_y()`'s formula (originally
+written as a module-level constant, `_ICON_ROW_Y = ...`) read `dial_ui.PRESET_NAME_Y` and
+`dial_ui._MENU_POS_MAIN` *at import time*. `wiim_ui.py` is reached via a circular import
+(driver.py -> wiim_ui.py -> dial_ui.py -> driver.py), which is safe *only* if nothing reads
+`dial_ui`'s attributes until it has fully finished executing -- true for real boot order (`app.py`
+imports `driver` first, which finishes importing `dial_ui` as a side effect, before `app.py`'s own
+`import dial_ui` line ever runs), but `tools/dial_sim.py` imports `dial_ui` directly, hitting the
+same circular chain from the *other* direction (dial_ui -> driver -> wiim_ui -> dial_ui, mid-import)
+-- and crashed with `AttributeError: partially initialized module 'dial_ui' has no attribute
+'PRESET_NAME_Y'` the moment this was actually tested via the render tool. Fixed by making it a
+function (`_icon_row_y()`), computed on every call instead of once at import -- by the time any
+draw/tap function actually runs, `dial_ui.py` has long since finished executing regardless of which
+direction the circular chain was entered from. This is the exact hazard already flagged in this
+file's "Note for future backend work" below, and it's worth re-reading before adding any new
+module-level code to a `<backend>_ui.py` file that touches `dial_ui`/`driver` attributes.
+
+Tap handling followed the row split: `media_status_tap`/`media_prev_tap`/`media_next_tap` all moved
+their hit-test band from `PRESET_NAME_Y` to `_icon_row_y()` to match where the icon actually lives,
+and `app.py`'s `_tap_main_screen` gained a *separate* zone that opens the Preset submenu directly via
+`_tap_open_preset_menu()` (reusing `_open_submenu("preset", ...)`, the same call the top-menu path
+already makes) -- gated on `CAPS["presets"] and not CAPS["preset_quickbuttons"]`, so Denon/MiniDSP
+(which have quick buttons) and HA (no presets at all) are unaffected. That zone needed no fixed
+lower bound at all in the end: `_tap_main_screen` is only ever called for `touch_y < MENU_TAP_Y` in
+the first place (`_dispatch_tap` routes anything at or below that to the bottom MENU-tap zone
+instead), and the media-tap checks run first in the same function and already claim their own
+region whenever `state.media_state` qualifies -- so the preset-menu tap just fires for whatever's
+left, with no coordinate math needed to avoid overlapping a row it doesn't actually know the
+position of. This also removed an earlier stopgap in `_tap_main_screen` (gating the whole media-tap
+block on `not dial_ui._preset_name(state)`) that was only ever needed because the two rows used to
+share one slot -- with them genuinely separate now, both tap zones are just independently,
+unconditionally live.
+
+**Note for future backend work:** `wiim_ui.py` does `import driver as _driver` directly (needed
+for the `CAPS["presets"]` check in `_preset_slot_text()`) -- this creates driver.py -> wiim_ui.py ->
+driver.py, a circular import. That's safe *only* because the access happens inside a function body
+(`_preset_slot_text()`), never at module level -- by the time that function actually runs, `driver.py`
+has long finished executing. `dial_ui.py` already relies on this exact same property for its own
+`import driver as _driver` (reached via driver.py -> ha_ui.py -> dial_ui.py -> driver.py, or
+-> wiim_ui.py -> dial_ui.py -> driver.py) -- confirmed safe on real hardware for `ha`, and now for
+`wiim` too. A future `<backend>_ui.py` needing `driver.CAPS` can follow the same pattern; just
+never read `_driver.<anything>` outside a function.
+
+## "MENU home" frame -- generic chrome, all backends (added 2026-07-29)
+
+`dial_ui.py`'s `_draw_menu_home()` draws a small roof-line + two flared legs (no bottom edge)
+behind the MENU hint on the main screen, in the same barely-visible dimness as the MENU text
+itself (`_TK_MENU`, a new palette index 12 added specifically to match `_C_MENU`'s exact RGB
+value -- bitmap-drawing primitives like `_line()` take palette indices, not the raw hex label
+colors elsewhere in this file, so a new backend/UI element that needs to match a label color
+exactly needs its own palette entry, not just the same-looking hex constant). Purely decorative,
+generic to every backend (drawn unconditionally in `draw_main()`'s ON-and-MODE_MAIN path, not
+gated by any `CAPS` flag) -- the goal, in the user's words, was to make the MENU tap zone "feel
+more like it had more of a home" without adding visual noise.
+
+**Notable for *how* this got designed, not just what shipped:** the user explicitly asked for
+"mockups and confirmations before any code changes," and the whole thing went through several
+rejected concepts before landing here entirely via off-device mockups -- zero iterations were
+tested on real hardware, unlike nearly everything else in this file:
+- First concept (from the user's own sketch in `ui/UIDiagram.drawio` -- a gray ellipse overlaid
+  such that only its top arc pokes into the round screen) was mocked up by extracting the *exact*
+  ellipse geometry from the `.drawio` XML itself (`<mxCell style="ellipse" ...>`'s `x/y/width/height`,
+  converted from diagram-space to real 240x240 device pixels via the scale factor between the
+  embedded screenshot's placed size and its native resolution) rather than eyeballing pixel
+  positions from the rendered PNG -- reading the source file gave exact numbers instead of a
+  guess. Rendered via `tools/dial_sim.py` (imported as a module from a throwaway script, which
+  also gets its shims installed as an import-time side effect -- reusable pattern for any future
+  one-off mockup). Confirmed by the user as the right size/position, but rejected outright once
+  seen live: **"doesn't do it."**
+- Pivoted to a trapezoid/"home" shape on the user's suggestion. Several variants (open vs. closed,
+  which edge flared which way) were mocked up and compared before landing on: a top edge near the
+  preset-button row + two legs flaring outward and down toward the rim, with **no bottom edge** --
+  a fully closed trapezoid was tried too and read as "boxing in" rather than "grounding."
+- The color was also wrong on the first pass (matched the preset-button frame's brighter tick-mark
+  gray, since that's what "same thickness as the frames around the numbers" specified) -- the user
+  asked for it dimmed to match the MENU text's own near-invisible brightness instead, confirmed via
+  a zoomed-in crop of the re-rendered mockup before writing any real code.
+
+Geometry (`_MENU_HOME_TOP_Y`/`_BOTTOM_Y`/`_TOP_HW`/`_LEG_HW`) is hardcoded to the values confirmed
+in the final mockup, not derived from other layout constants -- same style as this file's other
+hand-tuned pixel constants (`_DBTN_Y0`, `PRESET_NAME_Y`, etc.).
+
 ## CircuitPython heap/boot-memory guardrails (read before touching boot-path code)
 
 The app once failed to boot on real hardware (`MemoryError` allocating the ~28.8KB gauge bitmap,
@@ -926,9 +1240,15 @@ lasting rules that came out of it:
 ## Suggested Prompt For Next Session
 
 > Read "CircuitPython heap/boot-memory guardrails" before touching boot-path code (`app.py`'s
-> `main()`), `.mpy` deploy tooling, or the `driver.py`/`ha_ui.py` UI-extension split. Otherwise:
-> review "Device Driver Architecture (v2.0)" if the task involves adding or changing a device
-> backend, and the "hard lessons" list before touching backend-specific code.
+> `main()`), `.mpy` deploy tooling, or the `driver.py`/`ha_ui.py`/`wiim_ui.py` UI-extension split.
+> Otherwise: review "Device Driver Architecture (v2.0)" if the task involves adding or changing a
+> device backend, and the "hard lessons" list before touching backend-specific code.
+>
+> If the WiiM backend's rewritten raw-socket transport hasn't been redeployed and booted fresh yet,
+> that's the first thing to try -- the approach itself is confirmed working (see "Backend #4: WiiM
+> / LinkPlay streamer"'s TLS section), but only via ad-hoc REPL snippets, not the actual shipped
+> module code end to end. Check `gc.mem_free()` before/after on that first real boot regardless,
+> same as any other memory theory in this file.
 
 ## Current Recommendation
 
@@ -936,7 +1256,7 @@ The app boots and connects cleanly on real hardware, both `denon` and `ha` confi
 deploy-mpy` is what the device should run day to day; plain `make deploy` is for fast dev
 iteration only (no `mpy-cross` needed) and should not be mistaken for the shipped configuration.
 
-All three backends are implemented against the same
+All four backends are implemented against the same
 pluggable-driver contract; Denon and MiniDSP are verified against real hardware (AVR-X4800H,
 MiniDSP 2x4HD, MiniDSP Flex). HA `media_player` (discovery/switching, skip controls, the
 standby-screen menu access fix, and the row/glyph/spacing polish) has had real on-device use --
@@ -946,6 +1266,20 @@ WiFi outage, still outstanding: a live `select_source` check (never exercised li
 identical-shaped `_call_service` path other calls already confirmed working), and confirming the
 `<<`/`>>` skip icons plus the centered-integer volume display look right on the actual physical
 screen (renders via `tools/dial_sim.py` and direct `.pcf` bitmap dumps both look correct, but
-neither is the real GC9A01 display). Future work could include: input selection UI polish, sound
+neither is the real GC9A01 display).
+
+`wiim` is implemented, and its TLS transport was a real find: the first implementation (a shared
+`adafruit_requests.Session` with `check_hostname = False`) reliably failed to boot -- see "HTTPS-
+only API with a self-signed cert" above for the full debugging trail -- and the fix (a raw-socket
+transport with a hardcoded SNI hostname, bypassing `adafruit_requests` for this backend only) is
+confirmed working end-to-end via live REPL testing against the real M5 Dial and a real WiiM Pro
+(full HTTP/1.0 response -- status line, headers, JSON body -- received correctly over the fixed
+path). What's still outstanding: the *rewritten* `wiim.py`/`app.py` haven't been redeployed and
+booted fresh yet with the fix in place -- the fix was validated via ad-hoc snippets typed directly
+into the live REPL, not yet the actual shipped module code end to end, so that's the next concrete
+step, not a re-litigation of whether the approach works. Also still unverified: the `getPresetInfo`
+`preset_list` entry field names (no favorites were configured on the test unit yet).
+
+Future work could include: input selection UI polish, sound
 mode selection, multi-zone support, or wiring up MiniDSP's real Dirac-series per-slot filter names
 if a future unit exposes more than a bare on/off `dirac` boolean.
