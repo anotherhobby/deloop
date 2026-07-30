@@ -4,12 +4,14 @@ src/settings.toml.minidsp
 src/settings.toml.denon
 src/settings.toml.ha
 src/settings.toml.wiim
+src/settings.toml.camilladsp
 
 # Python
 .venv/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
 # macOS
 .DS_Store

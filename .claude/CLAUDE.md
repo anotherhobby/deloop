@@ -1,12 +1,14 @@
 # deloop Project Context
 
-Last updated: 2026-07-29 (v2.2 -- four backends shipping (Denon, MiniDSP, HA media_player, WiiM/
-LinkPlay); `code.py` is now a thin entry point importing `app.py`; the device runs precompiled
-`.mpy` via `make deploy-mpy`, not plain `.py`)
+Last updated: 2026-07-30 (v2.3 -- five backends shipping (Denon, MiniDSP, CamillaDSP, HA
+media_player, WiiM/LinkPlay); `code.py` is now a thin entry point importing `app.py`; the device
+runs precompiled `.mpy` via `make deploy-mpy`, not plain `.py`. CamillaDSP was built with zero
+live-hardware/live-daemon access, then verified end-to-end the same day -- see "Backend #5:
+CamillaDSP" below for what that confirmed and what's still open.)
 
 This file captures the current project discussion so a future agent session can build a full project plan without needing the whole conversation repeated. This file itself lives at `.claude/CLAUDE.md` -- if you see an older reference to `local/agent/project-context.md` anywhere (in code comments, old commit messages, etc.), that's this same file before it moved.
 
-**If you're adding a fifth device backend, skip to [Device Driver Architecture](#device-driver-architecture-v20) below** -- that section is the recipe (four backends already follow it: Denon, MiniDSP, HA, WiiM). Everything before it is v1.0 history (Denon-only POC) kept for hardware/protocol reference.
+**If you're adding a sixth device backend, skip to [Device Driver Architecture](#device-driver-architecture-v20) below** -- that section is the recipe (five backends already follow it: Denon, MiniDSP, CamillaDSP, HA, WiiM). Everything before it is v1.0 history (Denon-only POC) kept for hardware/protocol reference.
 
 ## Project Summary
 
@@ -285,6 +287,8 @@ deloop/
                       # documents both the driver contract and the UI-extension contract
     denon.py          # Denon/Marantz backend
     minidsp.py         # minidsp-rs backend
+    camilladsp.py       # CamillaDSP backend -- WebSocket-only, hand-rolled client,
+                      # confirmed working on real hardware 2026-07-30 (see Backend #5 below)
     ha.py              # Home Assistant media_player backend
     ha_ui.py           # HA's paired UI extension (row-swap, skip icons, play/pause icon) --
                       # only imported when DEVICE_DRIVER=ha; see driver.py's UI-extension contract
@@ -502,9 +506,10 @@ see `settings.toml.template` for current defaults and comments on each.
 
 Added 2026-07-28 when the user wanted minidsp-rs (https://github.com/mrene/minidsp-rs) support
 alongside Denon, explicitly asking for a real pluggable-backend design ("near 100% chance of
-extending support in the future") rather than a one-off Denon-vs-MiniDSP branch. Three backends
-now follow this recipe -- Denon, MiniDSP, and HA `media_player` (added 2026-07-28, see "Backend
-#3: HA media_player" below) -- this section is what a fourth would follow.
+extending support in the future") rather than a one-off Denon-vs-MiniDSP branch. Five backends
+now follow this recipe -- Denon, MiniDSP, CamillaDSP (added 2026-07-30, see "Backend #5:
+CamillaDSP" below), HA `media_player`, and WiiM/LinkPlay -- this section is what a sixth would
+follow.
 
 ### The shape
 
@@ -1199,6 +1204,280 @@ Geometry (`_MENU_HOME_TOP_Y`/`_BOTTOM_Y`/`_TOP_HW`/`_LEG_HW`) is hardcoded to th
 in the final mockup, not derived from other layout constants -- same style as this file's other
 hand-tuned pixel constants (`_DBTN_Y0`, `PRESET_NAME_Y`, etc.).
 
+## Backend #5: CamillaDSP (added 2026-07-30)
+
+`src/camilladsp.py`, `DEVICE_DRIVER = "camilladsp"` -- controls a
+[CamillaDSP](https://github.com/HEnquist/camilladsp) process (volume, mute, config-file presets).
+Written with zero live-hardware access, then verified end-to-end the same day: `make
+probe-camilladsp` confirmed every command/reply shape against a real `camilladsp` 4.1.3 process,
+and the backend booted and ran correctly on a real M5 Dial against that same process (volume, mute,
+and touch all functioning, audible on the test Mac). This is the reference example for how this
+project develops a backend without hardware in hand first -- read the "Live testing" subsection
+below before assuming the same shortcut is safe for a future backend; it worked here because every
+design choice made blind was flagged explicitly and then actually checked, not because skipping
+live testing is generally fine (hard lesson #8 in the Denon->MiniDSP section still holds).
+
+### Why this backend needed its own from-scratch WebSocket client
+
+Unlike MiniDSP (a hardware DSP driven via a host daemon, minidsp-rs, that exposes both a WebSocket
+*and* a plain HTTP API), CamillaDSP is itself a software DSP process, and its control API is
+**WebSocket-only** -- confirmed via its own docs and by reading `local/pycamilladsp` (the vendor's
+official Python client, downloaded but gitignored, not vendored into this repo). There is no HTTP
+fallback the way minidsp-rs has one, which is the same situation that ruled out two earlier
+WebSocket-based designs for the HA backend (see "Backend #3: HA media_player" above) --
+CircuitPython has no usable native WebSocket client for this board; the community libraries are
+work-in-progress and target Airlift co-processor boards, not the M5 Dial's plain `wifi`/
+`socketpool` stack. Given that, and that deloop's whole architecture is already poll-per-call with
+no persistent connections anywhere (`_poll_avr` in `app.py`), `camilladsp.py` implements a minimal
+hand-rolled WebSocket client scoped to exactly what a one-shot request/reply call needs: one fresh
+TCP connection + WS handshake per call (or small batch of calls), no keepalive, no reconnect-on-
+drop, and Ping frames read but never replied to with a Pong (every connection here closes within
+milliseconds of opening, so there's not expected to be a window where the server needs one
+answered -- unverified beyond the short live test session, see "Still open" below). Full protocol
+details and every scope-reduction live in `src/camilladsp.py`'s own module docstring, not
+duplicated here.
+
+Command/reply shapes (`GetVolume`/`SetVolume`, `GetMute`/`SetMute`, `GetConfigFilePath`/
+`SetConfigFilePath`+`Reload`, and the `{command: {"result": ..., "value": ...}}` envelope) were
+read directly out of `local/pycamilladsp/tests/test_camillaws.py` -- the vendor's own test
+fixtures, a materially stronger source than a summarized doc (hard lesson #3) -- and have since
+been reconfirmed byte-for-byte live via `tools/probe_camilladsp.py` against a real instance.
+
+### Current design decisions (and the "why" worth keeping)
+
+- **Presets are a flat name/path list, not a numbered-slot scheme.** MiniDSP/WiiM presets use
+  `PRESET_COUNT` + optional `PRESET_NAMES` indexed by position because neither API can enumerate or
+  name its own slots. CamillaDSP presets are just config file paths on the host running CamillaDSP
+  -- there's no slot count concept at all -- so `config.CAMILLADSP_PRESETS` is a flat
+  `"Name:/path,Name2:/path2"` list parsed into `(path, name)` pairs directly (hard lesson #6: a
+  device-behavior difference should drive a design difference, not laziness).
+- **The current preset value is a real live query (`GetConfigFilePath`), not a placeholder** --
+  unlike MiniDSP's Dirac-enable state or WiiM's "which favorite is active" gap, CamillaDSP actually
+  reports which config is loaded. Confirmed live: `GetConfigFilePath` echoes back exactly the
+  string last passed to `SetConfigFilePath`, including a full absolute path -- so `get_presets()`'s
+  current-value comparison against `CAMILLADSP_PRESETS` correctly highlights the active preset once
+  the Dial has made at least one `SetConfigFilePath` call. At boot, before any switch, it reflects
+  whatever path the process was originally launched with -- if that doesn't string-match a
+  `CAMILLADSP_PRESETS` entry, the Preset menu just opens with nothing pre-highlighted, the same
+  graceful "no match" behavior `get_presets()` was already designed to tolerate.
+- **Main-screen quick-select buttons are a separately configured subset, not the full list and not
+  nothing.** `CAMILLADSP_QUICK_PRESETS` (config.py) names up to 4 entries from `CAMILLADSP_PRESETS`
+  to get buttons; the full list (which can be arbitrarily long -- CamillaDSP presets are just named
+  config files, no real ceiling) stays reachable only through the scrollable Preset submenu
+  regardless. This landed after two rejected shapes, both instructive: showing buttons for the
+  whole list (wrong -- unlike MiniDSP/Denon's small, physically-fixed slot counts, a long
+  `CAMILLADSP_PRESETS` would hit the same button-row/tap-rect overflow `wiim.py` avoids by going
+  submenu-only) and no quick buttons at all, matching `wiim.py` exactly (rejected by the user: the
+  row has room for a few buttons, no reason to give up the shortcut just because the *full* list can
+  be long). `driver.py` gained a `get_quick_presets()` contract entry for this -- defaults to
+  reusing `get_presets()`'s own list when a backend doesn't define it (exactly correct for
+  `denon.py`/`minidsp.py`, whose full lists already fit the row), so only `camilladsp.py` needed to
+  actually implement it. `state.preset_quick_names` (new field, `state.py`) is what `dial_ui.py`'s
+  button row and `app.py`'s quick-button tap handler read; the scrollable submenu still reads
+  `state.preset_names`, unaffected.
+- **`VOLUME_MIN`/`VOLUME_MAX` default to -50/0 dB**, not the full attenuation-only portion of
+  CamillaDSP's documented -150..+50 `SetVolume` range -- confirmed by cloning and reading
+  `HEnquist/camillagui-backend` (the official companion web GUI, same author as CamillaDSP), whose
+  own default config hardcodes `volume_range: 50` / `volume_max: 0`. Also confirmed (from
+  `camilladsp`'s own `src/utils/decibels.rs`) that CamillaDSP and MiniDSP use the identical
+  `20*log10(amplitude)` dB convention, so -50dB is mathematically the same digital attenuation on
+  both -- not necessarily the same perceived loudness, since that also depends on each system's
+  downstream DAC/amp analog gain, which neither DSP's own volume number encodes.
+- **`CAMILLADSP_PRESET_TIMEOUT_MS`** stays at minidsp.py's own generous headroom (10s) as a
+  starting point. Live-measured at ~1-3ms against a trivial `SignalGenerator`-based test config (see
+  "Live testing" below) -- a lower bound, not a general answer, since a real room-correction config
+  with large filter files to load could be much slower.
+- **`get_status()`'s "input" field is repurposed for DSP processing status**, not a real input --
+  CamillaDSP has no input/source concept at all (`CAPS["input_select"]` stays False), so
+  `dial_ui.py`'s top status label was otherwise permanently blank for this backend. Added on the
+  user's request rather than left unused: the processing rate (e.g. `"96khz"`) while `GetState` is
+  `"Running"`, or the raw `GetState` word (`Paused`/`Inactive`/`Starting`/`Stalled`) otherwise --
+  CamillaDSP's own vocabulary, not reworded, since anyone running CamillaDSP already knows what
+  those mean. Sample rate (`GetCaptureRate`) and processing state (`GetState`) are polled every
+  time, batched into the same `get_status()` WS connection as `GetVolume`/`GetMute` (four commands,
+  one connection). First version combined channel count into the same string
+  (`"<channels>ch - <rate>khz"`) -- confirmed live on real hardware to be visibly too wide, so
+  channel count was pulled back out into its own thing (see next bullet) and the display is rate-only.
+- **Channel count is a separate, generic contract key now, not folded into any one backend's display
+  string.** `get_status()`'s optional `"channels"` key (`driver.py`, same no-CAPS-flag shape as
+  `"media_state"`) is a `state.channels` field with no UI consumer yet -- the user wants it
+  displayed somewhere else, not decided as of this writing. `camilladsp.py`'s own
+  `_fetch_channels()`/`_channels` cache (from `GetConfigJson`'s `devices.capture.channels` -- the
+  only way to get it, since no dedicated command reports it and `GetChannelLabels` is unreliable,
+  labels being optional in the config) was kept exactly as built, just wired into this new key
+  instead of the status string. Fetched once and cached, not every poll, since it's static per
+  loaded config; `set_preset()` invalidates the cache since a different config can have a different
+  channel count.
+- **Checked whether the other four backends could fill in "channels" too -- none currently can**,
+  each for a different confirmed reason (see `driver.py`'s contract comment for the full writeup,
+  not repeated here): `denon.py` has no known API command for it, and this is unresolved even in
+  the wider HA/Denon integration community, not just unchecked by this project; `minidsp.py`'s
+  HTTP API never serializes channel count at all (confirmed from minidsp-rs's own
+  `daemon/src/http/mod.rs`), even though the hardware's fixed channel definitions do exist as
+  compile-time static data per hw_id; `ha.py` genuinely has no such attribute in HA's own
+  `media_player` entity schema (confirmed by reading `homeassistant/components/media_player/
+  __init__.py` directly -- `media_channel`, the one lookalike name, is a broadcast/TV channel, not
+  an audio channel count); `wiim.py`'s `getMetaInfo` has documented `sampleRate`/`bitDepth`/
+  `bitRate` fields (community API docs, unverified live) -- genuinely relevant "audiophile info,"
+  just not a channels field, and a different feature scope than what was actually asked for here.
+  Fully unit-tested host-side (state-word fallback for every non-Running state, missing-rate
+  fallback, the lazy-fetch-then-cache behavior for channels, cache invalidation on preset switch)
+  but not yet confirmed on real hardware -- add to "Still open" below once it has been.
+
+### Live testing (2026-07-30)
+
+Host-side, against a real `camilladsp` 4.1.3 (arm64, macOS) binary, before touching the Dial: three
+throwaway test configs in `local/camilladsp/` (gitignored) -- `flat.yml`/`quiet.yml`/`muffled.yml`,
+all `SignalGenerator` (synthetic 1kHz sine, no real mic/input needed) into `CoreAudio` default
+output, so testing needed no microphone permission prompt and no real audio hardware beyond the
+Mac's own speakers. All three passed `camilladsp --check`; `flat.yml` produced real audible output.
+`make probe-camilladsp` (against both `127.0.0.1` and the Mac's real LAN IP, matching what the Dial
+actually uses) confirmed every reply envelope byte-for-byte against `camilladsp.py`'s
+`_parse_reply`.
+
+On the Dial itself: `DEVICE_DRIVER = "camilladsp"` against that same Mac-hosted process, confirmed
+live -- encoder volume changes update both the display and (audibly) the actual output; touch
+mute/menu controls work. First successful end-to-end run of the hand-rolled WebSocket client on
+real CircuitPython hardware against a real server -- the one thing no amount of host-side testing
+could confirm.
+
+Regenerating `ui/*.png` reference screenshots for this backend surfaced two real process bugs
+(a stale `tools/dial_sim.py` fixture, and a config-derived `CAPS` flag a fixture's `state.*` alone
+couldn't fake) that motivated turning that into a permanent tool -- see "ui/ screenshot
+regeneration" right below for the full writeup.
+
+### Still open
+
+- Whether CamillaDSP's server tolerates never receiving a Pong in reply to a Ping, under conditions
+  the short live test session didn't exercise (e.g. a connection that happens to stay open longer).
+- `CAMILLADSP_PRESET_TIMEOUT_MS` against a real production config with actual FIR/convolution
+  filter files to load, not just the trivial `SignalGenerator`-based test configs.
+- ~~The DSP-status display is unit-tested host-side only, not yet confirmed live~~ -- **resolved.**
+  Deployed, and the Dial showed a permanent "Starting" with no channel/rate info -- looked like a
+  bug, wasn't one. Root-caused by reading CamillaDSP 4.1.3's own source directly
+  (`src/generatordevice.rs`): the `SignalGenerator` capture backend `local/camilladsp/*.yml`'s test
+  configs use (chosen specifically to avoid a real audio device / mic-permission prompt) never
+  writes `ProcessingState::Running` at all -- confirmed by grep, every *other* capture backend
+  (CoreAudio/Alsa/Wasapi/Asio/Pulse/PipeWire/File) does. `GetCaptureRate` similarly always reports
+  `0` for the same reason (no real clock to measure on a synthetic source). Confirmed the fix
+  isn't needed by testing a real backend instead: swapped to `RawFile` capture reading a generated
+  test tone (`local/camilladsp/rawfile_verify.yml` + `test_tone.raw`, gitignored) -- `GetState`
+  reached `"Running"` within ~1s and `GetCaptureRate` reported real fluctuating numbers around the
+  nominal rate, and `GetConfigJson`'s `devices.capture.channels` read back correctly too. So
+  `camilladsp.py`'s code is confirmed correct end-to-end; `local/camilladsp/flat.yml` et al will
+  permanently show "Starting" and that's expected, not a regression -- see
+  `local/camilladsp/README.md`'s "Known quirk" section. Worth remembering generally: a synthetic/
+  mock capture/data source chosen for testing convenience can fail to exercise a real backend's
+  full behavior in ways that only show up as "looks like a bug" until traced to source -- the
+  fastest way through was reading the vendor's actual Rust source, not guessing from the symptom.
+- The *rate-only* status string and the new generic `"channels"`/`state.channels` contract key
+  (both post-date the "Starting" investigation above) haven't been redeployed/reconfirmed on the
+  Dial yet -- the width fix and the contract generalization are host-side-verified only.
+
+## ui/ screenshot regeneration -- `tools/render_ui_screenshots.py` / `make ui-renders` (added 2026-07-30)
+
+`ui/ui-denon.png`, `ui-minidsp.png`, `ui-wiim.png`, `ui-camilladsp.png`, `ui-muted.png`,
+`ui-standby.png` -- the polished, per-backend screenshots README.md actually embeds -- are real
+renders of `dial_ui.py`'s drawing code, same "not a mockup" claim `tools/dial_sim.py` already made
+for its own `local/renders/` scenario set, but with one real difference: `dial_sim.py`'s
+`_base_state()` fixture is Denon-shaped and stays that way no matter which `DEVICE_DRIVER` is
+active, which produces real nonsense on another backend (confirmed live: `minidsp.py`'s
+`friendly_input()` mangling the raw Denon-style input "SAT/CBL" into "Sat/cbl"; `wiim.py` showing
+"Unknown" input and a blank `"--"` volume because -20.5 isn't valid on its 0-100 range).
+`render_ui_screenshots.py` is the fix: one `_fixture_<backend>()` function per backend, each with
+state realistic for that backend specifically (real source/input names, a volume level sane for
+its own `VOLUME_MIN`/`VOLUME_MAX`, real preset shapes).
+
+**One process renders exactly one backend, always -- there is no way around this.**
+`config.py`/`driver.py`/`dial_ui.py` all bind to `DEVICE_DRIVER` (and any `VOLUME_MIN`/`VOLUME_MAX`
+override) at first import, and Python caches imported modules -- so looping over backends by
+mutating `os.environ` and re-importing inside one process silently does nothing (the cached module
+stays bound to whichever backend was active on its *first* import). The script takes a required
+`--backend` flag, cross-checked against the actual `DEVICE_DRIVER` env var as a safety net, and
+`make ui-renders` in the Makefile is what actually loops -- one full `$(PYTHON)
+tools/render_ui_screenshots.py --backend X` subprocess per backend, each with its own env line.
+
+**Real bug caught building this, twice, both worth remembering for the next backend/field added:**
+1. `dial_sim.py`'s `_base_state()` had never been updated when `state.preset_quick_names` was
+   added earlier the same session -- every render using it (i.e. every backend) silently showed an
+   empty quick-button row. This is exactly the "update `tools/dial_sim.py`'s fixture state" step
+   the "Recipe for adding a backend" section calls out, missed because a new `state.*` field
+   doesn't only affect the backend that motivated adding it. Fixed in `_base_state()` by setting
+   `state.preset_quick_names = list(state.preset_names)`, matching what `denon`/`minidsp` actually
+   get from `driver.get_quick_presets()`'s default-reuse fallback on real hardware.
+2. `make ui-renders`'s first version rendered `camilladsp` with no `CAMILLADSP_PRESETS`/
+   `CAMILLADSP_QUICK_PRESETS` env vars set -- the resulting screenshot looked complete but had no
+   quick-select buttons at all, caught by the user on sight. Root cause:
+   `camilladsp.py`'s `CAPS["preset_quickbuttons"]` is derived from
+   `len(config.CAMILLADSP_QUICK_PRESETS)` *at import time*, so it came out `False` regardless of
+   `render_ui_screenshots.py`'s fixture explicitly setting `state.preset_quick_names` to a non-empty
+   list -- CAPS gates whether `dial_ui.py` draws the row at all, and nothing in `state` can override
+   that. Fixed by passing representative `CAMILLADSP_PRESETS`/`CAMILLADSP_QUICK_PRESETS` values in
+   the Makefile line itself, with a comment on that target explaining why they're not optional.
+   General lesson: a fixture that only sets `state.*` fields is not sufficient for any backend whose
+   `CAPS` is itself config-derived -- the environment has to actually reflect a real config too.
+
+**Realism review, same session:** the user caught two more things on sight that weren't bugs, just
+unrepresentative choices. WiiM's fixture originally left `WIIM_PRESET_COUNT`/`WIIM_PRESET_NAMES`
+unset, which produced a real (not broken) but visually sparse screenshot -- an empty gap where
+`wiim_ui.py`'s `"(Set Preset)"` placeholder normally sits, since that placeholder only renders when
+`CAPS["presets"]` is true. Fixed by setting representative values in the Makefile's `wiim` line,
+matching the shape of the user's real `settings.toml.wiim`. Separately, the fixture's input was
+raw mode `"10"`, which `wiim.py`'s `_MODE_NAME` table really does map to the literal string "WiiM"
+(confirmed live, not a bug) -- but that reads oddly as a "current input" in a screenshot, so it was
+swapped to mode `"1"` ("AirPlay", equally confirmed live) purely for recognizability. Neither
+required a code change, both are in `_fixture_wiim()`'s comments -- worth remembering that "is it
+technically accurate" and "is it a good illustration" are different bars for this particular tool.
+
+## Gauge arc overshoot at min/max volume -- all backends (found + fixed 2026-07-30)
+
+User-reported: spinning the encoder to max volume made the red end of the gauge arc visibly creep
+further around the ring than it should, by roughly 5%. Real bug, `dial_ui.py`, not backend-specific
+-- affects every backend, just most visible on ranges where red/green sit right at an extreme
+(`camilladsp`'s -50..0, where max volume = the very end of the sweep, made it easy to notice).
+
+**Why single-frame renders couldn't catch this.** `tools/dial_sim.py` and `render_ui_screenshots.py`
+always call `dial_ui.draw_main()` -- a full, correctly-bounded re-render (`_render_gauge()`'s
+`_arc_solid(bmp, _ARC_START, _ARC_START+_ARC_SWEEP, ...)`, exact bounds every time). The real device
+never does that while the encoder is actively spinning -- `app.py`'s `_handle_encoder_rotation()`
+calls `dial_ui.draw_volume()` per tick instead, the fast incremental path that erases the *old*
+pointer position and draws the new one (`_restore_region()` + `_draw_pointer()`) without a full
+redraw. A bug living only in that incremental path is invisible to every render tool in this
+project, which only ever exercises the full-redraw path. First actually confirmed by simulating the
+real sequence off-device -- one `draw_main()` to establish a starting pointer position, then many
+`draw_volume()` calls in a loop stepping toward max, same as a live encoder spin -- and diffing the
+result against a clean `draw_main()` at that same final volume. Before the fix: real, non-trivial
+pixel differences (not antialiasing noise -- full-strength `(0,153,64)` green / `(170,24,0)` red at
+the arc's two tips). After the fix: pixel-identical, both directions (tested spinning to max and to
+min).
+
+**Root cause:** `_restore_region(bmp, angle, muted)` (the erase-old-pointer step) computes its
+redraw window as `angle ± (_PTR_HALF + 2)` with no bounds-check against the gauge's actual sweep
+(`_ARC_START` to `_ARC_START + _ARC_SWEEP`). When the pointer sits near either end of the range
+(near min or max volume), that window extends past the true arc boundary. Two things then combine
+to make the overshoot visible and *persistent*: `_arc_solid()` is a generic scanline-fill primitive
+with no bounds-check of its own -- it paints exactly the range it's told to, including past the
+gauge's real limits -- and `_arc_color(angle)` still returns a real color (green or red, whichever
+extreme) for an angle outside the intended range, rather than "no color," because its `frac`
+calculation isn't clamped either. So every incremental tick near an extreme repainted a few extra
+colored pixels just past the true tip, and because the fast path never does a full bounded redraw
+mid-spin, nothing ever corrected it back -- each tick could only make the overshoot the same or
+worse, never better, until the next full `draw_main()` (menu open, poll, etc.) reset it.
+
+**Fix:** clamp `_restore_region()`'s window to `[_ARC_START, _ARC_START + _ARC_SWEEP]` before
+calling `_arc_solid()`. Three lines. Confirmed by rerunning the same off-device spin-simulation
+diff both directions (toward max: red/right tip; toward min: green/left tip, the same bug mirrored,
+less noticed but equally real) -- both pixel-identical to a clean render afterward.
+
+**General lesson:** this project's rendering tools (`dial_sim.py`, `render_ui_screenshots.py`) are
+excellent for "does a given static state render correctly" but structurally cannot catch a bug that
+only lives in a *sequence* of incremental draw calls, because they only ever call the full-redraw
+path. If a future bug report describes something that changes *during* interaction rather than in
+one static frame (a gauge, an animation, anything with an incremental/fast-path redraw), simulate
+the actual call sequence off-device (a loop of the real fast-path function calls) and diff against
+a clean full render, the same way this one was actually confirmed -- don't rely on single-frame
+renders to rule it in or out.
+
 ## CircuitPython heap/boot-memory guardrails (read before touching boot-path code)
 
 The app once failed to boot on real hardware (`MemoryError` allocating the ~28.8KB gauge bitmap,
@@ -1249,6 +1528,14 @@ lasting rules that came out of it:
 > / LinkPlay streamer"'s TLS section), but only via ad-hoc REPL snippets, not the actual shipped
 > module code end to end. Check `gc.mem_free()` before/after on that first real boot regardless,
 > same as any other memory theory in this file.
+>
+> The CamillaDSP backend (`src/camilladsp.py`, "Backend #5" below) has booted successfully on real
+> M5 Dial hardware against a real `camilladsp` process -- volume/mute/touch all confirmed working.
+> The final quick-preset-button design (`CAMILLADSP_QUICK_PRESETS`/`get_quick_presets()`/
+> `state.preset_quick_names`) is verified host-side only -- redeploying and confirming it on the
+> Dial is the next concrete step for this backend. Still open beyond that: preset-switch timing was
+> only measured against a trivial synthetic test config, not a real production one with actual
+> filter files, and `CAMILLADSP_PRESET_TIMEOUT_MS` is still a guess for that case.
 
 ## Current Recommendation
 
@@ -1256,7 +1543,7 @@ The app boots and connects cleanly on real hardware, both `denon` and `ha` confi
 deploy-mpy` is what the device should run day to day; plain `make deploy` is for fast dev
 iteration only (no `mpy-cross` needed) and should not be mistaken for the shipped configuration.
 
-All four backends are implemented against the same
+All five backends are implemented against the same
 pluggable-driver contract; Denon and MiniDSP are verified against real hardware (AVR-X4800H,
 MiniDSP 2x4HD, MiniDSP Flex). HA `media_player` (discovery/switching, skip controls, the
 standby-screen menu access fix, and the row/glyph/spacing polish) has had real on-device use --
@@ -1280,6 +1567,17 @@ into the live REPL, not yet the actual shipped module code end to end, so that's
 step, not a re-litigation of whether the approach works. Also still unverified: the `getPresetInfo`
 `preset_list` entry field names (no favorites were configured on the test unit yet).
 
+`camilladsp` is implemented and confirmed working end-to-end on real M5 Dial hardware against a
+real `camilladsp` 4.1.3 process -- volume, mute, and touch all functioning -- see "Backend #5:
+CamillaDSP" above for the full design rationale and what's still open (Pong/ping tolerance beyond
+the short test session, and preset-switch timing against a real production config rather than the
+trivial synthetic test configs in `local/camilladsp/`). One piece is verified host-side only, not
+yet redeployed to the Dial: the final quick-preset-button design (`CAMILLADSP_QUICK_PRESETS`,
+`get_quick_presets()`, `state.preset_quick_names`) -- that's the next concrete step for this
+backend, not a question of whether the approach works.
+
 Future work could include: input selection UI polish, sound
-mode selection, multi-zone support, or wiring up MiniDSP's real Dirac-series per-slot filter names
-if a future unit exposes more than a bare on/off `dirac` boolean.
+mode selection, multi-zone support, wiring up MiniDSP's real Dirac-series per-slot filter names
+if a future unit exposes more than a bare on/off `dirac` boolean, or -- once verified -- extending
+`camilladsp.py`'s design (name/path preset lists, live-reported current preset) back as an option
+for other backends if a similar gap ever comes up.

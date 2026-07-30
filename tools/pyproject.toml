@@ -11,6 +11,7 @@ dev = [
     "circup",
     "denonavr",
     "Pillow",
+    "websocket-client",
 ]
 
 [tool.setuptools]

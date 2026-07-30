@@ -37,16 +37,26 @@
 #     should also flip state.preset_enabled to True, or leave it alone.
 #
 #     "preset_quickbuttons" (default True) says whether the main-screen
-#     quick-select button row (dial_ui.py's _draw_preset_filter_buttons,
-#     up to _DBTN_MAX=5 pre-allocated slots) should render CAPS["presets"]'
-#     list at all. Denon (2 presets) and MiniDSP (<=4) leave this at the
-#     default; wiim.py sets it False because a WiiM unit's favorites list
-#     can be much longer than 5 -- past that point the quick-button row's
-#     fixed-slot drawing and its tap-rect math (which lays out rects for
-#     the *full* list length, not just the drawn slots) go out of sync.
-#     Backends with this False still get their presets via the always-
-#     generic, always-scrollable Preset submenu -- see CAPS["presets"]
-#     above -- just never the main-screen shortcut.
+#     quick-select button row (dial_ui.py's _draw_preset_filter_buttons, up
+#     to _DBTN_MAX=5 pre-allocated slots) should render at all. It gates
+#     state.preset_quick_names (below), not CAPS["presets"]' full list --
+#     the two are allowed to differ in length and content. Denon (2
+#     presets) and MiniDSP (<=4) leave this at the default, with
+#     get_quick_presets() left unimplemented so it defaults to reusing the
+#     same full list get_presets() returns -- their full list already fits
+#     the button row, so there's nothing to distinguish. wiim.py hardcodes
+#     it False because a WiiM unit's favorites list can be much longer than
+#     5 pre-allocated slots -- past that point the row's fixed-slot drawing
+#     and its tap-rect math (sized to the *full* list length, not just the
+#     drawn slots) go out of sync, so its presets are reachable only via the
+#     always-generic, always-scrollable Preset submenu (CAPS["presets"]
+#     above), never the main-screen shortcut. camilladsp.py takes a third
+#     shape: a config-driven *subset* of its full preset list
+#     (CAMILLADSP_QUICK_PRESETS, up to 4 names) gets buttons, while the full
+#     list (which can be arbitrarily long -- CamillaDSP presets are just
+#     named config files, no real ceiling) stays reachable only through the
+#     submenu -- this is why get_quick_presets() exists as its own function
+#     rather than always being derived from get_presets().
 #
 #   LABELS: dict of {"input_select": str, "presets": str}
 #     Display label for each optional feature's top-menu entry and submenu
@@ -68,12 +78,54 @@
 #   needed elsewhere. media_play()/media_pause() are the matching optional
 #   controls, called only when state.media_state is "playing"/"paused".
 #
+#   get_status()'s dict may also include an optional "channels" key -- the
+#   number of audio channels present on whatever the backend considers its
+#   current input (an integer), for backends that can determine that. Same
+#   no-CAPS-flag shape as "media_state": state.py defaults it to None via
+#   .get() for any backend that doesn't return the key, and nothing reads it
+#   yet beyond storing it -- added for camilladsp.py (from GetConfigJson's
+#   devices.capture.channels, cached rather than fetched every poll since
+#   it's static per loaded config).
+#
+#   Checked (2026-07-30) whether the other four backends could fill this in
+#   too -- none currently can, each for a different confirmed reason, not
+#   just "not implemented yet":
+#     denon.py: no known AppCommand.xml/telnet command reports the incoming
+#       signal's channel count -- confirmed unresolved even in the wider
+#       HA/Denon integration community (a Home Assistant community thread
+#       asking this exact question found no answer), not just unchecked here.
+#     minidsp.py: minidsp-rs's HTTP API never serializes a channel count at
+#       all -- confirmed from its own source (daemon/src/http/mod.rs's
+#       `Device` struct only has url/version/product_name). The hardware's
+#       fixed input/output channel definitions exist as compile-time static
+#       data per hw_id (protocol/src/device/mod.rs), same shape as
+#       minidsp.py's own _SOURCE_MAP, but nothing exposes it over HTTP to
+#       read even if a similar hardcoded table were added.
+#     ha.py: confirmed absent from HA's own media_player entity schema by
+#       reading homeassistant/components/media_player/__init__.py directly
+#       -- no audio-channel-count attribute exists (media_channel, the one
+#       lookalike name, is a broadcast/TV/radio channel, unrelated).
+#     wiim.py: getMetaInfo has documented sampleRate/bitDepth/bitRate fields
+#       (per community API docs, unverified live) -- genuinely relevant
+#       "audiophile info" territory, just not a channels field specifically,
+#       and a different feature scope than what this key was added for.
+#
 #   power_on() / power_standby()           -- required only if CAPS["power"]
 #   load_input_names() / load_source_list() / get_inputs() -> (index, [(index, name)])
 #     / set_input(index) / friendly_input(raw) -- required only if CAPS["input_select"]
 #   get_presets() -> (value, [(value, name)]) / set_preset(value)
 #     -- required only if CAPS["presets"]. `value` always names a real,
 #     selectable slot -- there is no synthetic "off" entry in the list.
+#   get_quick_presets() -> [(value, name)] -- optional; only meaningful when
+#     CAPS["presets"] and CAPS["preset_quickbuttons"] are both True. The
+#     subset of get_presets()'s list (same (value, name) shape, no `current`
+#     element -- state.preset already tracks that) to offer as main-screen
+#     quick-select buttons, distinct from the full scrollable-submenu list
+#     when a backend wants that distinction (see CAPS["preset_quickbuttons"]
+#     above). Defaults to get_presets()'s own list when unimplemented, which
+#     is exactly correct for a backend whose full list already fits the
+#     button row (denon.py, minidsp.py) -- only a backend like camilladsp.py,
+#     whose full list can outgrow the row, needs to actually define this.
 #   get_preset_enabled() -> bool / set_preset_enabled(bool)
 #     -- whether the currently-selected preset is actually engaged, as a
 #     dimension independent of *which* slot is selected (e.g. Dirac Live
@@ -147,6 +199,9 @@ import config
 if config.DEVICE_DRIVER == "minidsp":
     import minidsp as _impl
     _ui_impl = None
+elif config.DEVICE_DRIVER == "camilladsp":
+    import camilladsp as _impl
+    _ui_impl = None
 elif config.DEVICE_DRIVER == "ha":
     import ha as _impl
     import ha_ui as _ui_impl
@@ -199,6 +254,11 @@ friendly_input    = getattr(_impl, "friendly_input", lambda raw: raw)
 
 get_presets = getattr(_impl, "get_presets", lambda: ("", []))
 set_preset  = getattr(_impl, "set_preset", lambda value: None)
+
+# Defaults to reusing get_presets()'s own list -- see driver.py's contract
+# comment on CAPS["preset_quickbuttons"] above for why only a backend whose
+# full preset list can outgrow the button row needs to override this.
+get_quick_presets = getattr(_impl, "get_quick_presets", lambda: get_presets()[1])
 
 get_preset_enabled = getattr(_impl, "get_preset_enabled", lambda: True)
 set_preset_enabled = getattr(_impl, "set_preset_enabled", lambda enabled: None)

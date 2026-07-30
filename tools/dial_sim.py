@@ -261,6 +261,13 @@ def _base_state():
     state.input          = "SAT/CBL"
     state.preset         = "2"
     state.preset_names   = [("2", "Movie"), ("3", "Music"), ("4", "Night")]
+    # Mirrors driver.get_quick_presets()'s default fallback (reuse the full
+    # list) -- denon.py/minidsp.py don't define their own, so this is what
+    # they'd actually show on real hardware. Without this, dial_ui.py's
+    # button row silently renders empty (state.preset_quick_names defaults
+    # to [] in AVRState.__init__) -- a real regression this fixture hit the
+    # first time camilladsp.py's separate quick-preset list was added.
+    state.preset_quick_names = list(state.preset_names)
     state.preset_enabled = True
     return state
 
