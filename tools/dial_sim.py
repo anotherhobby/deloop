@@ -303,7 +303,7 @@ def main():
     dial_ui.draw_status(ui, "connecting to wifi...")
     save(ui, "status_connecting")
 
-    dial_ui.draw_error(ui, "No AVR")
+    dial_ui.draw_error(ui, "Reconnecting...")
     save(ui, "error")
 
     state.power = "STANDBY"

@@ -1136,18 +1136,29 @@ def draw_status(ui, msg):
 
 
 def draw_error(ui, msg):
-    """Error state: message at the top of the display.  Tap anywhere to restart."""
+    """Error state: message and restart hint centered on the display, one
+    above the other, in the same small dim style as the main screen's
+    input line (font _F_SM, color _C_DIM).  Tap anywhere to restart.
+
+    Reuses the "preset" and "menu" labels (both already _F_SM) rather than
+    "status" (_F_MD, too big) or "input" (_F_SM, but its position is never
+    reset elsewhere -- see its own label comment -- so repositioning it
+    here would leak into the next draw_main()).
+    """
     _render_gauge(ui["bmp"], _SENTINEL, False)
     ui["_ptr_angle"] = None
     _hide_vol_and_status(ui)
-    ui["status"].text  = msg[:24]
-    ui["status"].color = _C_WARN
     for ml in ui["items"]:
         ml.text = ""
-    ui["menu"].anchor_point      = _MENU_ANCHOR_MAIN
-    ui["menu"].anchored_position = _MENU_POS_MAIN
-    ui["menu"].text  = "tap to restart"
-    ui["menu"].color = _C_WARN
+    ui["status"].text = ""
+    ui["preset"].anchor_point      = (0.5, 0.5)
+    ui["preset"].anchored_position = (CX, CY - 20)
+    ui["preset"].text  = msg[:24]
+    ui["preset"].color = _C_DIM
+    ui["menu"].anchor_point      = (0.5, 0.5)
+    ui["menu"].anchored_position = (CX, CY + 20)
+    ui["menu"].text  = "Tap to Restart"
+    ui["menu"].color = _C_DIM
     ui["display"].refresh()
 
 

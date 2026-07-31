@@ -953,7 +953,7 @@ def _poll_now(loop, ui, state, now):
         loop.error_count += 1
         if loop.error_count >= _MAX_ERRORS and loop.mode != MODE_ERROR:
             loop.mode = MODE_ERROR
-            dial_ui.draw_error(ui, "No AVR")
+            dial_ui.draw_error(ui, "Reconnecting...")
     return powered_on_externally
 
 
