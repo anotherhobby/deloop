@@ -1,0 +1,108 @@
+# Builds and publishes a deloop OTA release automatically on every push to
+# main. The version number is never chosen by hand -- it's always
+# "highest existing vN release tag + 1" (see "Determine next version" below),
+# computed the same way no matter what triggered the run. Consumed by
+# src/ota.py on the device -- see its module docstring and CLAUDE.md's OTA
+# section for the full design.
+#
+# Also runnable manually (Actions tab -> "Run workflow", or `gh workflow run
+# release.yml`) for a release with no new commit -- same version-computation
+# step either way, so there is exactly one place version numbers come from.
+#
+# v1-v4 predate this workflow (hand-created tags, no assets) -- the version
+# step below sees them as ordinary existing tags and continues from v5.
+#
+# The MPY_MODULES list below must be kept in sync by hand with the
+# Makefile's MPY_MODULES and tools/build_release_manifest.py's
+# _MPY_MODULES (same explicit-list tradeoff used throughout this project
+# rather than a glob).
+name: Build and publish deloop release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Serializes runs so two near-simultaneous triggers can't compute the same
+# "next version" and collide trying to create the same tag.
+concurrency:
+  group: deloop-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Must match the CircuitPython build actually running on the device
+  # (cat /Volumes/CIRCUITPY/boot_out.txt) -- bump by hand if that changes,
+  # same manual-attention requirement the Makefile's local mpy-cross
+  # comment already documents.
+  CIRCUITPYTHON_VERSION: "10.2.1"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full tag history needed to find the latest vN
+
+      - name: Determine next version
+        id: version
+        run: |
+          git fetch --tags --quiet
+          LATEST=$(git tag -l 'v[0-9]*' | sed 's/^v//' | sort -n | tail -1)
+          LATEST="${LATEST:-0}"
+          VERSION=$((LATEST + 1))
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "ERROR: $TAG already exists -- refusing to overwrite a published release." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Linux amd64 static build -- confirmed to exist at this exact path
+      # for 10.2.1 (2026-07-31): the Makefile's own mpy-cross comment only
+      # links the macOS arm64 build used for local dev, a different
+      # artifact than what this Linux runner needs.
+      - name: Download mpy-cross (Linux amd64, CircuitPython ${{ env.CIRCUITPYTHON_VERSION }})
+        run: |
+          curl -sL "https://adafruit-circuit-python.s3.amazonaws.com/bin/mpy-cross/linux-amd64/mpy-cross-linux-amd64-${{ env.CIRCUITPYTHON_VERSION }}.static" -o mpy-cross
+          chmod +x mpy-cross
+          ./mpy-cross --version
+
+      # Working-copy only -- never committed back. src/version.py's
+      # checked-in value is a placeholder; this is the one place it
+      # becomes real, for exactly the files this workflow ships.
+      - name: Bake version into src/version.py
+        run: echo "CURRENT_VERSION = ${{ steps.version.outputs.version }}" > src/version.py
+
+      - name: Compile .mpy modules
+        run: |
+          mkdir -p dist
+          for m in config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app ota version; do
+            ./mpy-cross "src/$m.py" -o "dist/$m.mpy"
+          done
+          # Never .mpy-compiled -- code.py is CircuitPython's boot entry point.
+          cp src/code.py dist/code.py
+
+      - name: Build manifest.json
+        run: |
+          python tools/build_release_manifest.py --dir dist --out dist/manifest.json --version ${{ steps.version.outputs.version }}
+
+      - name: Create GitHub release, upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          gh release create "$TAG" --target "$GITHUB_SHA" --generate-notes
+          gh release upload "$TAG" dist/* --clobber

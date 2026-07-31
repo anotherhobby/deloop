@@ -192,6 +192,19 @@ def _parse_camilladsp_quick_presets(raw, presets):
 CAMILLADSP_QUICK_PRESETS = _parse_camilladsp_quick_presets(
     os.getenv("CAMILLADSP_QUICK_PRESETS", ""), CAMILLADSP_PRESETS)
 
+# OTA self-update settings -- orthogonal to DEVICE_DRIVER, see ota.py. This
+# updates deloop's own app files from a GitHub release, never CircuitPython
+# firmware itself. Manual only: nothing here runs in the background -- the
+# Update menu's "Check Now"/"Install Update" are the only entry points. See
+# README.md's "Updating deloop" section.
+OTA_ENABLED            = _get_bool("OTA_ENABLED", True)
+OTA_REPO               = os.getenv("OTA_REPO", "anotherhobby/deloop")
+OTA_CHECK_TIMEOUT_MS   = int(os.getenv("OTA_CHECK_TIMEOUT", "10000"))
+# Generous headroom for a ~15-file sequential download over Wi-Fi -- not yet
+# measured against real hardware (see CLAUDE.md's OTA section); revisit once
+# it has been, same as every other backend's *_TIMEOUT_MS constants here.
+OTA_INSTALL_TIMEOUT_MS = int(os.getenv("OTA_INSTALL_TIMEOUT", "60000"))
+
 # Polling interval -- display state is truth; poll is error correction only
 POLL_INTERVAL_S  = float(os.getenv("POLL_INTERVAL", "30.0"))
 POLL_INTERVAL_MS = int(POLL_INTERVAL_S * 1000)

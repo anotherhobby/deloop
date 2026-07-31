@@ -110,6 +110,15 @@ AVR_HOST = "192.168.1.100"
 # could be much slower; not yet measured for that case.
 # CAMILLADSP_PRESET_TIMEOUT = "10000"
 
+# --- Self-update (optional) ---
+# Pulls new deloop app-file releases from GitHub -- NOT CircuitPython
+# firmware. Manual only: opens via the "Update" menu, nothing runs in the
+# background. See README.md "Updating deloop".
+# OTA_ENABLED = "true"
+# OTA_REPO = "anotherhobby/deloop"
+# OTA_CHECK_TIMEOUT = "10000"
+# OTA_INSTALL_TIMEOUT = "60000"
+
 # Optional overrides (safe to leave commented out)
 # VOLUME_MIN        = "-80.0"  # per-driver default set in config.py (dB, or 0-100
 # VOLUME_MAX        = "18.0"   # percent for DEVICE_DRIVER = "ha" / "wiim")
