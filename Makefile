@@ -21,6 +21,11 @@ install-libs:
 	$(CIRCUP) install adafruit_bitmap_font
 	$(CIRCUP) install adafruit_focaltouch
 	$(CIRCUP) install adafruit_imageload
+	# ota.py's sha256 verification -- this board's native hashlib has no
+	# sha256 at all (confirmed live, 2026-07-31); adafruit_hashlib falls
+	# back to a pure-Python implementation, confirmed byte-identical to
+	# CPython's hashlib.sha256 including its incremental .update() path.
+	$(CIRCUP) install adafruit_hashlib
 
 # full-deploy: everything from scratch -- libs, settings, code, fonts.
 # Run this after a fresh CircuitPython flash or when onboarding a new device.
@@ -69,7 +74,7 @@ MPY_CROSS := local/mpy-cross
 # than what the runtime compiler produces from `.py` source AND skips
 # paying that compile-time cost at all -- see CLAUDE.md's "CircuitPython
 # heap/boot-memory guardrails" for why that's not just a flash-space nicety.
-MPY_MODULES := config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app
+MPY_MODULES := config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app ota version
 
 _copy-files-mpy:
 	cp src/settings.toml $(CIRCUITPY)/settings.toml
@@ -180,6 +185,8 @@ _copy-files:
 	cp src/settings.toml $(CIRCUITPY)/settings.toml
 	@rm -f $(addsuffix .mpy,$(addprefix $(CIRCUITPY)/,$(MPY_MODULES)))
 	cp src/config.py   $(CIRCUITPY)/config.py
+	cp src/ota.py      $(CIRCUITPY)/ota.py
+	cp src/version.py  $(CIRCUITPY)/version.py
 	cp src/driver.py   $(CIRCUITPY)/driver.py
 	cp src/denon.py    $(CIRCUITPY)/denon.py
 	cp src/minidsp.py  $(CIRCUITPY)/minidsp.py
@@ -266,4 +273,20 @@ CAMILLADSP_PORT ?= $(shell grep '^CAMILLADSP_PORT' src/settings.toml 2>/dev/null
 probe-camilladsp:
 	$(PYTHON) tools/probe_camilladsp.py --host $(CAMILLADSP_HOST) --port $(or $(CAMILLADSP_PORT),1234) $(PROBE_ARGS)
 
-.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp renders ui-renders
+# Run the host-side GitHub Releases probe (no device/daemon needed -- just
+# network access to github.com). Confirms release/manifest/asset shapes
+# against the real repo before ota.py's assumptions are trusted.
+# Usage: make probe-ota
+OTA_REPO ?= $(shell grep '^OTA_REPO' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
+probe-ota:
+	$(PYTHON) tools/probe_ota.py --repo $(or $(OTA_REPO),anotherhobby/deloop) $(PROBE_ARGS)
+
+# Build a release manifest.json from whatever's already staged in a
+# directory (by default, local/build/ -- whatever `make deploy` last
+# compiled there). Sanity-check locally before this same script runs in CI
+# (.github/workflows/release.yml). OTA_VERSION is just a placeholder int
+# for local testing; the real workflow auto-computes it (latest tag + 1).
+build-manifest:
+	$(PYTHON) tools/build_release_manifest.py --dir local/build --out local/build/manifest.json --version $(or $(OTA_VERSION),0)
+
+.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest renders ui-renders

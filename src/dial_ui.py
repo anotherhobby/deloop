@@ -1257,6 +1257,33 @@ def show_splash(display):
     display.refresh()
 
 
+def show_message(display, text):
+    """Minimal single-line status screen -- no ~28KB gauge bitmap, no label
+    pool. Used by app.py's OTA apply-mode boot branch, which needs to show
+    brief status text (e.g. "Updating...") without paying dial_ui.init()'s
+    full allocation cost on top of everything else that boot already needs
+    resident (wifi, ssl, ota, adafruit_hashlib) -- confirmed live
+    (2026-07-31) that doing both causes a real MemoryError. Same "no large
+    bitmap" approach show_splash() already uses, for the same reason.
+    """
+    group = displayio.Group()
+    try:
+        import vectorio
+        bg_pal = displayio.Palette(1)
+        bg_pal[0] = 0x000000
+        group.append(vectorio.Rectangle(
+            pixel_shader=bg_pal, width=_W, height=_H, x=0, y=0))
+    except Exception:
+        pass
+    group.append(label.Label(
+        _F_SM, text=text, color=_C_TEXT,
+        anchor_point=(0.5, 0.5), anchored_position=(CX, CY),
+    ))
+    display.auto_refresh = False
+    display.root_group = group
+    display.refresh()
+
+
 def flash_power_on(ui):
     """Brief splash shown when the AVR transitions to powered-on.
 

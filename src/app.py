@@ -36,6 +36,7 @@ import config
 import driver
 import dial_ui
 import sound
+import version
 from state import AVRState
 
 _MAX_ERRORS = 5
@@ -51,6 +52,26 @@ MODE_ERROR    = 4   # network/AVR error – tap anywhere to restart
 _NVM_BRIGHTNESS = 0
 # NVM slot for persisting sound on/off (byte 1: 0=off, any other=on)
 _NVM_SOUND      = 1
+# OTA NVM state -- 3 bytes. Root-caused live (2026-07-31, see CLAUDE.md's
+# OTA section for the full trail): a genuine hardware reset breaks TLS
+# for the rest of that power cycle (a raw-socket test showed the TCP
+# connect and handshake both succeed, but the first post-handshake
+# application-data send doesn't -- OSError -12288, every single time).
+# A session reached via supervisor.reload() instead -- never a hard
+# reset -- works completely reliably. So the whole OTA flow is designed
+# around never hard-resetting: "Check Now"/"Install Update" set an
+# action byte and call supervisor.reload() (not microcontroller.reset())
+# into a lean, low-memory pass of main() that skips dial_ui.init()
+# (see _ota_lean_mode()), does the real network+filesystem work, records
+# a result, and reloads back to the normal UI -- no hard reset anywhere
+# in this flow. Filesystem writes use a *live* storage.remount("/",
+# readonly=False) call (confirmed live: succeeds with zero reboot at all
+# as long as CIRCUITPY isn't actively host-mounted -- eject it first if
+# it is) rather than the boot.py-gated dance earlier designs needed.
+_NVM_OTA_ACTION  = 2   # 0=idle, 1=pending check, 2=pending install
+_NVM_OTA_RESULT  = 3   # 0=none, 1=available, 2=up_to_date, 3=check_error,
+                        # 4=install_ok, 5=install_failed, 6=eject_needed
+_NVM_OTA_VERSION = 4   # latest version found by a check (valid when result==1)
 
 # Encoder debounce (volume mode only)
 ENC_DEBOUNCE_S = 0.15
@@ -105,6 +126,184 @@ def _save_sound(val):
         print("save_sound:", e)
 
 
+def _ota_action():
+    try:
+        return microcontroller.nvm[_NVM_OTA_ACTION]
+    except Exception:
+        return 0
+
+
+def _set_ota_action(val):
+    gc.collect()   # nvm writes need a real buffer -- see _set_ota_result
+    try:
+        microcontroller.nvm[_NVM_OTA_ACTION] = val
+    except Exception as e:
+        print("set_ota_action:", type(e), e)
+
+
+def _ota_result():
+    try:
+        return microcontroller.nvm[_NVM_OTA_RESULT]
+    except Exception:
+        return 0
+
+
+def _set_ota_result(val):
+    # Confirmed live (2026-07-31): an nvm[] write itself needs to allocate
+    # a real buffer (observed ~8KB -- likely a flash-sector-sized read-
+    # modify-write, not just the one byte being set), which can fail with
+    # a MemoryError of its own right after a network-heavy operation.
+    # gc.collect() first, same discipline used everywhere else in this
+    # codebase before a specific allocation.
+    gc.collect()
+    try:
+        microcontroller.nvm[_NVM_OTA_RESULT] = val
+    except Exception as e:
+        print("set_ota_result:", type(e), e)
+
+
+def _ota_latest_version():
+    try:
+        v = microcontroller.nvm[_NVM_OTA_VERSION]
+        return None if v == 255 else v   # 255 = erased/uninitialized flash
+    except Exception:
+        return None
+
+
+def _set_ota_latest_version(val):
+    try:
+        microcontroller.nvm[_NVM_OTA_VERSION] = val
+    except Exception as e:
+        print("set_ota_latest_version:", type(e), e)
+
+
+def _ota_reload_to_normal():
+    """Clear the pending action and reload back into normal UI mode --
+    shared tail for every _ota_lean_mode() exit path. A *soft* reload,
+    not microcontroller.reset() -- see _ota_lean_mode()'s docstring for
+    why that distinction matters here just as much on the way out as on
+    the way in."""
+    _set_ota_action(0)
+    gc.collect()
+    import supervisor
+    supervisor.reload()
+
+
+def _ota_new_session():
+    """Fresh wifi connect + Session(ssl_context) -- factored out only so
+    the caller doesn't need to spell it twice (check vs install)."""
+    wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
+    pool = socketpool.SocketPool(wifi.radio)
+    import ssl
+    ssl_context = ssl.create_default_context()
+    return adafruit_requests.Session(pool, ssl_context)
+
+
+def _ota_do_check():
+    """Runs ota.check_latest_version() in its own stack frame. Confirmed
+    live (2026-07-31): this matters, not just tidiness -- pool/ssl_context/
+    session are the real memory hogs (TLS/socket buffers), and leaving them
+    resident in the CALLER's frame (the first cut of this function had the
+    network call and the nvm-writing code in one flat function) starves the
+    nvm write that records the result of the ~8KB it needs, even with a
+    gc.collect() right before it -- objects still reachable from a live
+    frame are not garbage. Once this function returns, its frame is gone
+    and they're immediately collectible."""
+    import ota
+    return ota.check_latest_version(_ota_new_session())
+
+
+def _ota_do_install():
+    """Same reasoning as _ota_do_check() -- runs ota.apply() in its own
+    frame so its locals are collectible before _ota_lean_mode() tries to
+    record the result to nvm."""
+    import ota
+    ota.apply(_ota_new_session())
+
+
+def _ota_lean_mode():
+    """Runs instead of the normal UI/backend flow when an OTA action
+    (check or install) is pending -- see main()'s call to this, near the
+    top, before dial_ui.init()/driver setup. Deliberately skips all of
+    that: dial_ui.init()'s ~28KB gauge bitmap plus driver/encoder/touch
+    setup left too little headroom for wifi+ssl+ota+adafruit_hashlib in
+    earlier testing (confirmed live, a real MemoryError).
+
+    Reached only via supervisor.reload() (see _confirm_sub's "update"
+    branch), never via a hard reset -- that distinction is load-bearing,
+    not stylistic. Root-caused live (2026-07-31, full trail in CLAUDE.md's
+    OTA section): a genuine hardware reset breaks TLS for the rest of
+    that power cycle -- a raw-socket test showed the TCP connect and the
+    handshake itself both succeeding, but the first post-handshake
+    application-data send() failing, 100% reproducibly, every attempt,
+    however long an idle delay preceded it. A session reached via a soft
+    reload instead -- confirmed live, several times -- completes a full
+    TLS round trip (handshake, send, recv, a real HTTP response)
+    reliably. Every exit path below ends in _ota_reload_to_normal(),
+    itself also a soft reload, so this holds on the way back out too --
+    a successful install's newly-written app.mpy is picked up correctly
+    by that reload the same way CircuitPython's own auto-reload already
+    relies on re-importing changed files from disk.
+
+    Filesystem writes use a *live* storage.remount("/", readonly=False)
+    call rather than any boot.py-gated dance -- confirmed live this
+    succeeds with zero reboot at all as long as CIRCUITPY isn't actively
+    host-mounted (eject it first if it is -- the one real dependency
+    this whole design has, surfaced to the user as the "eject_needed"
+    result below rather than failing silently).
+    """
+    action = _ota_action()
+    dial_ui.show_message(board.DISPLAY, "Checking..." if action == 1 else "Updating...")
+
+    if not config.WIFI_SSID:
+        _set_ota_result(3 if action == 1 else 5)
+        _ota_reload_to_normal()
+        return
+
+    if action == 1:   # Check Now
+        try:
+            latest, current = _ota_do_check()
+            gc.collect()   # pool/ssl_context/session are out of scope now
+            print("free mem before ota result nvm writes:", gc.mem_free())
+            if latest > current:
+                _set_ota_latest_version(latest)
+                _set_ota_result(1)
+            else:
+                _set_ota_result(2)
+        except Exception as e:
+            print("ota check failed:", type(e), e)
+            _set_ota_result(3)
+        _ota_reload_to_normal()
+        return
+
+    # action == 2: Install Update.
+    import storage
+    try:
+        storage.remount("/", readonly=False)
+    except Exception as e:
+        print("ota install: remount failed:", type(e), e)
+        _set_ota_result(6)   # eject_needed
+        _ota_reload_to_normal()
+        return
+
+    ok = False
+    try:
+        _ota_do_install()
+        ok = True
+    except Exception as e:
+        print("ota apply failed:", type(e), e)
+    gc.collect()   # pool/ssl_context/session are out of scope now
+    print("free mem before ota result nvm writes:", gc.mem_free())
+
+    try:
+        storage.remount("/", readonly=True)   # restore the normal default
+    except Exception as e:
+        print("ota install: remount-back failed:", type(e), e)
+
+    _set_ota_result(4 if ok else 5)
+    _ota_reload_to_normal()
+
+
 def _connect_wifi(ui):
     if not config.WIFI_SSID:
         dial_ui.draw_error(ui, "No WiFi cfg")
@@ -128,6 +327,8 @@ def _top_menu_entries():
         entries.append(("preset", driver.LABELS["presets"]))
     if driver.CAPS["player_select"]:
         entries.append(("player", driver.LABELS["player_select"]))
+    if config.OTA_ENABLED:
+        entries.append(("update", "Update"))
     entries.append(("device", "Device"))
     return entries
 
@@ -140,7 +341,36 @@ def _build_dev_menu():
     return ["Brightness", "Sound", "Restart"]
 
 
-def _build_sub_items(sub_type, state):
+def _ota_menu_title():
+    """Submenu title for sub_type == "update" -- current version lives
+    here, not repeated in every item string (see _ota_update_items)."""
+    return "UPDATE (v{})".format(version.CURRENT_VERSION)
+
+
+def _ota_update_items(loop):
+    """Status-dependent display strings for the Update submenu -- always a
+    1- or 2-item action list, never a real list of choices the way input/
+    preset/player are. The current version is shown in the submenu's
+    title instead (see _open_submenu/_handle_encoder_rotation), not
+    repeated in every one of these. See _confirm_sub's "update" branch for
+    what each label triggers. loop.ota_status is surfaced from NVM once,
+    on the first normal boot after a check/install reload -- see main()."""
+    if loop.ota_status == "available":
+        return ["Install Update (v{})".format(loop.ota_latest_version), "Check Again"]
+    if loop.ota_status == "up_to_date":
+        return ["Up to date", "Check Again"]
+    if loop.ota_status == "error":
+        return ["Check failed", "Check Again"]
+    if loop.ota_status == "eject_needed":
+        return ["Eject drive first", "Check Again"]
+    if loop.ota_status == "just_installed":
+        return ["Update installed", "Check Now"]
+    if loop.ota_status == "just_failed":
+        return ["Install failed", "Check Now"]
+    return ["Check Now"]
+
+
+def _build_sub_items(sub_type, state, loop):
     """Return list of display strings for a submenu."""
     if sub_type == "input":
         return [name for _, name in state.input_names]
@@ -153,10 +383,12 @@ def _build_sub_items(sub_type, state):
         return ["            {} %\n(rotate to adjust)".format(pct)]
     if sub_type == "sound":
         return ["On", "Off"]
+    if sub_type == "update":
+        return _ota_update_items(loop)
     return []
 
 
-def _open_submenu(sub_type, label, state):
+def _open_submenu(sub_type, label, state, loop):
     """Resolve a non-Device top-menu entry into (sub_type, sub_cursor, title, items)."""
     sc = 0
     if sub_type == "input":
@@ -171,24 +403,32 @@ def _open_submenu(sub_type, label, state):
         ids = [i for i, _ in state.player_names]
         if state.player_id in ids:
             sc = ids.index(state.player_id)
-    return sub_type, sc, label.upper(), _build_sub_items(sub_type, state)
+    title = _ota_menu_title() if sub_type == "update" else label.upper()
+    return sub_type, sc, title, _build_sub_items(sub_type, state, loop)
 
 
-def _enter_dev_sub(item, state, ui, sound_mod):
+def _enter_dev_sub(item, state, ui, sound_mod, loop):
     """Open the leaf submenu for a Device menu item. Returns (sub_type, sub_cursor)."""
     if item == "Brightness":
         dial_ui.render_gauge_bg(ui, state.volume_db, state.muted)
-        dial_ui.draw_menu(ui, "BRIGHTNESS", _build_sub_items("brightness", state), 0)
+        dial_ui.draw_menu(ui, "BRIGHTNESS", _build_sub_items("brightness", state, loop), 0)
         return "brightness", 0
     elif item == "Sound":
         sc = -1   # no pre-selection; user taps or rotates to choose
-        dial_ui.draw_menu(ui, "SOUND", _build_sub_items("sound", state), sc, clear_bg=True)
+        dial_ui.draw_menu(ui, "SOUND", _build_sub_items("sound", state, loop), sc, clear_bg=True)
         return "sound", sc
     return None, 0
 
 
-def _confirm_sub(sub_type, sub_cursor, state, ui):
-    """Apply sub-menu selection (side-effects only)."""
+def _confirm_sub(sub_type, sub_cursor, state, ui, loop):
+    """Apply sub-menu selection (side-effects only).
+
+    Returns a truthy value to mean "stay open, refresh items" instead of
+    the usual "close back to MODE_MAIN" -- every branch below except
+    "update"'s check action implicitly returns None (falsy), so existing
+    behavior for every other sub_type is unchanged. Only "Check Now"/
+    "Check Again" needs to show a result in place rather than closing.
+    """
     if sub_type == "input":
         index, _ = state.input_names[sub_cursor]
         try:
@@ -241,6 +481,20 @@ def _confirm_sub(sub_type, sub_cursor, state, ui):
     elif sub_type == "sound":
         sound.enabled = (sub_cursor == 0)   # 0=On, 1=Off
         _save_sound(sound.enabled)
+    elif sub_type == "update":
+        items = _ota_update_items(loop)
+        label = items[sub_cursor] if 0 <= sub_cursor < len(items) else ""
+        if label.startswith("Install"):
+            _set_ota_action(2)
+            dial_ui.show_message(ui["display"], "Updating...")
+            import supervisor
+            supervisor.reload()   # never returns
+        elif label.startswith("Check"):
+            _set_ota_action(1)
+            dial_ui.show_message(ui["display"], "Checking...")
+            import supervisor
+            supervisor.reload()   # never returns
+        # else: tapped/confirmed an inert informational row -- no-op, closes normally
 
 
 def _scroll_for(cursor, scroll, num_items):
@@ -297,7 +551,7 @@ class _Loop:
         self.dev_cursor  = 0    # cursor within Device submenu
         self.sub_cursor  = 0
         self.sub_scroll  = 0    # first visible item in sub-menu (for long lists)
-        self.sub_type    = None    # "input", "preset", "player", "brightness", "sound"
+        self.sub_type    = None    # "input", "preset", "player", "brightness", "sound", "update"
         self.menu_idle   = 0.0     # monotonic time of last menu interaction
 
         self.mute_phase_origin  = 0.0     # monotonic time the current pulse cycle started
@@ -306,6 +560,13 @@ class _Loop:
 
         self.power_fade_start = 0.0   # monotonic time the power-off fade began; 0.0 = not fading
         self.power_fade_from  = dial_ui.BRIGHTNESS_ON   # display brightness when the fade began
+
+        # OTA session status -- ephemeral UI state, same category as mode/
+        # sub_type above: reset fresh every boot, surfaced once from NVM
+        # (see main()) right after a check/install reload. Deliberately
+        # not on AVRState -- that's the amp/DSP model, this is not.
+        self.ota_status          = "idle"   # idle|available|up_to_date|error|eject_needed|just_installed|just_failed
+        self.ota_latest_version  = None
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +607,7 @@ def _handle_encoder_button(loop, ui, state, btn, now):
             loop.mode = MODE_MENU_DEV
             dial_ui.draw_menu(ui, "DEVICE", _build_dev_menu(), loop.dev_cursor, clear_bg=True)
         else:
-            loop.sub_type, loop.sub_cursor, title, items = _open_submenu(sub_type, label, state)
+            loop.sub_type, loop.sub_cursor, title, items = _open_submenu(sub_type, label, state, loop)
             loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
             loop.mode = MODE_MENU_SUB
             vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
@@ -360,18 +621,26 @@ def _handle_encoder_button(loop, ui, state, btn, now):
         if item == "Restart":
             microcontroller.reset()
         else:
-            loop.sub_type, loop.sub_cursor = _enter_dev_sub(item, state, ui, sound)
+            loop.sub_type, loop.sub_cursor = _enter_dev_sub(item, state, ui, sound, loop)
             loop.sub_scroll = 0
             loop.mode = MODE_MENU_SUB
         return
 
     if loop.mode == MODE_MENU_SUB:
+        stay_open = False
         if loop.sub_cursor >= 0:
-            _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui)
+            stay_open = _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui, loop)
         # sub_cursor < 0: no item selected yet — button press closes without applying
-        loop.mode = MODE_MAIN
-        dial_ui.exit_menu(ui)
-        dial_ui.draw_main(ui, state)
+        if stay_open:
+            items = _build_sub_items(loop.sub_type, state, loop)
+            loop.sub_cursor = 0
+            loop.sub_scroll = 0
+            title = _ota_menu_title() if loop.sub_type == "update" else loop.sub_type.upper()
+            dial_ui.draw_menu(ui, title, items[:dial_ui.MENU_VISIBLE], 0, clear_bg=True)
+        else:
+            loop.mode = MODE_MAIN
+            dial_ui.exit_menu(ui)
+            dial_ui.draw_main(ui, state)
 
 
 # ---------------------------------------------------------------------------
@@ -428,16 +697,17 @@ def _handle_encoder_rotation(loop, ui, state, encoder, now):
             # Adjust brightness live; clamp to [0.05, 1.0] in 0.05 steps
             state.brightness = max(0.05, min(1.0, state.brightness - delta * 0.05))
             ui["display"].brightness = state.brightness
-            dial_ui.draw_menu(ui, "BRIGHTNESS", _build_sub_items("brightness", state), 0)
+            dial_ui.draw_menu(ui, "BRIGHTNESS", _build_sub_items("brightness", state, loop), 0)
             return
 
-        items = _build_sub_items(loop.sub_type, state)
+        items = _build_sub_items(loop.sub_type, state, loop)
         loop.sub_cursor = 0 if loop.sub_cursor < 0 else (loop.sub_cursor - delta) % len(items)
         loop.sub_scroll = _scroll_for(loop.sub_cursor, loop.sub_scroll, len(items))
         if loop.sub_type == "input":     title = driver.LABELS["input_select"].upper()
         elif loop.sub_type == "preset":  title = driver.LABELS["presets"].upper()
         elif loop.sub_type == "player":  title = driver.LABELS["player_select"].upper()
         elif loop.sub_type == "sound":   title = "SOUND"
+        elif loop.sub_type == "update":  title = _ota_menu_title()
         else:                            title = loop.sub_type.upper()
         vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
         dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True)
@@ -590,7 +860,7 @@ def _tap_menu_top(loop, ui, state, now):
         loop.mode = MODE_MENU_DEV
         dial_ui.draw_menu(ui, "DEVICE", _build_dev_menu(), loop.dev_cursor, clear_bg=True)
     else:
-        loop.sub_type, loop.sub_cursor, title, items = _open_submenu(sub_type, label, state)
+        loop.sub_type, loop.sub_cursor, title, items = _open_submenu(sub_type, label, state, loop)
         loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
         loop.mode = MODE_MENU_SUB
         vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
@@ -613,26 +883,34 @@ def _tap_menu_dev(loop, ui, state, now):
     if item == "Restart":
         microcontroller.reset()
     else:
-        loop.sub_type, loop.sub_cursor = _enter_dev_sub(item, state, ui, sound)
+        loop.sub_type, loop.sub_cursor = _enter_dev_sub(item, state, ui, sound, loop)
         loop.sub_scroll = 0
         loop.mode = MODE_MENU_SUB
 
 
 def _tap_menu_sub(loop, ui, state, now):
     tapped = _menu_item_at_y(loop.touch_y)
-    items = _build_sub_items(loop.sub_type, state)
+    items = _build_sub_items(loop.sub_type, state, loop)
     vis_count = min(dial_ui.MENU_VISIBLE, len(items) - loop.sub_scroll)
+    stay_open = False
     if 0 <= tapped < vis_count:
         # Tap a visible item -> select + confirm it
         sound.click()
         loop.menu_idle = now
         loop.sub_cursor = loop.sub_scroll + tapped
-        _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui)
+        stay_open = _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui, loop)
     else:
         sound.click()
-    loop.mode = MODE_MAIN
-    dial_ui.exit_menu(ui)
-    dial_ui.draw_main(ui, state)
+    if stay_open:
+        items = _build_sub_items(loop.sub_type, state, loop)
+        loop.sub_cursor = 0
+        loop.sub_scroll = 0
+        title = _ota_menu_title() if loop.sub_type == "update" else loop.sub_type.upper()
+        dial_ui.draw_menu(ui, title, items[:dial_ui.MENU_VISIBLE], 0, clear_bg=True)
+    else:
+        loop.mode = MODE_MAIN
+        dial_ui.exit_menu(ui)
+        dial_ui.draw_main(ui, state)
 
 
 def _tap_open_menu(loop, ui, now):
@@ -738,7 +1016,7 @@ def _tap_open_preset_menu(loop, ui, state, now):
     sound.click()
     loop.menu_idle = now
     label = driver.LABELS["presets"]
-    loop.sub_type, loop.sub_cursor, title, items = _open_submenu("preset", label, state)
+    loop.sub_type, loop.sub_cursor, title, items = _open_submenu("preset", label, state, loop)
     loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
     loop.mode = MODE_MENU_SUB
     vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
@@ -1049,6 +1327,19 @@ def main():
     _splash_t = time.monotonic()
     dial_ui.show_splash(board.DISPLAY)
 
+    # --- OTA lean mode -------------------------------------------------------
+    # _confirm_sub's "update" branch sets the pending action and calls
+    # supervisor.reload() (never microcontroller.reset()) right before
+    # this boot -- see _ota_lean_mode()'s docstring for the full story on
+    # why that distinction is load-bearing, not stylistic. Runs instead
+    # of the normal UI/backend flow entirely: OTA is orthogonal to
+    # DEVICE_DRIVER, so no driver/backend init happens here at all, and
+    # this branch never reaches the hardware-input setup below it either.
+    if _ota_action() != 0:
+        _ota_lean_mode()
+        return   # unreachable -- every path through _ota_lean_mode() ends
+                 # in a reload, which never returns
+
     # --- Hardware inputs ---
     encoder = rotaryio.IncrementalEncoder(board.ENC_A, board.ENC_B)
 
@@ -1190,6 +1481,23 @@ def main():
 
     loop = _Loop()
     loop.last_pos = encoder.position
+
+    # Surface the result of a check/install exactly once, on the first
+    # normal boot after the reload _ota_lean_mode() ends with -- see
+    # _confirm_sub's "update" branch and _ota_lean_mode() itself.
+    _result = _ota_result()
+    if _result != 0:
+        loop.ota_status = {
+            1: "available",
+            2: "up_to_date",
+            3: "error",
+            4: "just_installed",
+            5: "just_failed",
+            6: "eject_needed",
+        }.get(_result, "idle")
+        if _result == 1:
+            loop.ota_latest_version = _ota_latest_version()
+        _set_ota_result(0)
 
     # --- Main loop ---
     while True:
