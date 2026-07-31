@@ -1,6 +1,6 @@
 # deloop
 
-deloop is Firmware for the [M5 Dial](https://shop.m5stack.com/products/m5stack-dial-v1-1) that turns it into a focused remote and volume knob with support for the following devices/platforms:
+deloop is Firmware for the [M5 Dial](https://shop.m5stack.com/products/m5stack-dial-v1-1) that turns it into a focused remote and volume knob and config switcher with support for the following devices/platforms:
 
 *  Denon/Marantz AVRs (2016+, Presets only on Dirac Live licensed AVRs)
 *  minidsp-rs
@@ -8,11 +8,11 @@ deloop is Firmware for the [M5 Dial](https://shop.m5stack.com/products/m5stack-d
 *  WiiM/LinkPlay streamers
 *  Home Assistant media player entities
 
-It is wired, compact, and originally intended for desktop use, but is fairly universal. You rotate the encoder to change volume, tap the scren to mute, and there is touch menu for inputs / Dirac Live presets / and device settings. Home Assistant media players and WiiM streamers that support media controls will get basic play/pause/skip buttons as well.
+As a package, it is wired, compact, and generally intended for desktop use. You rotate the encoder to adjust volume, and tap the upper half of the screen to mute. Input switching thru the menu is suppored on all devices. For devices that support DSP presets, up to 4 touch buttons can display on the sceen, with a menu to access more if needed. Home Assistant media players and WiiM streamers that support media controls will also get basic play/pause/skip buttons.
 
 deloop is not a replacement for a full remote, an app or config interface for these devices, and is quite limited in its control scope to keep it focused as a simple volume, preset, and input contoller and display for daily use.
 
-Be aware that the M5Dial is a panel mount device that mounts thru a 45mm hole. It can be mounted all sorts of ways, but does not stand well on it's own, so you'll need to sort out some kind of plan. Here it is mounted in a $6 wood phone stand off Amazon that I drilled a 45mm hole thru. 
+The M5Dial is a panel mount device that mounts thru a 45mm hole. It can be mounted all sorts of ways, but does not stand well on it's own, so you'll need to sort out some kind of plan. Below it's shown mounted in a $6 wood phone stand off Amazon that I drilled a 45mm hole thru. 
 
 ![device](ui/wood-stand.jpeg)
 
@@ -25,20 +25,20 @@ If you decide you want to modify/extend the deloop code, this file will make Cla
 ## Features
 
 - Volume up/down via the rotary encoder, with acceleration on a fast spin
-- State display: Volume, Current Input, Current preset/filter on Denon and miniDSP
+- State display: Volume, Current Input, Current preset/filter
 - Live circular color gauge display of volume (dB) with a moving indicator
-- Main screen tap controls: mute, preset selection, dirac toggle, menu, power (long press, Denon only),
+- Main screen tap controls: mute, preset selection, dirac toggle, menu, power (long press, Denon & HA media players only)
 - Tap the already-active preset to disable it in place (e.g. Dirac Live off) without losing which one is loaded -- it stays highlighted, just in gray instead of orange
 - Screen grays out while a preset change is slowly appling (confirmed several seconds on MiniDSP config-slot switches), then returns to color once it's done.
-- Touch menu: input selection, preset selection, brightness, click sound on/off, restart device
-- Synced against the device so external changes (app, another remote) update deloop.
+- Touch menu (not all items on all devices): input selection, preset selection, device selection, brightness, click sound on/off, restart device
+- Synced against the device thru polling so external changes (app, another remote) update deloop.
 - Runs on [CircuitPython](https://circuitpython.org/board/m5stack_dial/)
 - Pluggable device backend (`src/driver.py`) -- see [Device backends](#device-backends)
-- Note that deloop is not currently designed to support displaying and/or updating Audyssey filters.
+- Note that deloop is not currently designed to support displaying and/or switching Audyssey filters on Deonon/Marantz.
 
 ## User Interface
 
-The main screen's color bar has a white triangular pointer that rotates live around the color bar as you adjust the volume with the rotary encoder, indicating current position within the active backend's volume range (`VOLUME_MIN`/`VOLUME_MAX` in `src/config.py`). The color bands are proportional to that range -- bottom 60% green, next 10% amber, next 10% orange, top 20% red -- which on a Denon AVR's -80dB..+18dB range works out to:
+The main screen's color bar has a white triangular pointer that rotates live around the color bar as you adjust the volume with the rotary encoder, indicating current position within the active backend's volume range. The color bands are proportional to that range -- bottom 60% green, next 10% amber, next 10% orange, top 20% red -- which on a Denon AVR's -80dB..+18dB range works out to:
 
 - green:  -80dB to -20dB
 - yellow: -20dB to -10dB
@@ -47,37 +47,19 @@ The main screen's color bar has a white triangular pointer that rotates live aro
 - Major ticks indicate 10dB increemnts
 - Minor ticks indicate 5dB increments
 
-deloops has reasonable volume level defaults for each back end (based on , and the device's volume range is also configurable via settings file. 
+deloop has volume range defaults for each back end that should feel appropriate, but the device's volume range is also configurable via settings file. 
 
-Because each back end device type has slightly different options, each user interface varies some depending on device capability (some devices have basic touch media controls as well) -- the diagrams below explain the main UI per backend. The 0 dB white tick mark is only on devices with a negative volume range (Denon/miniDSP). 
+Because each back end device type has slightly different options, I've taken care to implement the user interface to uniquely take advantage of each back end. As such, the UI varies some depending on device capability. There are diagrams below the renders to explain the main UI per backend. Note that the renders in this readme are generated from the actual drawing code, and each was rendered with realistic configs for their backend, and are pixel perfect representations of the display. 
 
-<table>
-<tr>
-<td align="center"><img src="ui/UIDiagram-Denon.drawio.png" width="420"></td>
-<td align="center"><img src="ui/UIDiagram-miniDSP.drawio.png" width="420"></td>
-</tr>
-<tr>
-<td align="center"><img src="ui/UIDiagram-WiiM.drawio.png" width="420"></td>
-<td align="center"><img src="ui/UIDiagram-camilla.drawio.png" width="420"></td>
-</tr>
-<tr>
-<td align="center"><img src="ui/UIDiagram-HomeAssistant.drawio.png" width="420"></td>
-</tr>
-</table>
+![Device UI examples grid](ui/ui-devices-grid.png)
 
-### Device UI Examples
+### Per Device UI Guides:
 
-<table>
-<tr>
-<td align="center"><img src="ui/ui-denon.png" width="260"><br>Denon</td>
-<td align="center"><img src="ui/ui-minidsp.png" width="260"><br>MiniDSP</td>
-<td align="center"><img src="ui/ui-wiim.png" width="260"><br>WiiM</td>
-<td align="center"><img src="ui/ui-camilladsp.png" width="260"><br>CamillaDSP</td>
-<td align="center"><img src="ui/ui-homeassistant.png" width="260"><br>Home Assistant</td>
-</tr>
-</table>
-
-All five are real renders of `dial_ui.py`'s actual drawing code (`make ui-renders`), not mockups -- each with a fixture realistic for that backend (its own volume range, real input/source names, real preset shapes), not one generic fixture reused across all of them. See `tools/render_ui_screenshots.py` if you're adding a sixth.
+![Denon](ui/UIDiagram-Denon.drawio.png)
+![miniDSP](ui/UIDiagram-miniDSP.drawio.png)
+![WiiM](ui/UIDiagram-WiiM.drawio.png)
+![Camilla](ui/UIDiagram-camilla.drawio.png)
+![HomeAssistant](ui/UIDiagram-HomeAssistant.drawio.png)
 
 ### Mute
 
@@ -87,17 +69,17 @@ Tapping the screen area anywhere above the preset name will mute the device. Whi
 
 ### Standby
 
-For devices that support power on/off, when the device is in standby mode, a dim power button is displayed. A long press will power the AVR on and cycle back to the main screen.
+For devices that support power, when the device is in standby mode, a dim power button is displayed. A long press will power the device on and cycle back to the main screen.
 
 ![Standby screen](ui/ui-standby.png)
-
-Note: the screen shots are pixel-accurate renders of `dial_ui.py`'s actual drawing code (`make ui-renders` for these polished per-backend ones; see `make renders` below for the fuller dev scenario set), not mockups.
 
 ## Hardware
 
 - Only tested on the [M5Dial](https://docs.m5stack.com/en/core/M5Dial). There are lots of other ESP32 rotary encoders out there, but I would not expect them work out of the box with this project. If you want to investigate porting it or trying it elsewhere, download this repo and have Claude perform that investigation. It's very good at doing this since it's CLAUDE.md file is well trained on the device hardware and quite good at sorting out what libraries work with what hardware.
 
 ## Device backends
+
+Note that from here down, the Readme is entirely produced by Claude.
 
 deloop talks to the amp through a swappable driver module (`src/driver.py`), selected by the `DEVICE_DRIVER` key in `settings.toml`. `app.py` and `dial_ui.py` never talk to a specific backend directly -- they read a `CAPS` dict the active driver exports to decide which menu items and gestures to offer, so a backend that can't do something (e.g. no power state) simply doesn't advertise that capability rather than needing special-casing throughout the UI code. See the contract documented at the top of `src/driver.py` if you want to add another backend.
 
