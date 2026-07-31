@@ -131,10 +131,14 @@ renders:
 	$(PYTHON) tools/dial_sim.py
 
 # ui-renders: regenerate the polished per-backend screenshots in ui/ that
-# README.md actually embeds (ui-denon.png, ui-minidsp.png, ui-wiim.png,
-# ui-camilladsp.png, ui-homeassistant.png, ui-muted.png, ui-standby.png). One subprocess per
-# backend -- DEVICE_DRIVER binds at import time, so a single process can't
-# switch mid-run; see tools/render_ui_screenshots.py's module docstring.
+# feed README.md (ui-denon.png, ui-minidsp.png, ui-wiim.png,
+# ui-camilladsp.png, ui-homeassistant.png, ui-muted.png, ui-standby.png),
+# then compose them into the single ui-devices-grid.png README actually
+# embeds -- see tools/render_ui_grid.py's module docstring for why README
+# embeds one composed image rather than a table of five separate <img>
+# tags. One subprocess per backend -- DEVICE_DRIVER binds at import time,
+# so a single process can't switch mid-run; see
+# tools/render_ui_screenshots.py's module docstring.
 # Run this after any dial_ui.py change that affects layout/colors/text.
 # MINIDSP_HOST/CAMILLADSP_HOST etc. are never touched -- rendering only
 # imports config.py/dial_ui.py, no network calls, no real device needed.
@@ -158,6 +162,7 @@ ui-renders:
 	  $(PYTHON) tools/render_ui_screenshots.py --backend camilladsp
 	DEVICE_DRIVER=ha VOLUME_MIN=0.0 VOLUME_MAX=100.0 HA_MEDIA_CONTROLS=true \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend ha
+	$(PYTHON) tools/render_ui_grid.py
 
 fonts:
 	@mkdir -p src/fonts

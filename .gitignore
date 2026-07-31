@@ -18,3 +18,8 @@ __pycache__/
 
 local/
 .vscode/
+
+# draw.io desktop app lock/backup files (created while a .drawio file is
+# open, e.g. ui/.$UIDiagram-Denon.drawio.bkp) -- not real content, and one
+# got committed by accident (see ui/.$UIDiagram.drawio.bkp removal)
+ui/.$*.bkp
