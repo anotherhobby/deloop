@@ -41,6 +41,14 @@ from state import AVRState
 
 _MAX_ERRORS = 5
 
+# How often to retry driver.get_presets() after it failed at boot (AVR
+# unreachable, timeout, etc) -- much shorter than the normal 5s/30s adaptive
+# poll interval, since a missing preset/Dirac list is a visibly broken UI
+# element (buttons never appear) rather than just slightly-stale state, and
+# is worth reconnecting for aggressively until the first success. Stops
+# retrying permanently the moment it succeeds once -- see _retry_presets().
+_PRESET_RETRY_INTERVAL_S = 10.0
+
 # Menu mode constants
 MODE_MAIN     = 0
 MODE_MENU_TOP = 1   # top-level menu
@@ -192,6 +200,17 @@ def _ota_reload_to_normal():
 def _ota_new_session():
     """Fresh wifi connect + Session(ssl_context) -- factored out only so
     the caller doesn't need to spell it twice (check vs install)."""
+    # Default power_management is MIN, which lets the radio sleep between
+    # the AP's DTIM beacons -- fine for the AVR's LAN-local polling, but a
+    # plausible contributor to the ETIMEDOUT pattern seen against GitHub's
+    # WAN-hop TLS round trip (real ESP32/CircuitPython radio-sleep latency,
+    # not this repo's network -- see the user's own citation of
+    # adafruit/Adafruit_CircuitPython_Requests#191, a documented ESP32 TCP
+    # timeout issue independent of any particular network).
+    try:
+        wifi.radio.power_management = wifi.PowerManagement.NONE
+    except Exception as e:
+        print("power_management NONE failed:", type(e), e)
     wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
     pool = socketpool.SocketPool(wifi.radio)
     import ssl
@@ -210,7 +229,7 @@ def _ota_do_check():
     frame are not garbage. Once this function returns, its frame is gone
     and they're immediately collectible."""
     import ota
-    return ota.check_latest_version(_ota_new_session())
+    return ota.check_latest_version(_ota_new_session)
 
 
 def _ota_do_install():
@@ -218,7 +237,7 @@ def _ota_do_install():
     frame so its locals are collectible before _ota_lean_mode() tries to
     record the result to nvm."""
     import ota
-    ota.apply(_ota_new_session())
+    ota.apply(_ota_new_session)
 
 
 def _ota_lean_mode():
@@ -253,7 +272,11 @@ def _ota_lean_mode():
     result below rather than failing silently).
     """
     action = _ota_action()
-    dial_ui.show_message(board.DISPLAY, "Checking..." if action == 1 else "Updating...")
+    if action == 1:
+        msg = "Checking...\ncurrent v{}".format(version.CURRENT_VERSION)
+    else:
+        msg = "Updating to v{}...".format(_ota_latest_version())
+    dial_ui.show_message(board.DISPLAY, msg)
 
     if not config.WIFI_SSID:
         _set_ota_result(3 if action == 1 else 5)
@@ -309,6 +332,10 @@ def _connect_wifi(ui):
         dial_ui.draw_error(ui, "No WiFi cfg")
         raise RuntimeError("WIFI_SSID not set in settings.toml")
     dial_ui.draw_status(ui, "WiFi...")
+    try:
+        wifi.radio.power_management = wifi.PowerManagement.NONE
+    except Exception as e:
+        print("power_management NONE failed:", type(e), e)
     wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
 
 
@@ -342,9 +369,19 @@ def _build_dev_menu():
 
 
 def _ota_menu_title():
-    """Submenu title for sub_type == "update" -- current version lives
-    here, not repeated in every item string (see _ota_update_items)."""
-    return "UPDATE (v{})".format(version.CURRENT_VERSION)
+    """Submenu title for sub_type == "update"."""
+    return "UPDATE"
+
+
+def _ota_version_text():
+    """Current version string for the Update submenu's persistent status
+    row (dial_ui.draw_menu's version_text param) -- visible the moment the
+    submenu opens, no tap required, styled to match the main screen's
+    "input" label (dim gray) rather than a bright title. Separate from
+    _ota_menu_title() because draw_menu()'s title parameter is never
+    actually rendered (see its own comment: "no title; context comes from
+    the items themselves") -- version_text is a real, distinct label."""
+    return "v{}".format(version.CURRENT_VERSION)
 
 
 def _ota_update_items(loop):
@@ -389,7 +426,7 @@ def _build_sub_items(sub_type, state, loop):
 
 
 def _open_submenu(sub_type, label, state, loop):
-    """Resolve a non-Device top-menu entry into (sub_type, sub_cursor, title, items)."""
+    """Resolve a non-Device top-menu entry into (sub_type, sub_cursor, title, version_text, items)."""
     sc = 0
     if sub_type == "input":
         indices = [i for i, _ in state.input_names]
@@ -404,7 +441,8 @@ def _open_submenu(sub_type, label, state, loop):
         if state.player_id in ids:
             sc = ids.index(state.player_id)
     title = _ota_menu_title() if sub_type == "update" else label.upper()
-    return sub_type, sc, title, _build_sub_items(sub_type, state, loop)
+    ver = _ota_version_text() if sub_type == "update" else ""
+    return sub_type, sc, title, ver, _build_sub_items(sub_type, state, loop)
 
 
 def _enter_dev_sub(item, state, ui, sound_mod, loop):
@@ -546,6 +584,10 @@ class _Loop:
         self.error_count = 0
         self.first_poll  = True
 
+        # 0.0, not now() -- fires on the very first main-loop pass if
+        # get_presets() failed at boot, rather than waiting a full interval.
+        self.last_preset_retry = 0.0
+
         self.mode        = MODE_MAIN
         self.menu_cursor = 0
         self.dev_cursor  = 0    # cursor within Device submenu
@@ -607,11 +649,11 @@ def _handle_encoder_button(loop, ui, state, btn, now):
             loop.mode = MODE_MENU_DEV
             dial_ui.draw_menu(ui, "DEVICE", _build_dev_menu(), loop.dev_cursor, clear_bg=True)
         else:
-            loop.sub_type, loop.sub_cursor, title, items = _open_submenu(sub_type, label, state, loop)
+            loop.sub_type, loop.sub_cursor, title, ver, items = _open_submenu(sub_type, label, state, loop)
             loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
             loop.mode = MODE_MENU_SUB
             vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
-            dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True)
+            dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True, version_text=ver)
         return
 
     if loop.mode == MODE_MENU_DEV:
@@ -636,7 +678,8 @@ def _handle_encoder_button(loop, ui, state, btn, now):
             loop.sub_cursor = 0
             loop.sub_scroll = 0
             title = _ota_menu_title() if loop.sub_type == "update" else loop.sub_type.upper()
-            dial_ui.draw_menu(ui, title, items[:dial_ui.MENU_VISIBLE], 0, clear_bg=True)
+            ver = _ota_version_text() if loop.sub_type == "update" else ""
+            dial_ui.draw_menu(ui, title, items[:dial_ui.MENU_VISIBLE], 0, clear_bg=True, version_text=ver)
         else:
             loop.mode = MODE_MAIN
             dial_ui.exit_menu(ui)
@@ -709,8 +752,9 @@ def _handle_encoder_rotation(loop, ui, state, encoder, now):
         elif loop.sub_type == "sound":   title = "SOUND"
         elif loop.sub_type == "update":  title = _ota_menu_title()
         else:                            title = loop.sub_type.upper()
+        ver = _ota_version_text() if loop.sub_type == "update" else ""
         vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
-        dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True)
+        dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True, version_text=ver)
 
 
 # ---------------------------------------------------------------------------
@@ -860,11 +904,11 @@ def _tap_menu_top(loop, ui, state, now):
         loop.mode = MODE_MENU_DEV
         dial_ui.draw_menu(ui, "DEVICE", _build_dev_menu(), loop.dev_cursor, clear_bg=True)
     else:
-        loop.sub_type, loop.sub_cursor, title, items = _open_submenu(sub_type, label, state, loop)
+        loop.sub_type, loop.sub_cursor, title, ver, items = _open_submenu(sub_type, label, state, loop)
         loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
         loop.mode = MODE_MENU_SUB
         vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
-        dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True)
+        dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True, version_text=ver)
 
 
 def _tap_menu_dev(loop, ui, state, now):
@@ -906,7 +950,8 @@ def _tap_menu_sub(loop, ui, state, now):
         loop.sub_cursor = 0
         loop.sub_scroll = 0
         title = _ota_menu_title() if loop.sub_type == "update" else loop.sub_type.upper()
-        dial_ui.draw_menu(ui, title, items[:dial_ui.MENU_VISIBLE], 0, clear_bg=True)
+        ver = _ota_version_text() if loop.sub_type == "update" else ""
+        dial_ui.draw_menu(ui, title, items[:dial_ui.MENU_VISIBLE], 0, clear_bg=True, version_text=ver)
     else:
         loop.mode = MODE_MAIN
         dial_ui.exit_menu(ui)
@@ -1016,11 +1061,11 @@ def _tap_open_preset_menu(loop, ui, state, now):
     sound.click()
     loop.menu_idle = now
     label = driver.LABELS["presets"]
-    loop.sub_type, loop.sub_cursor, title, items = _open_submenu("preset", label, state, loop)
+    loop.sub_type, loop.sub_cursor, title, ver, items = _open_submenu("preset", label, state, loop)
     loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
     loop.mode = MODE_MENU_SUB
     vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
-    dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True)
+    dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True, version_text=ver)
 
 
 def _tap_main_screen(loop, ui, state, now):
@@ -1271,6 +1316,34 @@ def _poll_avr(loop, ui, state, now):
         loop.last_poll = now - poll_interval + 1.0
 
 
+def _retry_presets(loop, ui, state, now):
+    """Catch-up retry for driver.get_presets() after it failed at boot.
+
+    main() fetches presets/Dirac filters exactly once, at boot -- if the
+    backend isn't reachable yet (AVR still warming up, transient network
+    issue), state.preset_names stays permanently empty and the quick-select
+    buttons never appear, with nothing to ever retry it again. Runs on its
+    own short, fixed interval (_PRESET_RETRY_INTERVAL_S) independent of the
+    normal adaptive status poll, and stops for good the moment it succeeds
+    once -- this is a boot-catch-up mechanism, not an ongoing poll (a preset
+    switch already refreshes the list itself, same as at boot).
+    """
+    if state.preset_names or not driver.CAPS.get("presets"):
+        return
+    if loop.enc_last_move != 0.0 or (now - loop.last_preset_retry) < _PRESET_RETRY_INTERVAL_S:
+        return
+    loop.last_preset_retry = now
+    gc.collect()
+    try:
+        state.preset, state.preset_names = driver.get_presets()
+        state.preset_enabled = driver.get_preset_enabled()
+        state.preset_quick_names = driver.get_quick_presets()
+        if state.preset_names and loop.mode == MODE_MAIN:
+            dial_ui.draw_main(ui, state)   # quick-select buttons now have names to show
+    except Exception as e:
+        print("preset retry:", e, "| free mem:", gc.mem_free())
+
+
 def _pulse_mute(loop, ui, state, now):
     """While muted and resting in MAIN, breathe the volume number and use
     the pulse's natural pause at the bottom of each cycle to sneak in an
@@ -1325,6 +1398,7 @@ def _fade_power_off(loop, ui, state, now):
 def main():
     # ── Startup splash ────────────────────────────────────────────────────
     _splash_t = time.monotonic()
+    print("free mem at top of main:", gc.mem_free(), "t:", _splash_t)
     dial_ui.show_splash(board.DISPLAY)
 
     # --- OTA lean mode -------------------------------------------------------
@@ -1364,6 +1438,7 @@ def main():
     # is Adafruit's own documented mitigation (see "Memory-saving tips for
     # CircuitPython" -> "Reducing memory fragmentation").
     gc.collect()
+    print("free mem right before dial_ui.init:", gc.mem_free())
     ui = dial_ui.init()
 
     # Enforce 2-second minimum splash display time
@@ -1499,6 +1574,23 @@ def main():
             loop.ota_latest_version = _ota_latest_version()
         _set_ota_result(0)
 
+        # Land straight back in the Update submenu with the result already
+        # showing, instead of the plain volume screen -- a check/install
+        # only ever reloads because the user asked for one, so "here's what
+        # we found, confirm to proceed" should be the very next thing they
+        # see, not something they have to re-navigate into Update to find.
+        # Same _open_submenu() a manual tap on "Update" already uses --
+        # sub_cursor lands on index 0 either way, which for this sub_type is
+        # always the primary action ("Install Update (vN)"/"Check Again"/
+        # etc, see _ota_update_items), so a single knob press or tap
+        # confirms it exactly like opening Update by hand always has.
+        loop.sub_type, loop.sub_cursor, title, ver, items = _open_submenu(
+            "update", "Update", state, loop)
+        loop.sub_scroll = _scroll_for(loop.sub_cursor, 0, len(items))
+        loop.mode = MODE_MENU_SUB
+        vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
+        dial_ui.draw_menu(ui, title, vis, loop.sub_cursor - loop.sub_scroll, clear_bg=True, version_text=ver)
+
     # --- Main loop ---
     while True:
         now = time.monotonic()
@@ -1511,3 +1603,4 @@ def main():
         _pulse_mute(loop, ui, state, now)
         _fade_power_off(loop, ui, state, now)
         _poll_avr(loop, ui, state, now)
+        _retry_presets(loop, ui, state, now)

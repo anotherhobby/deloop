@@ -51,6 +51,48 @@ def init(session):
     _session = session
 
 
+def _reset_connections():
+    """Force-close every socket this session has pooled, rather than the
+    normal resp.close() (which just *frees a socket for reuse*, never
+    actually closes it -- confirmed by reading adafruit_requests'
+    Response.close() source: it calls connection_manager.free_socket(),
+    not close_socket()). Needed because a body-read failure (confirmed,
+    same investigation as ota.py's _Fetcher, to have zero retry
+    protection anywhere in adafruit_requests itself -- only the earlier
+    connect+send phase gets that) otherwise leaves a broken socket
+    sitting in the pool, ready to be silently handed back to the very
+    next request against the same host/port."""
+    try:
+        _session._connection_manager._free_sockets(force=True)
+    except Exception as e:
+        print("denon: socket reset failed:", type(e), e)
+
+
+def _request_text(method, url, **kwargs):
+    """GET/POST via _session, returning the decoded response body text.
+
+    Retries once on a body-read failure, resetting the whole connection
+    pool first (see _reset_connections()) so the retry can't be handed
+    back the same broken socket. Connect/send failures are already
+    retried internally by adafruit_requests itself (its own
+    "Repeated socket failures" mechanism, confirmed by reading its
+    source); this covers the gap after that -- reading the body once a
+    request has already been sent."""
+    attempt = 0
+    while True:
+        attempt += 1
+        resp = getattr(_session, method)(url, **kwargs)
+        try:
+            text = resp.text
+            resp.close()
+            return text
+        except OSError as e:
+            print("denon: body read failed ({}, attempt {}):".format(url, attempt), type(e), e)
+            _reset_connections()   # already closes resp's socket along with every other pooled one
+            if attempt >= 2:
+                raise
+
+
 # ---------------------------------------------------------------------------
 # Input name mapping
 # ---------------------------------------------------------------------------
@@ -101,11 +143,7 @@ def load_input_names():
     """
     global _input_names
     url = _BASE + "/goform/AppCommand.xml"
-    resp = _session.post(url, data=_RENAME_BODY, timeout=_TIMEOUT)
-    try:
-        xml = resp.text
-    finally:
-        resp.close()
+    xml = _request_text("post", url, data=_RENAME_BODY, timeout=_TIMEOUT)
 
     result = {}
     pos = 0
@@ -141,14 +179,10 @@ def friendly_input(raw_name):
 # ---------------------------------------------------------------------------
 
 def _post_status():
-    """POST AppCommand status request; returns XML text, closes socket."""
+    """POST AppCommand status request; returns XML text."""
     url = _BASE + "/goform/AppCommand.xml"
     # No Content-Type header -- the AVR rejects requests that include one.
-    resp = _session.post(url, data=_STATUS_BODY, timeout=_TIMEOUT)
-    try:
-        return resp.text
-    finally:
-        resp.close()
+    return _request_text("post", url, data=_STATUS_BODY, timeout=_TIMEOUT)
 
 
 def _send(path):
@@ -286,13 +320,9 @@ def _xml_encode(s):
 
 
 def _ui_get(path, params=""):
-    """GET from the web UI port (11080). Returns text, closes socket."""
+    """GET from the web UI port (11080). Returns text."""
     url = _BASE_UI + path + (("?" + params) if params else "")
-    resp = _session.get(url, timeout=_TIMEOUT)
-    try:
-        return resp.text
-    finally:
-        resp.close()
+    return _request_text("get", url, timeout=_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
