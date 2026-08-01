@@ -1,0 +1,362 @@
+# deloop Architecture
+
+The living design doc for deloop: project summary, stack decision, current layout, input model,
+runtime architecture notes, configuration reference, boot-memory guardrails, and current status.
+See [docs/hardware.md](hardware.md) for physical/flashing details, and
+[docs/device-drivers.md](device-drivers.md) for the pluggable backend architecture and each
+backend's protocol reference.
+
+Last updated: 2026-08-01 (v2.4 -- self-update (OTA) added: deloop can now pull app-file releases
+from GitHub over Wi-Fi via a manual Update menu, live `storage.remount()` + `supervisor.reload()`
+only (never a hard reset -- see why below), with a fully automated "merge to main = new release"
+versioning workflow. Check Now is confirmed working live but not yet 100% reliable on a single
+attempt against GitHub's WAN round trip; Install Update hasn't been re-tested since the latest
+reliability hardening; none of today's OTA hardening work is committed yet -- see
+[docs/ota.md](ota.md) for the full story and its own "Status as of this writing".)
+
+This file (now `docs/architecture.md`) captures the current project discussion so a future agent
+session can build a full project plan without needing the whole conversation repeated. It moved
+out of `.claude/CLAUDE.md` on 2026-08-01 as part of a context-efficiency reorg (see
+`.claude/CLAUDE.md`'s docs index) -- if you see an older reference to
+`local/agent/project-context.md`, that's this same material from before an even earlier move.
+
+## Project Summary
+
+`deloop` is firmware for an M5Stack Dial that controls an amp/DSP (or a Home Assistant
+`media_player` entity) over the local network -- originally a Denon/Marantz AVR, now also a
+MiniDSP unit via minidsp-rs and any HA `media_player`, through a pluggable driver
+(`src/driver.py`). The device is for an office AVR where normal control is awkward.
+
+The primary interaction is rotary volume control. The most important display requirement is that the current AVR volume is always visible and stays accurate even when the volume changes from outside the Dial.
+
+Initial proof-of-concept features from the README:
+
+- Power on/off
+- Volume up/down with current volume display
+- Volume display updates when state changes externally
+- Mute toggle
+- Speaker preset selection
+- Dirac preset selection
+- Input selection
+
+Longer term, this could become a more complete Denon/Marantz remote, but the project should start with a tight POC centered on volume and state feedback.
+
+## User Preferences And Constraints
+
+- The user is primarily a Python developer.
+- C/C++ is possible, but should not be the default because maintainability would depend too much on AI assistance.
+- The user prefers owning normal source files in a Git repo over vendor IDE project blobs.
+- VS Code is the preferred development environment.
+- Direct Dial-to-Denon control is preferred. The Denon modes are well understood, so there is no current reason to push Denon logic into Home Assistant or another service layer.
+- Home Assistant can remain useful as a reference point for feature parity, but should not be the primary architecture unless a concrete limitation appears.
+- Using M5Burner is acceptable. It is M5Stack's hardware and firmware tooling, so that coupling is not considered a major problem.
+- The important sharing goal is: clone the repo, plug in the device, run a command to push the app files after the firmware is installed.
+
+## Current Stack Decision
+
+**CircuitPython 10.2.1 on M5 Dial** (pivoted from UiFlow2 on 2026-07-23).
+
+- M5Stack Dial hardware
+- CircuitPython 10.2.1 firmware (official board: `m5stack_dial`)
+- Plain CircuitPython `.py` files in this repo as the source of truth -- edited and version
+  controlled as `.py`, always
+- Deployment via USB mass storage, but **not as plain `.py` day to day**: `make deploy-mpy`
+  precompiles every module except `code.py` to `.mpy` first (`code.py` itself must stay
+  uncompiled source -- it's the boot entry point) and is what the device should actually run; see
+  "CircuitPython heap/boot-memory guardrails" below for why. Plain `make deploy` (no `.mpy`,
+  `cp src/* /Volumes/CIRCUITPY/`-equivalent) still exists for fast dev iteration and doesn't
+  require `local/mpy-cross` to be present, but isn't the shipped configuration.
+
+Flashing steps and the full hardware/pin/library reference live in
+[docs/hardware.md](hardware.md); deploy-command mechanics (`make deploy`/`make shell`) are also
+there.
+
+### Why the pivot from UiFlow2
+
+UiFlow2 firmware in WiFi mode does not expose a standard MicroPython REPL over USB serial. The serial port is a log-only output channel; `mpremote` cannot enter raw REPL mode. Switching to USB mode was not possible without reflashing. CircuitPython mounts the device as a USB drive (`CIRCUITPY`), making `make deploy` a simple file copy — exactly the workflow the project requires.
+
+## Actual Project Shape (as of v2.2)
+
+The original proposed shape below was Denon-only and pre-dates the driver split; kept for history. The real, current layout is:
+
+```text
+deloop/
+  README.md
+  .claude/
+    CLAUDE.md         # this file
+  local/               # gitignored -- mpy-cross binary, build staging, misc dev artifacts
+  src/
+    code.py          # CircuitPython entry point -- ONLY `import app; app.main()`. Must
+                      # stay this thin: it's the one file that can't be .mpy-compiled.
+    app.py           # the real entry-point logic -- input handling, menu state machine,
+                      # main loop. What code.py used to be, before the boot-memory fix.
+    driver.py         # selects the active backend module (+ its UI extension, if any);
+                      # documents both the driver contract and the UI-extension contract
+    denon.py          # Denon/Marantz backend
+    minidsp.py         # minidsp-rs backend
+    camilladsp.py       # CamillaDSP backend -- WebSocket-only, hand-rolled client,
+                      # confirmed working on real hardware 2026-07-30 (see Backend #5 below)
+    ha.py              # Home Assistant media_player backend
+    ha_ui.py           # HA's paired UI extension (row-swap, skip icons, play/pause icon) --
+                      # only imported when DEVICE_DRIVER=ha; see driver.py's UI-extension contract
+    wiim.py            # WiiM/LinkPlay streamer backend -- first backend needing TLS
+    wiim_ui.py         # WiiM's paired UI extension (play/pause + skip tap targets only) --
+                      # only imported when DEVICE_DRIVER=wiim
+    dial_ui.py        # display rendering -- generic gauge/volume/menu chrome only
+    state.py          # in-memory device state model
+    sound.py          # piezo click feedback
+    config.py         # settings.toml loader/defaults
+    ota.py             # self-update: check/download/verify/install a GitHub Release --
+                      # see Self-Update (OTA) below. Pure network+filesystem, no NVM/reset.
+    version.py          # CURRENT_VERSION placeholder (real value baked in by the release
+                      # workflow, never committed back)
+    settings.toml.template
+  tools/
+    probe_denon.py     # host-side Denon HTTP API probe
+    probe_minidsp.py   # host-side minidsp-rs HTTP API probe
+    probe_ha.py        # host-side HA REST API probe
+    probe_wiim.py      # host-side WiiM/LinkPlay HTTPS API probe
+    probe_ota.py        # host-side GitHub Releases probe
+    build_release_manifest.py   # builds manifest.json from a built dist/ dir (make build-manifest)
+    dump_denonavr.py
+    dial_sim.py        # renders dial_ui.py off-device to PNGs (make renders)
+    render_ui_screenshots.py    # renders README's per-backend screenshots (make ui-renders)
+    make_splash.py, gen_click.py
+  .github/
+    workflows/release.yml   # builds + publishes a new OTA release on every push to main
+  Makefile
+```
+
+See [docs/device-drivers.md](device-drivers.md)'s "Device Driver Architecture" section for what
+`driver.py`/`denon.py`/`minidsp.py`/`ha.py`/`wiim.py` actually look like and how to add a sixth
+backend, and "CircuitPython heap/boot-memory guardrails" below for why `code.py`/`app.py` are
+split the way they are.
+
+### Original proposed shape (v1.0, historical -- superseded)
+
+```text
+deloop/
+  README.md
+  agent/
+    project-context.md
+  src/
+    main.py
+    config.py
+    denon.py
+    state.py
+    controls.py
+    dial_ui.py
+  tools/
+    detect_port.py        # optional, only if mpremote auto is not enough
+  Makefile
+  pyproject.toml          # optional host-side tooling only
+```
+
+(`main.py` never happened -- CircuitPython's entry point convention is `code.py`, which is what shipped. `controls.py` input handling ended up living in `code.py` itself rather than a separate module.)
+
+## Input Model (final)
+
+| Gesture | Action |
+|---|---|
+| Rotate encoder | Volume (MAIN); navigate menu (MENU) |
+| Encoder press | Open menu; enter submenu; confirm selection |
+| Touch hold 0.5s | Mute toggle (MAIN only) |
+| Touch hold 1.5s | Power toggle (MAIN only, suppresses mute) |
+| Touch tap (<0.5s) | Close menu |
+| 8s idle in menu | Auto-close menu |
+
+## Architecture Notes
+
+### Polling strategy
+- State is **optimistic**: display updates immediately, poll is error-correction.
+- Adaptive interval: standby -> 5s; recently active -> 30s; truly idle -> 5s.
+- Poll never runs while encoder is moving.
+- Any AVR command resets `last_poll` to prevent back-to-back HTTP calls.
+
+### Socket management (CircuitPython)
+Every `adafruit_requests` response MUST be `.close()`d. CircuitPython has
+a small socket pool (~4). Unclosed responses cause "Out of sockets" errors.
+All `denon.py` helpers close in `finally` blocks.
+
+### Non-ASCII in source files
+CircuitPython rejects non-ASCII even in comments. Use ASCII only:
+`--` not em-dash, `->` not right-arrow, `+` not box-drawing characters.
+
+**Discrepancy found 2026-07-28, unresolved:** `dial_ui.py` already had plenty of non-ASCII
+characters in *comments* (em-dashes, right-arrows, degree signs, box-drawing section dividers)
+well before this session, and the device has been deployed/tested repeatedly throughout this
+project without a reported boot crash traceable to them. That contradicts "even in comments" as
+written. Possible explanations, unconfirmed: the original crash that produced this lesson was
+actually in a string literal, not a comment, and got written up imprecisely; or comments get
+stripped before whatever check chokes on non-ASCII and only literals are actually at risk. Until
+someone confirms which, treat *string literals* as the confirmed-dangerous case (see the
+`chr()`-not-`\u`-escape lesson two sections below, which sidesteps this regardless of which
+explanation is right) and don't treat existing non-ASCII comments elsewhere in the file as
+something that needs fixing on sight.
+
+### Brightness persistence
+Stored in `microcontroller.nvm[0]` as `int(brightness * 100)`.
+255 = uninitialized (defaults to 1.0). Saved on menu confirm (encoder press).
+
+### Touch controller
+Always use `board.I2C()` (singleton), never `busio.I2C(board.SCL, board.SDA)`.
+"No I2C device at 0x38" on boot = stale lock from REPL session; power-cycle.
+
+## Configuration (settings.toml)
+
+`src/settings.toml` (gitignored). Template: `src/settings.toml.template` -- treat that file as the
+source of truth for the current key list; it's been through several rounds of change since this
+table was first written (the `SPEAKER_PRESET_1/2` keys below, for instance, no longer exist --
+speaker/Dirac presets were unified into the generic `preset`/`preset_names` model described in
+[docs/device-drivers.md](device-drivers.md)'s "Device Driver Architecture" section).
+
+Original v1.0 key list (historical, Denon-only, some now removed):
+
+| Key | Default | Notes |
+|---|---|---|
+| `WIFI_SSID` | (required) | |
+| `WIFI_PASS` | (required) | |
+| `AVR_HOST` | `192.168.1.100` | |
+| `SPEAKER_PRESET_1` | `Preset 1` | **removed** -- superseded by generic presets |
+| `SPEAKER_PRESET_2` | `Preset 2` | **removed** -- superseded by generic presets |
+| `VOLUME_STEP` | `0.5` | dB/tick at normal speed |
+| `VOLUME_STEP_FAST` | `2.0` | dB/tick at fast speed |
+| `ACCEL_THRESHOLD` | `100` | ms between ticks for fast mode |
+| `ACCEL_SAFETY_CAP` | `-15.0` | Max volume during fast upward spin |
+| `POLL_INTERVAL` | `30.0` | Seconds between polls when recently active |
+
+As of v2.2, `config.py` also has: `DEVICE_DRIVER` (`"denon"`, `"minidsp"`, `"ha"`, or `"wiim"`),
+per-driver `VOLUME_MIN`/`VOLUME_MAX` defaults, the `MINIDSP_*` keys (`HOST`, `PORT`,
+`DEVICE_INDEX`, `SERIAL`, `PRESET_COUNT`, `TIMEOUT`, `PRESET_TIMEOUT`), the `HA_*` keys (`HOST`,
+`PORT`, `TOKEN`, `ENTITY_ID`, `TIMEOUT`), and the `WIIM_*` keys (`HOST`, `TIMEOUT`, `INPUTS`) --
+see `settings.toml.template` for current defaults and comments on each.
+
+As of v2.4, `config.py` also has `OTA_ENABLED`/`OTA_REPO`/`OTA_CHECK_TIMEOUT_MS`/
+`OTA_INSTALL_TIMEOUT_MS`, orthogonal to `DEVICE_DRIVER` -- see [docs/ota.md](ota.md).
+
+## CircuitPython heap/boot-memory guardrails (read before touching boot-path code)
+
+The app once failed to boot on real hardware (`MemoryError` allocating the ~28.8KB gauge bitmap,
+sometimes surfacing instead as a WiFi connect hang/failure depending on exactly how the heap
+fragmented that boot) purely because the codebase had grown past a memory cliff on the ESP32-S3 --
+not any single bug. Fixed via `.mpy` precompilation + splitting `code.py` down to a thin entry
+point; see `Makefile` (`deploy-mpy` target) and `app.py`'s header comment for the mechanics. The
+lasting rules that came out of it:
+
+- **CircuitPython compiles a module's *entire* bytecode before running any of it**, and holds it
+  resident for the module's lifetime. An unused function still costs heap at import time -- "it's
+  behind a conditional/never called" does not make a module cheap; not *importing* it at all is
+  the only thing that does. This is why `driver.py` only imports a backend (and, per its
+  "UI-extension contract" comment, that backend's paired UI file) when it's actually the active
+  one -- keep new backends and UI extensions following that same pattern.
+- **`code.py` must stay tiny.** It's the one file CircuitPython requires as uncompiled source (the
+  boot entry point), so it's the one file that can never be `.mpy`-compiled. Real logic belongs in
+  `app.py` or another importable module. If `code.py` grows past a few lines again, that's a
+  regression -- move the new code, don't leave it there.
+- **`.mpy`-compile everything else** (`make deploy-mpy`) before treating a boot-memory question as
+  answered. Needs `local/mpy-cross`, version-matched to the device's exact CircuitPython build
+  (`cat /Volumes/CIRCUITPY/boot_out.txt`) -- the generic `pip install mpy-cross` package targets
+  vanilla MicroPython and produces `.mpy` files this device won't load; get the real one from
+  Adafruit's S3 bucket, linked from
+  https://learn.adafruit.com/welcome-to-circuitpython/library-file-types-and-frozen-libraries.
+  Compile to a local staging dir first, not directly onto the mounted CIRCUITPY drive -- writing
+  `.mpy` output straight to the USB volume was observed to take 100+ seconds per file.
+- **`gc.mem_free()` reports total free memory, not the largest contiguous block.** CircuitPython's
+  allocator is non-compacting, so a "plenty free" number does not rule out a specific large
+  allocation failing -- don't trust that number alone to declare a memory theory confirmed or
+  refuted; a fragmentation problem can look identical to "no problem" until the one allocation that
+  actually needs a big contiguous chunk hits it.
+- **Font glyph codepoint risk is documented in `Makefile`'s `fonts` target** -- read it before
+  adding any character outside the existing ASCII 32-126 range.
+- **Before declaring anything "fixed" or "root cause found": check the cheapest available number
+  before and after the change**, not just after. A theory that's well-reasoned and even partially
+  correct can still be the wrong fix if that check is skipped.
+
+## Suggested Prompt For Next Session
+
+> Most recent/pressing: read [docs/ota.md](ota.md) in full before touching `ota.py`, `denon.py`'s
+> retry logic, or `app.py`'s OTA lean-mode/menu code -- especially its "reliability investigation"
+> subsection before changing any retry logic. Two concrete next steps, in order: (1) commit and
+> merge today's OTA hardening work (currently uncommitted on the `ota` branch -- see that doc's
+> "Status as of this writing"), which will itself trigger a new automated release; (2) run a full
+> Install Update end-to-end against current code, since it hasn't been re-tested since the
+> retry/session-rebuild rewrite touched that exact path. Separately, the presets-retry fix
+> (`_retry_presets()` in `app.py`, unrelated to OTA) is deployed but not yet confirmed live from a
+> genuine boot-time failure.
+>
+> Read "CircuitPython heap/boot-memory guardrails" above before touching boot-path code (`app.py`'s
+> `main()`), `.mpy` deploy tooling, or the `driver.py`/`ha_ui.py`/`wiim_ui.py` UI-extension split.
+> Otherwise: review [docs/device-drivers.md](device-drivers.md)'s "Device Driver Architecture
+> (v2.0)" if the task involves adding or changing a device backend, and its "hard lessons" list
+> before touching backend-specific code.
+>
+> If the WiiM backend's rewritten raw-socket transport hasn't been redeployed and booted fresh yet,
+> that's the first thing to try -- the approach itself is confirmed working (see
+> docs/device-drivers.md's "Backend #4: WiiM / LinkPlay streamer" -> TLS section), but only via
+> ad-hoc REPL snippets, not the actual shipped module code end to end. Check `gc.mem_free()` before/
+> after on that first real boot regardless, same as any other memory theory in this file.
+>
+> The CamillaDSP backend (`src/camilladsp.py`, see docs/device-drivers.md's "Backend #5" section)
+> has booted successfully on real M5 Dial hardware against a real `camilladsp` process --
+> volume/mute/touch all confirmed working. The final quick-preset-button design
+> (`CAMILLADSP_QUICK_PRESETS`/`get_quick_presets()`/`state.preset_quick_names`) is verified
+> host-side only -- redeploying and confirming it on the Dial is the next concrete step for this
+> backend. Still open beyond that: preset-switch timing was only measured against a trivial
+> synthetic test config, not a real production one with actual filter files, and
+> `CAMILLADSP_PRESET_TIMEOUT_MS` is still a guess for that case.
+
+## Current Recommendation
+
+**Self-update (OTA)**, added 2026-07-31/08-01: implemented, and Check Now is confirmed working
+live on real hardware from a genuine cold boot -- but not yet 100% reliable on a single attempt
+(occasional `ETIMEDOUT` against GitHub's WAN round trip, always recoverable by retrying, never a
+hang/crash/loop). Install Update has real, correct release assets to install against (`v5`,
+confirmed) but hasn't been run end-to-end since the retry/session-rebuild reliability work landed --
+that's the top open item. All of today's OTA hardening (the `_Fetcher` retry rewrite, `denon.py`'s
+matching fix, `power_management = NONE`, the version-display UI fix) is uncommitted, sitting on the
+`ota` branch. See [docs/ota.md](ota.md) for the full design rationale, the reliability
+investigation's findings (real, sourced, not network hand-waving), and exactly what's still open.
+
+The app boots and connects cleanly on real hardware, both `denon` and `ha` configs. `make
+deploy-mpy` is what the device should run day to day; plain `make deploy` is for fast dev
+iteration only (no `mpy-cross` needed) and should not be mistaken for the shipped configuration.
+
+All five backends are implemented against the same
+pluggable-driver contract; Denon and MiniDSP are verified against real hardware (AVR-X4800H,
+MiniDSP 2x4HD, MiniDSP Flex). HA `media_player` (discovery/switching, skip controls, the
+standby-screen menu access fix, and the row/glyph/spacing polish) has had real on-device use --
+that's how the standby MENU tap-zone bug, the oversized pause glyph, and the font-size regression
+all got caught, even though that last one turned out not to be the WiFi bug itself. Other than the
+WiFi outage, still outstanding: a live `select_source` check (never exercised live, only the
+identical-shaped `_call_service` path other calls already confirmed working), and confirming the
+`<<`/`>>` skip icons plus the centered-integer volume display look right on the actual physical
+screen (renders via `tools/dial_sim.py` and direct `.pcf` bitmap dumps both look correct, but
+neither is the real GC9A01 display).
+
+`wiim` is implemented, and its TLS transport was a real find: the first implementation (a shared
+`adafruit_requests.Session` with `check_hostname = False`) reliably failed to boot -- see
+docs/device-drivers.md's "HTTPS-only API with a self-signed cert" section for the full debugging
+trail -- and the fix (a raw-socket transport with a hardcoded SNI hostname, bypassing
+`adafruit_requests` for this backend only) is confirmed working end-to-end via live REPL testing
+against the real M5 Dial and a real WiiM Pro (full HTTP/1.0 response -- status line, headers, JSON
+body -- received correctly over the fixed path). What's still outstanding: the *rewritten*
+`wiim.py`/`app.py` haven't been redeployed and booted fresh yet with the fix in place -- the fix
+was validated via ad-hoc snippets typed directly into the live REPL, not yet the actual shipped
+module code end to end, so that's the next concrete step, not a re-litigation of whether the
+approach works. Also still unverified: the `getPresetInfo` `preset_list` entry field names (no
+favorites were configured on the test unit yet).
+
+`camilladsp` is implemented and confirmed working end-to-end on real M5 Dial hardware against a
+real `camilladsp` 4.1.3 process -- volume, mute, and touch all functioning -- see
+docs/device-drivers.md's "Backend #5: CamillaDSP" section for the full design rationale and what's
+still open (Pong/ping tolerance beyond the short test session, and preset-switch timing against a
+real production config rather than the trivial synthetic test configs in `local/camilladsp/`). One
+piece is verified host-side only, not yet redeployed to the Dial: the final quick-preset-button
+design (`CAMILLADSP_QUICK_PRESETS`, `get_quick_presets()`, `state.preset_quick_names`) -- that's
+the next concrete step for this backend, not a question of whether the approach works.
+
+Future work could include: input selection UI polish, sound
+mode selection, multi-zone support, wiring up MiniDSP's real Dirac-series per-slot filter names
+if a future unit exposes more than a bare on/off `dirac` boolean, or -- once verified -- extending
+`camilladsp.py`'s design (name/path preset lists, live-reported current preset) back as an option
+for other backends if a similar gap ever comes up.
