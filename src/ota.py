@@ -48,37 +48,94 @@ _STAGING_DIR = "/ota_staging"
 _CHUNK_SIZE = 512
 
 
-def _fetch_json(session, url, timeout_ms):
-    # One retry with a short pause -- cheap insurance against an ordinary
-    # transient network hiccup. Not standing in for anything deeper: the
-    # one real reliability issue this project hit (a full TLS handshake
-    # succeeding but the first post-handshake send() failing, 100% of the
-    # time) turned out to be tied to a genuine hardware reset having
-    # happened in the current power cycle, not something a request-level
-    # retry could paper over -- see app.py's _ota_lean_mode() docstring.
-    # This module is only ever reached from a codepath that avoids that
-    # condition entirely, so this retry is just normal defensive practice.
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            resp = session.get(url, timeout=timeout_ms / 1000)
-            break
-        except OSError as e:
-            if attempt >= 2:
-                raise
-            print("ota: request failed ({}), retrying once:".format(url), type(e), e)
-            time.sleep(1.0)
-    try:
-        if resp.status_code != 200:
-            raise RuntimeError("GET {} -> {}".format(url, resp.status_code))
-        return resp.json()
-    finally:
-        resp.close()
+class _Fetcher:
+    """Owns one Session, rebuilt from scratch (fresh socket pool, fresh TLS
+    context -- see _ota_new_session()) on any retry rather than reused.
+
+    Adafruit_CircuitPython_Requests#191 documents ESP32 TCP connections
+    that keep timing out after a prior failure when a retry reuses the
+    same pooled socket/session -- rebuilding everything before a retry,
+    instead of calling .get() again on the session that just failed, is
+    the safe-by-construction fix for that class of issue. new_session is
+    a zero-arg callable (app.py's _ota_new_session), not a pre-built
+    Session, specifically so this class can call it again mid-operation.
+    """
+
+    def __init__(self, new_session):
+        self._new_session = new_session
+        self.session = new_session()
+
+    def _retry_wait(self, attempt, t0, url, e):
+        """Common tail of a failed attempt: log, decide whether to retry,
+        and if so rebuild the session before the caller tries again.
+        Raises the original exception once attempts are exhausted."""
+        print("ota: GET failed after {:.2f}s ({}):".format(
+            time.monotonic() - t0, url), type(e), e)
+        if attempt >= 2:
+            raise e
+        gc.collect()   # drop the failed session/pool/ssl_context before building a new one
+        self.session = self._new_session()
+        time.sleep(1.0)
+
+    def get_json(self, url, timeout_ms):
+        # The retry wraps the *entire* GET-and-parse -- not just
+        # session.get() -- because live testing (2026-07-31) showed
+        # session.get() itself returning cleanly (headers received) while
+        # the ETIMEDOUT actually happened inside resp.json()'s body read,
+        # a moment later. A retry loop that only covered session.get()
+        # would silently never retry that failure at all.
+        attempt = 0
+        while True:
+            attempt += 1
+            _t0 = time.monotonic()
+            resp = None
+            try:
+                resp = self.session.get(url, timeout=timeout_ms / 1000)
+                if resp.status_code != 200:
+                    raise RuntimeError("GET {} -> {}".format(url, resp.status_code))
+                result = resp.json()
+                print("ota: GET+parse took {:.2f}s: {}".format(time.monotonic() - _t0, url))
+                return result
+            except OSError as e:
+                self._retry_wait(attempt, _t0, url, e)
+            finally:
+                if resp is not None:
+                    resp.close()
+
+    def download(self, url, dest_path, timeout_ms):
+        """Stream url to dest_path, returning its sha256 hexdigest. Never
+        holds the full body in RAM -- some .mpy files run tens of KB, and
+        this device's heap is precious enough (see CLAUDE.md's boot-memory
+        guardrails) that .content/.text are not an option here.
+
+        Same whole-operation retry reasoning as get_json() -- a stall
+        mid-stream is just as plausible on a large file as during a small
+        JSON body's read, maybe more so."""
+        attempt = 0
+        while True:
+            attempt += 1
+            _t0 = time.monotonic()
+            resp = None
+            try:
+                resp = self.session.get(url, timeout=timeout_ms / 1000)
+                if resp.status_code != 200:
+                    raise RuntimeError("GET {} -> {}".format(url, resp.status_code))
+                digest = hashlib.sha256()
+                with open(dest_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
+                        f.write(chunk)
+                        digest.update(chunk)
+                print("ota: GET+download took {:.2f}s: {}".format(time.monotonic() - _t0, url))
+                return digest.hexdigest()
+            except OSError as e:
+                self._retry_wait(attempt, _t0, url, e)
+            finally:
+                if resp is not None:
+                    resp.close()
 
 
-def _latest_release(session):
-    return _fetch_json(session, _API_LATEST.format(config.OTA_REPO), config.OTA_CHECK_TIMEOUT_MS)
+def _latest_release(fetcher):
+    return fetcher.get_json(_API_LATEST.format(config.OTA_REPO), config.OTA_CHECK_TIMEOUT_MS)
 
 
 def _parse_tag_version(tag_name):
@@ -101,31 +158,15 @@ def _find_asset(release, filename):
     return None
 
 
-def check_latest_version(session):
+def check_latest_version(new_session):
     """Return (latest, current) version integers. Read-only -- makes one
-    API call, downloads/installs nothing."""
-    release = _latest_release(session)
+    API call, downloads/installs nothing. new_session is a zero-arg
+    callable (app.py's _ota_new_session), not a pre-built Session -- see
+    _Fetcher."""
+    fetcher = _Fetcher(new_session)
+    release = _latest_release(fetcher)
     latest = _parse_tag_version(release.get("tag_name"))
     return latest, version.CURRENT_VERSION
-
-
-def _download_to(session, url, dest_path, timeout_ms):
-    """Stream url to dest_path, returning its sha256 hexdigest. Never
-    holds the full body in RAM -- some .mpy files run tens of KB, and this
-    device's heap is precious enough (see CLAUDE.md's boot-memory
-    guardrails) that .content/.text are not an option here."""
-    resp = session.get(url, timeout=timeout_ms / 1000)
-    try:
-        if resp.status_code != 200:
-            raise RuntimeError("GET {} -> {}".format(url, resp.status_code))
-        digest = hashlib.sha256()
-        with open(dest_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
-                f.write(chunk)
-                digest.update(chunk)
-        return digest.hexdigest()
-    finally:
-        resp.close()
 
 
 def _ensure_dir(path):
@@ -141,7 +182,7 @@ def _clear_staging():
         os.remove(_STAGING_DIR + "/" + name)
 
 
-def apply(session):
+def apply(new_session):
     """Check, download, verify, and install the latest release.
 
     Only ever called from app.py's _ota_lean_mode(), after it has already
@@ -154,16 +195,22 @@ def apply(session):
     safety story here, not a general rollback mechanism (acceptable given
     the accepted "worst case is USB recovery" risk tolerance for this
     project). Returns the newly-installed version integer on success.
+
+    new_session is a zero-arg callable (app.py's _ota_new_session), not a
+    pre-built Session -- see _Fetcher, which rebuilds its session from
+    scratch on any retry across the whole check+manifest+N-file-download
+    sequence below, not just once at the start.
     """
-    release = _latest_release(session)
+    fetcher = _Fetcher(new_session)
+    release = _latest_release(fetcher)
     latest = _parse_tag_version(release.get("tag_name"))
 
     manifest_asset = _find_asset(release, "manifest.json")
     if manifest_asset is None:
         raise RuntimeError(
             "release {} has no manifest.json asset".format(release.get("tag_name")))
-    manifest = _fetch_json(
-        session, manifest_asset["browser_download_url"], config.OTA_CHECK_TIMEOUT_MS)
+    manifest = fetcher.get_json(
+        manifest_asset["browser_download_url"], config.OTA_CHECK_TIMEOUT_MS)
 
     files = manifest.get("files") or []
     if not files:
@@ -182,8 +229,8 @@ def apply(session):
             raise RuntimeError("release is missing an asset for manifest path {!r}".format(path))
 
         dest = _STAGING_DIR + "/" + path
-        got_sha = _download_to(
-            session, asset["browser_download_url"], dest, config.OTA_INSTALL_TIMEOUT_MS)
+        got_sha = fetcher.download(
+            asset["browser_download_url"], dest, config.OTA_INSTALL_TIMEOUT_MS)
         got_size = os.stat(dest)[6]
         if got_sha != want_sha or got_size != want_size:
             raise RuntimeError(

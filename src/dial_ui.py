@@ -971,7 +971,7 @@ def init():
     # ── Top overlay: startup messages & menu title ────────────────────────────
     status_lbl = label.Label(
         _F_MD, text="", color=_C_WARN,
-        anchor_point=(0.5, 0.0), anchored_position=(CX, 8),
+        anchor_point=(0.5, 0.0), anchored_position=(CX, 24),
     )
     group.append(status_lbl)
 
@@ -1168,12 +1168,19 @@ def render_gauge_bg(ui, vol_db, muted):
     _render_gauge(ui["bmp"], vol_db, muted)
 
 
-def draw_menu(ui, title, items, cursor, clear_bg=False):
-    """Menu overlay.  clear_bg=True paints the bitmap black before drawing."""
+def draw_menu(ui, title, items, cursor, clear_bg=False, version_text=""):
+    """Menu overlay.  clear_bg=True paints the bitmap black before drawing.
+
+    version_text is the only thing ui["status"] ever shows here -- title
+    itself is never rendered (context normally comes from the items
+    themselves); the Update submenu is the one exception that needs a
+    persistent, no-tap-required label, styled to match the main screen's
+    dim "input" label rather than a bright title."""
     global MENU_ITEM_Y0
     if clear_bg:
         _clear(ui["bmp"])
-    ui["status"].text  = ""    # no title; context comes from the items themselves
+    ui["status"].text  = version_text
+    ui["status"].color = _C_DIM
     ui["vol_int"].text = ""
     ui["vol_dec"].text = ""
     ui["input"].text   = ""
