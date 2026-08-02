@@ -60,26 +60,15 @@ MODE_ERROR    = 4   # network/AVR error – tap anywhere to restart
 _NVM_BRIGHTNESS = 0
 # NVM slot for persisting sound on/off (byte 1: 0=off, any other=on)
 _NVM_SOUND      = 1
-# OTA NVM state -- 3 bytes. Root-caused live (2026-07-31, see CLAUDE.md's
-# OTA section for the full trail): a genuine hardware reset breaks TLS
-# for the rest of that power cycle (a raw-socket test showed the TCP
-# connect and handshake both succeed, but the first post-handshake
-# application-data send doesn't -- OSError -12288, every single time).
-# A session reached via supervisor.reload() instead -- never a hard
-# reset -- works completely reliably. So the whole OTA flow is designed
-# around never hard-resetting: "Check Now"/"Install Update" set an
-# action byte and call supervisor.reload() (not microcontroller.reset())
-# into a lean, low-memory pass of main() that skips dial_ui.init()
-# (see _ota_lean_mode()), does the real network+filesystem work, records
-# a result, and reloads back to the normal UI -- no hard reset anywhere
-# in this flow. Filesystem writes use a *live* storage.remount("/",
-# readonly=False) call (confirmed live: succeeds with zero reboot at all
-# as long as CIRCUITPY isn't actively host-mounted -- eject it first if
-# it is) rather than the boot.py-gated dance earlier designs needed.
-_NVM_OTA_ACTION  = 2   # 0=idle, 1=pending check, 2=pending install
-_NVM_OTA_RESULT  = 3   # 0=none, 1=available, 2=up_to_date, 3=check_error,
-                        # 4=install_ok, 5=install_failed, 6=eject_needed
-_NVM_OTA_VERSION = 4   # latest version found by a check (valid when result==1)
+# OTA NVM state (bytes 2-4) is defined once in config.py (NVM_OTA_ACTION/
+# RESULT/VERSION) since ota_boot.py needs it too, not just app.py -- see
+# that module's docstring for why the actual check/install work now lives
+# there instead of here. This file only ever reads OTA_RESULT/OTA_VERSION
+# (to show a check/install's outcome) and writes OTA_ACTION (to request
+# one via _confirm_sub's "update" branch, right before a reload hands off
+# to ota_boot.py). Never calls microcontroller.reset() anywhere in that
+# handoff -- see docs/ota.md for why a hard reset breaks TLS for the rest
+# of that power cycle, root-caused live 2026-07-31.
 
 # Encoder debounce (volume mode only)
 ENC_DEBOUNCE_S = 0.15
@@ -134,24 +123,21 @@ def _save_sound(val):
         print("save_sound:", e)
 
 
-def _ota_action():
-    try:
-        return microcontroller.nvm[_NVM_OTA_ACTION]
-    except Exception:
-        return 0
-
-
 def _set_ota_action(val):
+    """Requests a check/install on the next boot -- see _confirm_sub's
+    "update" branch, which calls this then reloads. Consuming this flag
+    (reading it, doing the real work, clearing it) is entirely
+    ota_boot.py's job now -- this file only ever writes it."""
     gc.collect()   # nvm writes need a real buffer -- see _set_ota_result
     try:
-        microcontroller.nvm[_NVM_OTA_ACTION] = val
+        microcontroller.nvm[config.NVM_OTA_ACTION] = val
     except Exception as e:
         print("set_ota_action:", type(e), e)
 
 
 def _ota_result():
     try:
-        return microcontroller.nvm[_NVM_OTA_RESULT]
+        return microcontroller.nvm[config.NVM_OTA_RESULT]
     except Exception:
         return 0
 
@@ -162,169 +148,21 @@ def _set_ota_result(val):
     # modify-write, not just the one byte being set), which can fail with
     # a MemoryError of its own right after a network-heavy operation.
     # gc.collect() first, same discipline used everywhere else in this
-    # codebase before a specific allocation.
+    # codebase before a specific allocation. The only caller left in this
+    # file is main()'s "clear the result after displaying it" step.
     gc.collect()
     try:
-        microcontroller.nvm[_NVM_OTA_RESULT] = val
+        microcontroller.nvm[config.NVM_OTA_RESULT] = val
     except Exception as e:
         print("set_ota_result:", type(e), e)
 
 
 def _ota_latest_version():
     try:
-        v = microcontroller.nvm[_NVM_OTA_VERSION]
+        v = microcontroller.nvm[config.NVM_OTA_VERSION]
         return None if v == 255 else v   # 255 = erased/uninitialized flash
     except Exception:
         return None
-
-
-def _set_ota_latest_version(val):
-    try:
-        microcontroller.nvm[_NVM_OTA_VERSION] = val
-    except Exception as e:
-        print("set_ota_latest_version:", type(e), e)
-
-
-def _ota_reload_to_normal():
-    """Clear the pending action and reload back into normal UI mode --
-    shared tail for every _ota_lean_mode() exit path. A *soft* reload,
-    not microcontroller.reset() -- see _ota_lean_mode()'s docstring for
-    why that distinction matters here just as much on the way out as on
-    the way in."""
-    _set_ota_action(0)
-    gc.collect()
-    import supervisor
-    supervisor.reload()
-
-
-def _ota_new_session():
-    """Fresh wifi connect + Session(ssl_context) -- factored out only so
-    the caller doesn't need to spell it twice (check vs install)."""
-    # Default power_management is MIN, which lets the radio sleep between
-    # the AP's DTIM beacons -- fine for the AVR's LAN-local polling, but a
-    # plausible contributor to the ETIMEDOUT pattern seen against GitHub's
-    # WAN-hop TLS round trip (real ESP32/CircuitPython radio-sleep latency,
-    # not this repo's network -- see the user's own citation of
-    # adafruit/Adafruit_CircuitPython_Requests#191, a documented ESP32 TCP
-    # timeout issue independent of any particular network).
-    try:
-        wifi.radio.power_management = wifi.PowerManagement.NONE
-    except Exception as e:
-        print("power_management NONE failed:", type(e), e)
-    wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
-    pool = socketpool.SocketPool(wifi.radio)
-    import ssl
-    ssl_context = ssl.create_default_context()
-    return adafruit_requests.Session(pool, ssl_context)
-
-
-def _ota_do_check():
-    """Runs ota.check_latest_version() in its own stack frame. Confirmed
-    live (2026-07-31): this matters, not just tidiness -- pool/ssl_context/
-    session are the real memory hogs (TLS/socket buffers), and leaving them
-    resident in the CALLER's frame (the first cut of this function had the
-    network call and the nvm-writing code in one flat function) starves the
-    nvm write that records the result of the ~8KB it needs, even with a
-    gc.collect() right before it -- objects still reachable from a live
-    frame are not garbage. Once this function returns, its frame is gone
-    and they're immediately collectible."""
-    import ota
-    return ota.check_latest_version(_ota_new_session)
-
-
-def _ota_do_install():
-    """Same reasoning as _ota_do_check() -- runs ota.apply() in its own
-    frame so its locals are collectible before _ota_lean_mode() tries to
-    record the result to nvm."""
-    import ota
-    ota.apply(_ota_new_session)
-
-
-def _ota_lean_mode():
-    """Runs instead of the normal UI/backend flow when an OTA action
-    (check or install) is pending -- see main()'s call to this, near the
-    top, before dial_ui.init()/driver setup. Deliberately skips all of
-    that: dial_ui.init()'s ~28KB gauge bitmap plus driver/encoder/touch
-    setup left too little headroom for wifi+ssl+ota+adafruit_hashlib in
-    earlier testing (confirmed live, a real MemoryError).
-
-    Reached only via supervisor.reload() (see _confirm_sub's "update"
-    branch), never via a hard reset -- that distinction is load-bearing,
-    not stylistic. Root-caused live (2026-07-31, full trail in CLAUDE.md's
-    OTA section): a genuine hardware reset breaks TLS for the rest of
-    that power cycle -- a raw-socket test showed the TCP connect and the
-    handshake itself both succeeding, but the first post-handshake
-    application-data send() failing, 100% reproducibly, every attempt,
-    however long an idle delay preceded it. A session reached via a soft
-    reload instead -- confirmed live, several times -- completes a full
-    TLS round trip (handshake, send, recv, a real HTTP response)
-    reliably. Every exit path below ends in _ota_reload_to_normal(),
-    itself also a soft reload, so this holds on the way back out too --
-    a successful install's newly-written app.mpy is picked up correctly
-    by that reload the same way CircuitPython's own auto-reload already
-    relies on re-importing changed files from disk.
-
-    Filesystem writes use a *live* storage.remount("/", readonly=False)
-    call rather than any boot.py-gated dance -- confirmed live this
-    succeeds with zero reboot at all as long as CIRCUITPY isn't actively
-    host-mounted (eject it first if it is -- the one real dependency
-    this whole design has, surfaced to the user as the "eject_needed"
-    result below rather than failing silently).
-    """
-    action = _ota_action()
-    if action == 1:
-        msg = "Checking...\ncurrent v{}".format(version.CURRENT_VERSION)
-    else:
-        msg = "Updating to v{}...".format(_ota_latest_version())
-    dial_ui.show_message(board.DISPLAY, msg)
-
-    if not config.WIFI_SSID:
-        _set_ota_result(3 if action == 1 else 5)
-        _ota_reload_to_normal()
-        return
-
-    if action == 1:   # Check Now
-        try:
-            latest, current = _ota_do_check()
-            gc.collect()   # pool/ssl_context/session are out of scope now
-            print("free mem before ota result nvm writes:", gc.mem_free())
-            if latest > current:
-                _set_ota_latest_version(latest)
-                _set_ota_result(1)
-            else:
-                _set_ota_result(2)
-        except Exception as e:
-            print("ota check failed:", type(e), e)
-            _set_ota_result(3)
-        _ota_reload_to_normal()
-        return
-
-    # action == 2: Install Update.
-    import storage
-    try:
-        storage.remount("/", readonly=False)
-    except Exception as e:
-        print("ota install: remount failed:", type(e), e)
-        _set_ota_result(6)   # eject_needed
-        _ota_reload_to_normal()
-        return
-
-    ok = False
-    try:
-        _ota_do_install()
-        ok = True
-    except Exception as e:
-        print("ota apply failed:", type(e), e)
-    gc.collect()   # pool/ssl_context/session are out of scope now
-    print("free mem before ota result nvm writes:", gc.mem_free())
-
-    try:
-        storage.remount("/", readonly=True)   # restore the normal default
-    except Exception as e:
-        print("ota install: remount-back failed:", type(e), e)
-
-    _set_ota_result(4 if ok else 5)
-    _ota_reload_to_normal()
 
 
 def _connect_wifi(ui):
@@ -545,10 +383,20 @@ def _scroll_for(cursor, scroll, num_items):
     return max(0, min(scroll, max(0, num_items - vis)))
 
 
-def _menu_item_at_y(y):
-    """Return visible item index [0..MENU_VISIBLE-1] for a touch at y, or -1."""
+def _menu_item_at_y(y, max_items):
+    """Return visible item index [0..max_items-1] for a touch at y, or -1.
+
+    max_items is required, not defaulted to MENU_VISIBLE -- found live
+    (2026-08-01) that scanning all MENU_VISIBLE slot positions regardless
+    of how many items a menu actually has meant a menu with fewer than
+    MENU_VISIBLE items (the Update submenu's single "Check Now" row is the
+    extreme case) had "phantom" hit zones below its real content: a tap
+    landing near one of those unused slot positions returned a real index
+    that then failed the caller's `tapped < actual count` check and closed
+    the menu entirely, misread as "tapped outside every item." Every
+    caller must pass its own real, currently-visible item count."""
     half = dial_ui.MENU_ITEM_DY // 2 - 2
-    for i in range(dial_ui.MENU_VISIBLE):
+    for i in range(max_items):
         if abs(y - (dial_ui.MENU_ITEM_Y0 + i * dial_ui.MENU_ITEM_DY)) <= half:
             return i
     return -1
@@ -820,18 +668,33 @@ def _read_touch_point(touch):
 
 
 def _handle_touch_down(loop, ui, state, touch, now):
-    """Touch held down: track position, fire long-press power toggle."""
-    if loop.touch_start == 0.0:
+    """Touch held down: track position, fire long-press power toggle.
+
+    Found + fixed 2026-08-01: touch_y used to be set only once, on the
+    very first frame of a touch-down, while touch_x kept updating on every
+    later frame (for swipe detection). If that first frame's read came
+    back phantom/empty (the FocalTouch driver can report touched>0 with
+    an empty touches list after filtering invalid points -- confirmed
+    reachable), touch_y stayed stuck at its reset value of 0 for the
+    entire gesture, even once a later frame got a real reading. Since
+    every real menu item sits near vertical screen center, a stuck
+    touch_y=0 never matches any item's hit band regardless of how many
+    items exist -- indistinguishable from "tapped outside everything,"
+    closing the menu on release. touch_x_start (the swipe-detection
+    baseline) had the same latent gap: only ever set on the literal first
+    frame, so a phantom first read left it stuck at 0 too. Both are now
+    set on whichever frame first produces a real point, not necessarily
+    the first frame, and touch_x/touch_y both keep updating on every
+    later frame a valid point comes back."""
+    first_frame = loop.touch_start == 0.0
+    if first_frame:
         loop.touch_start = now
-        pt = _read_touch_point(touch)
-        if pt:
-            loop.touch_x, loop.touch_y = pt
+    pt = _read_touch_point(touch)
+    if pt:
+        got_first_point = loop.touch_x_start == 0 and loop.touch_y == 0
+        loop.touch_x, loop.touch_y = pt
+        if first_frame or got_first_point:
             loop.touch_x_start = loop.touch_x
-    else:
-        # Track current position so release has the final x for swipe detection
-        pt = _read_touch_point(touch)
-        if pt:
-            loop.touch_x = pt[0]
 
     held = now - loop.touch_start
     if not driver.CAPS["power"] or loop.touch_power_fired or held < TOUCH_POWER_S:
@@ -886,8 +749,8 @@ def _swipe_back(loop, ui, state, now):
 
 
 def _tap_menu_top(loop, ui, state, now):
-    tapped = _menu_item_at_y(loop.touch_y)
     top_items = _build_top_menu()
+    tapped = _menu_item_at_y(loop.touch_y, min(dial_ui.MENU_VISIBLE, len(top_items)))
     if not (0 <= tapped < len(top_items)):
         sound.click()
         loop.mode = MODE_MAIN
@@ -912,8 +775,8 @@ def _tap_menu_top(loop, ui, state, now):
 
 
 def _tap_menu_dev(loop, ui, state, now):
-    tapped = _menu_item_at_y(loop.touch_y)
     dev_items = _build_dev_menu()
+    tapped = _menu_item_at_y(loop.touch_y, min(dial_ui.MENU_VISIBLE, len(dev_items)))
     if not (0 <= tapped < len(dev_items)):
         sound.click()
         loop.mode = MODE_MENU_TOP
@@ -933,9 +796,9 @@ def _tap_menu_dev(loop, ui, state, now):
 
 
 def _tap_menu_sub(loop, ui, state, now):
-    tapped = _menu_item_at_y(loop.touch_y)
     items = _build_sub_items(loop.sub_type, state, loop)
     vis_count = min(dial_ui.MENU_VISIBLE, len(items) - loop.sub_scroll)
+    tapped = _menu_item_at_y(loop.touch_y, vis_count)
     stay_open = False
     if 0 <= tapped < vis_count:
         # Tap a visible item -> select + confirm it
@@ -1338,7 +1201,18 @@ def _retry_presets(loop, ui, state, now):
         state.preset, state.preset_names = driver.get_presets()
         state.preset_enabled = driver.get_preset_enabled()
         state.preset_quick_names = driver.get_quick_presets()
-        if state.preset_names and loop.mode == MODE_MAIN:
+        # Found + fixed 2026-08-01: this used to render unconditionally
+        # once preset_names arrived, with no check on loop.first_poll.
+        # state.power defaults to "STANDBY" (see AVRState.__init__) until
+        # the first real status poll lands, and this retry's own interval
+        # can genuinely fire before that first poll does -- rendering here
+        # painted the power-off screen using that fabricated default,
+        # which then got silently corrected a few seconds later once the
+        # real poll came in. User-reported symptom: "it goes to the power
+        # off screen before the menu screen... it's not powered off."
+        # Guarding on first_poll means this only ever renders once
+        # state.power reflects a real reading.
+        if state.preset_names and loop.mode == MODE_MAIN and not loop.first_poll:
             dial_ui.draw_main(ui, state)   # quick-select buttons now have names to show
     except Exception as e:
         print("preset retry:", e, "| free mem:", gc.mem_free())
@@ -1401,18 +1275,13 @@ def main():
     print("free mem at top of main:", gc.mem_free(), "t:", _splash_t)
     dial_ui.show_splash(board.DISPLAY)
 
-    # --- OTA lean mode -------------------------------------------------------
-    # _confirm_sub's "update" branch sets the pending action and calls
-    # supervisor.reload() (never microcontroller.reset()) right before
-    # this boot -- see _ota_lean_mode()'s docstring for the full story on
-    # why that distinction is load-bearing, not stylistic. Runs instead
-    # of the normal UI/backend flow entirely: OTA is orthogonal to
-    # DEVICE_DRIVER, so no driver/backend init happens here at all, and
-    # this branch never reaches the hardware-input setup below it either.
-    if _ota_action() != 0:
-        _ota_lean_mode()
-        return   # unreachable -- every path through _ota_lean_mode() ends
-                 # in a reload, which never returns
+    # Note: there is no OTA-pending check here anymore. code.py itself
+    # reads the pending-action nvm byte and imports ota_boot.py instead of
+    # app.py entirely when one is set -- main() is never even called in
+    # that case. See ota_boot.py's module docstring for why that split
+    # exists (importing app.py alone was pulling in driver.py/dial_ui.py/
+    # the backend module regardless, leaving too little free memory for a
+    # reliable TLS handshake).
 
     # --- Hardware inputs ---
     encoder = rotaryio.IncrementalEncoder(board.ENC_A, board.ENC_B)
@@ -1558,8 +1427,8 @@ def main():
     loop.last_pos = encoder.position
 
     # Surface the result of a check/install exactly once, on the first
-    # normal boot after the reload _ota_lean_mode() ends with -- see
-    # _confirm_sub's "update" branch and _ota_lean_mode() itself.
+    # normal boot after the reload ota_boot.run() ends with -- see
+    # _confirm_sub's "update" branch and ota_boot.py's run().
     _result = _ota_result()
     if _result != 0:
         loop.ota_status = {

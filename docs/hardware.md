@@ -22,17 +22,25 @@ Confirmed working with CircuitPython 10.2.1, board ID `m5stack_dial`.
 
 ## Deployment Goal
 
-Day-to-day development:
+Day-to-day development -- and what the device should actually run:
 
 ```sh
 make deploy
 ```
 
-Underlying commands: see the Makefile's `_copy-files` target (plain `.py`, what `make deploy`
-runs) directly rather than duplicating the list here -- it grows with every new source file and a
-hand-copied list here would just drift. `make deploy-mpy` (`_copy-files-mpy` target) is what the
-device should actually run; see [docs/architecture.md](architecture.md)'s "CircuitPython
-heap/boot-memory guardrails" for why.
+**Corrected 2026-08-01: the target names below flipped meaning at some point after this doc's
+content was first written**, and the stale version briefly made it back into `.claude/CLAUDE.md`
+during the docs reorg -- caught live when it nearly sent a debugging session down the wrong path.
+`make deploy` now runs `_copy-files-mpy` (every module except `code.py` precompiled to `.mpy`) --
+this is the reliable, low-heap-footprint path and is what the device should run day to day. The
+Makefile's own comment on that target explains why the rename happened: the old naming (`deploy`
+= plain `.py`, `deploy-mpy` = compiled) let people run plain `deploy` "out of habit" and silently
+regress the device back into the exact low-headroom boot-memory state described in
+[docs/architecture.md](architecture.md)'s "CircuitPython heap/boot-memory guardrails". Plain,
+uncompiled `.py` deployment is now `make deploy-src` (`_copy-files` target) -- for when
+`local/mpy-cross` isn't available, or when chasing a traceback where uncompiled source gives a
+clearer on-device error. **Always confirm against the Makefile itself before trusting a deploy
+command from this doc or CLAUDE.md** -- this is exactly the kind of fact that drifts.
 
 CircuitPython auto-reloads when files change on the drive. No reset command needed.
 

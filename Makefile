@@ -48,6 +48,14 @@ full-deploy: install-libs deploy
 # plain-.py path was.
 deploy: _copy-files-mpy
 
+# deploy-code: same .mpy compile as `deploy`, but skips splash_logo.bmp and
+# the fonts/ directory entirely -- those rarely change and each cp to the
+# mounted CIRCUITPY drive pays a real per-file flash-write cost (see the
+# comment on _copy-files-mpy below), which adds up during rapid iteration
+# on code alone. Not what a fresh device/full-deploy needs (use `deploy`
+# for that) -- this is purely a fast path for "I only changed a .py file."
+deploy-code: _copy-code-mpy
+
 # deploy-src: plain, uncompiled .py -- NOT what the device should run day
 # to day (see `deploy` above). Real uses: no `local/mpy-cross` available
 # yet, or actively chasing a traceback where uncompiled source gives a
@@ -74,11 +82,12 @@ MPY_CROSS := local/mpy-cross
 # than what the runtime compiler produces from `.py` source AND skips
 # paying that compile-time cost at all -- see CLAUDE.md's "CircuitPython
 # heap/boot-memory guardrails" for why that's not just a flash-space nicety.
-MPY_MODULES := config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app ota version
+MPY_MODULES := config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app ota ota_boot version
 
-_copy-files-mpy:
+_copy-code-mpy:
 	cp src/settings.toml $(CIRCUITPY)/settings.toml
 	cp src/code.py     $(CIRCUITPY)/code.py
+	cp src/boot.py     $(CIRCUITPY)/boot.py
 	@rm -f $(addsuffix .py,$(addprefix $(CIRCUITPY)/,$(MPY_MODULES)))
 	@mkdir -p local/build
 	@for m in $(MPY_MODULES); do \
@@ -94,6 +103,8 @@ _copy-files-mpy:
 	@for m in $(MPY_MODULES); do \
 	  cp local/build/$$m.mpy $(CIRCUITPY)/$$m.mpy; \
 	done
+
+_copy-files-mpy: _copy-code-mpy
 	cp src/splash_logo.bmp $(CIRCUITPY)/splash_logo.bmp
 	mkdir -p $(CIRCUITPY)/fonts
 	cp src/fonts/FreeMonoBold_36.pcf $(CIRCUITPY)/fonts/FreeMonoBold_36.pcf
@@ -186,6 +197,7 @@ _copy-files:
 	@rm -f $(addsuffix .mpy,$(addprefix $(CIRCUITPY)/,$(MPY_MODULES)))
 	cp src/config.py   $(CIRCUITPY)/config.py
 	cp src/ota.py      $(CIRCUITPY)/ota.py
+	cp src/ota_boot.py $(CIRCUITPY)/ota_boot.py
 	cp src/version.py  $(CIRCUITPY)/version.py
 	cp src/driver.py   $(CIRCUITPY)/driver.py
 	cp src/denon.py    $(CIRCUITPY)/denon.py
@@ -200,6 +212,7 @@ _copy-files:
 	cp src/sound.py    $(CIRCUITPY)/sound.py
 	cp src/app.py      $(CIRCUITPY)/app.py
 	cp src/code.py     $(CIRCUITPY)/code.py
+	cp src/boot.py     $(CIRCUITPY)/boot.py
 	cp src/splash_logo.bmp $(CIRCUITPY)/splash_logo.bmp
 	mkdir -p $(CIRCUITPY)/fonts
 	cp src/fonts/FreeMonoBold_36.pcf $(CIRCUITPY)/fonts/FreeMonoBold_36.pcf
@@ -215,6 +228,20 @@ ls:
 # Open an interactive REPL over USB serial (CircuitPython still has one)
 shell:
 	$(PYTHON) -m mpremote connect auto
+
+# Dev-only: toggle CIRCUITPY's USB mass-storage drive via boot.py's nvm-byte
+# check (src/boot.py) -- lets Install Update's storage.remount() succeed
+# without physically ejecting/reconnecting, while keeping the serial
+# console (REPL/prints) available. Requires a hard reset to take effect
+# (boot.py only runs then) -- this triggers it directly, which naturally
+# drops the mpremote connection; reconnect with `make shell` afterward.
+# Run `make usb-drive-on` before `make deploy` -- CIRCUITPY must be
+# mounted for the file copy to have anywhere to write to.
+usb-drive-off:
+	$(PYTHON) -m mpremote connect auto exec "import gc, microcontroller; gc.collect(); microcontroller.nvm[5] = 1; microcontroller.reset()"
+
+usb-drive-on:
+	$(PYTHON) -m mpremote connect auto exec "import gc, microcontroller; gc.collect(); microcontroller.nvm[5] = 0; microcontroller.reset()"
 
 # Run the host-side Denon HTTP probe (requires AVR on network).
 # Usage: make probe
@@ -289,4 +316,15 @@ probe-ota:
 build-manifest:
 	$(PYTHON) tools/build_release_manifest.py --dir local/build --out local/build/manifest.json --version $(or $(OTA_VERSION),0)
 
-.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest renders ui-renders
+# ON-DEVICE regression check for ota.py's real install sequence (release
+# fetch -> minimal metadata extraction -> manifest -> every real asset,
+# resolved+downloaded+verified) -- unlike probe-ota above, this runs the
+# actual deployed ota.py/ota_boot.py on real hardware, over real Wi-Fi.
+# Stops short of the final rename-into-place commit, so a pass never
+# overwrites the files currently running on the device. Run after any
+# change to ota.py's Fetcher/session/apply() internals. See
+# tools/ota_regression_check.py's module docstring for why this exists.
+probe-ota-regression:
+	$(PYTHON) -m mpremote connect auto run tools/ota_regression_check.py
+
+.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression renders ui-renders

@@ -249,16 +249,31 @@ def get_status():
     volume_block = _nth_cmd_block(xml, 2)
     mute_block   = _nth_cmd_block(xml, 3)
 
-    raw_power  = _tag(power_block,  "zone1") or "STANDBY"
+    raw_power  = _tag(power_block,  "zone1")
     raw_source = _tag(_tag(source_block, "zone1") or "", "source") or ""
     raw_volume = _tag(_tag(volume_block, "zone1") or "", "volume")
     raw_mute   = _tag(mute_block,   "zone1") or "off"
 
     volume_db = float(raw_volume) if raw_volume is not None else -80.0
     muted     = raw_mute.strip().lower() == "on"
-    power     = raw_power.strip().upper()
+    # Found + fixed 2026-08-01: this used to be `raw_power or "STANDBY"`,
+    # then "STANDBY" again if the result wasn't "ON"/"OFF" -- silently
+    # converting ANY unparseable power reading (missing <zone1> tag, a
+    # truncated/malformed response) into a real, definite-looking
+    # "STANDBY" rather than treating it as the parse failure it actually
+    # is. Boot is this codebase's most heap-fragmented, most
+    # truncation-prone moment (see docs/architecture.md's boot-memory
+    # guardrails) -- exactly where a short/partial read is most likely,
+    # and exactly what was producing a real, reproducible "power off
+    # screen flashes at boot, then corrects itself" bug once app.py
+    # rendered from this fabricated value before a clean poll landed.
+    # Raising here instead routes a genuine parse failure through the
+    # same retry/error-count path _poll_now() already has for network
+    # errors, rather than smoothing it into a wrong-but-plausible answer.
+    power = (raw_power or "").strip().upper()
     if power not in ("ON", "OFF"):
-        power = "STANDBY"
+        raise RuntimeError(
+            "denon: unexpected power value {!r} (missing/truncated response?)".format(raw_power))
 
     return {
         "volume_db": volume_db,

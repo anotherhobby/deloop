@@ -60,12 +60,14 @@ Longer term, this could become a more complete Denon/Marantz remote, but the pro
 - CircuitPython 10.2.1 firmware (official board: `m5stack_dial`)
 - Plain CircuitPython `.py` files in this repo as the source of truth -- edited and version
   controlled as `.py`, always
-- Deployment via USB mass storage, but **not as plain `.py` day to day**: `make deploy-mpy`
+- Deployment via USB mass storage, but **not as plain `.py` day to day**: `make deploy`
   precompiles every module except `code.py` to `.mpy` first (`code.py` itself must stay
   uncompiled source -- it's the boot entry point) and is what the device should actually run; see
-  "CircuitPython heap/boot-memory guardrails" below for why. Plain `make deploy` (no `.mpy`,
-  `cp src/* /Volumes/CIRCUITPY/`-equivalent) still exists for fast dev iteration and doesn't
-  require `local/mpy-cross` to be present, but isn't the shipped configuration.
+  "CircuitPython heap/boot-memory guardrails" below for why. Plain, uncompiled deployment is
+  `make deploy-src` (fast dev iteration, doesn't require `local/mpy-cross` to be present), but
+  isn't the shipped configuration. (Corrected 2026-08-01 -- these target names swapped meaning at
+  some point after this was first written; see [docs/hardware.md](hardware.md)'s "Deployment
+  Goal" for the full story and a live case of the stale version almost causing a wrong diagnosis.)
 
 Flashing steps and the full hardware/pin/library reference live in
 [docs/hardware.md](hardware.md); deploy-command mechanics (`make deploy`/`make shell`) are also
@@ -107,7 +109,11 @@ deloop/
     sound.py          # piezo click feedback
     config.py         # settings.toml loader/defaults
     ota.py             # self-update: check/download/verify/install a GitHub Release --
-                      # see Self-Update (OTA) below. Pure network+filesystem, no NVM/reset.
+                      # see docs/ota.md. Pure network+filesystem, no NVM/reset.
+    ota_boot.py          # code.py imports THIS instead of app.py when an OTA action is
+                      # pending -- never imports driver.py/dial_ui.py/the backend module.
+                      # Added 2026-08-01; see docs/ota.md for why (a memory-budget bug that
+                      # every earlier OTA "fix" this same day had missed).
     version.py          # CURRENT_VERSION placeholder (real value baked in by the release
                       # workflow, never committed back)
     settings.toml.template
@@ -202,6 +208,71 @@ Stored in `microcontroller.nvm[0]` as `int(brightness * 100)`.
 Always use `board.I2C()` (singleton), never `busio.I2C(board.SCL, board.SDA)`.
 "No I2C device at 0x38" on boot = stale lock from REPL session; power-cycle.
 
+### Menu tap hit-testing must be bounded by the menu's real item count (found + fixed 2026-08-01)
+`app.py`'s `_menu_item_at_y(y)` used to scan all `MENU_VISIBLE` (5) slot positions unconditionally,
+regardless of how many items the current menu actually has. A menu with fewer than 5 items --
+the Update submenu's single "Check Now" row is the extreme case -- had "phantom" hit zones below
+its real content: a tap landing near one of those unused slot positions returned a real index that
+then failed the caller's `tapped < actual count` bounds check, which was indistinguishable from
+"tapped outside every item" and closed the menu entirely. User-reported symptom: "the first few
+taps always just throw me out of the menu," specifically right after a fresh boot into the Update
+submenu (one item, a 34px-tall real target near screen center out of the whole touch area) --
+resolved on its own once a check/install result added a second item and widened/recentred the
+real target. Fixed by requiring every caller (`_tap_menu_top`, `_tap_menu_dev`, `_tap_menu_sub`) to
+pass its own real, currently-visible item count into `_menu_item_at_y(y, max_items)` -- no default,
+so a future caller can't reintroduce this by forgetting to pass one. Affects all three menu levels
+in principle, not just Update -- that submenu just made it obvious by being the one place a menu
+can have just one item.
+
+**Confirmed live NOT sufficient by itself -- a second, independent bug was also in play.**
+Deployed and re-tested: tapping "Check Now" still closed the menu immediately, identically. Traced
+to `_handle_touch_down()`: `touch_y` was set only once, on the very first frame of a touch-down,
+while `touch_x` kept updating on every later frame (for swipe detection). If that first frame's
+read came back phantom/empty -- the FocalTouch driver can report `touched > 0` with an empty
+`touches` list after filtering invalid points, confirmed reachable -- `touch_y` stayed stuck at its
+reset value of `0` for the entire gesture, even once a later frame got a real reading. Since every
+real menu item sits near vertical screen center, a stuck `touch_y=0` never matches any item's hit
+band regardless of how many items exist or how correctly `_menu_item_at_y` is bounded --
+indistinguishable from "tapped outside everything," closing the menu on release. `touch_x_start`
+(the swipe-detection baseline) had the same latent gap for the same reason. Fixed: both are now set
+on whichever frame first produces a real point, not necessarily the literal first frame, and
+`touch_x`/`touch_y` both keep updating on every later frame a valid point comes back, matching what
+`touch_x` already did on its own. Both fixes are needed together -- neither alone was sufficient,
+which is exactly why the symptom looked identical before and after the first fix alone. Not yet
+confirmed live.
+
+### Power-off screen flashing at boot (found + fixed 2026-08-01)
+User-reported: "it goes to the power off screen before the menu screen. it's not powered off."
+An earlier, unrelated doc note ([docs/ota.md](ota.md)'s "Known-noisy diagnostic prints") had
+attributed a similar-sounding report to OTA's network-timeout investigation -- that conclusion
+was wrong and didn't hold up under actual investigation. Two independent, confirmed causes:
+
+1. **`state.py`'s `AVRState.__init__` defaults `self.power = "STANDBY"`**, with no "not yet known"
+   sentinel distinguishing "haven't polled yet" from "genuinely off." Any render that happens
+   before the first real status poll lands will show the power-off screen, because that default
+   is indistinguishable from a real reading.
+2. **`denon.py`'s `get_status()` used to silently convert any unparseable power reading into
+   `"STANDBY"`** -- `raw_power = _tag(power_block, "zone1") or "STANDBY"`, then `if power not in
+   ("ON", "OFF"): power = "STANDBY"` again. A missing `<zone1>` tag or a truncated/malformed
+   response (boot is this codebase's most heap-fragmented, most truncation-prone moment -- see
+   "CircuitPython heap/boot-memory guardrails" below) got silently smoothed into a real, definite-
+   looking "STANDBY" instead of raising -- so a genuinely truncated first poll would show the
+   power-off screen, then correct itself a few seconds later once a clean poll landed, exactly
+   matching the reported symptom. Fixed: an unparseable power value now raises `RuntimeError`
+   instead, routing through `_poll_now()`'s existing retry/error-count path (confirmed to already
+   handle this correctly: no render happens on a failed poll, and `loop.first_poll` correctly
+   stays `True` until a poll actually succeeds) rather than fabricating a wrong-but-plausible
+   answer.
+3. **`app.py`'s `_retry_presets()` rendered unconditionally** the moment preset names arrived,
+   with no check on `loop.first_poll` -- and its own short retry interval could genuinely fire
+   before the first real status poll completes, painting the power-off screen from the still-
+   default `state.power`. This is universal across backends (every backend boots with the
+   fabricated "STANDBY" default until its own first poll lands), not denon-specific like #2.
+   Fixed by gating that render on `not loop.first_poll`.
+
+All three landed together; #2 and #3 are independent triggers for the same underlying exposure (#1)
+and both needed fixing since either alone can cause the flash. Not yet confirmed live.
+
 ## Configuration (settings.toml)
 
 `src/settings.toml` (gitignored). Template: `src/settings.toml.template` -- treat that file as the
@@ -240,7 +311,8 @@ The app once failed to boot on real hardware (`MemoryError` allocating the ~28.8
 sometimes surfacing instead as a WiFi connect hang/failure depending on exactly how the heap
 fragmented that boot) purely because the codebase had grown past a memory cliff on the ESP32-S3 --
 not any single bug. Fixed via `.mpy` precompilation + splitting `code.py` down to a thin entry
-point; see `Makefile` (`deploy-mpy` target) and `app.py`'s header comment for the mechanics. The
+point; see `Makefile` (`deploy` target -- renamed from `deploy-mpy` at some point after this was
+written, see "Current Stack Decision" above) and `app.py`'s header comment for the mechanics. The
 lasting rules that came out of it:
 
 - **CircuitPython compiles a module's *entire* bytecode before running any of it**, and holds it
@@ -253,7 +325,7 @@ lasting rules that came out of it:
   boot entry point), so it's the one file that can never be `.mpy`-compiled. Real logic belongs in
   `app.py` or another importable module. If `code.py` grows past a few lines again, that's a
   regression -- move the new code, don't leave it there.
-- **`.mpy`-compile everything else** (`make deploy-mpy`) before treating a boot-memory question as
+- **`.mpy`-compile everything else** (`make deploy`) before treating a boot-memory question as
   answered. Needs `local/mpy-cross`, version-matched to the device's exact CircuitPython build
   (`cat /Volumes/CIRCUITPY/boot_out.txt`) -- the generic `pip install mpy-cross` package targets
   vanilla MicroPython and produces `.mpy` files this device won't load; get the real one from
@@ -317,9 +389,34 @@ matching fix, `power_management = NONE`, the version-display UI fix) is uncommit
 `ota` branch. See [docs/ota.md](ota.md) for the full design rationale, the reliability
 investigation's findings (real, sourced, not network hand-waving), and exactly what's still open.
 
-The app boots and connects cleanly on real hardware, both `denon` and `ha` configs. `make
-deploy-mpy` is what the device should run day to day; plain `make deploy` is for fast dev
+The app boots and connects cleanly on real hardware, both `denon` and `ha` configs. `make deploy`
+(`.mpy`-compiled) is what the device should run day to day; `make deploy-src` is for fast dev
 iteration only (no `mpy-cross` needed) and should not be mistaken for the shipped configuration.
+
+**Update, 2026-08-01, post-merge live testing:** merging today's OTA hardening (PR #10) triggered
+`v6`. Testing it live surfaced a real boot-loop bug (a failed check's retry path could exhaust
+memory badly enough that even the failure-recovery NVM write failed, leaving the pending-action
+flag stuck and looping forever) -- root-caused and fixed same-day, see
+[docs/ota.md](ota.md)'s "Reliability investigation" -> "Resolved 2026-08-01". Confirmed live that
+the loop itself is fixed. But the same failed-check sequence then left the heap fragmented enough
+that the *next normal boot* failed its own `dial_ui.init()` allocation (`MemoryError`, 28800
+bytes) -- the same historical class of bug as "CircuitPython heap/boot-memory guardrails" above,
+now newly triggered by OTA network activity leaving state that survives a `supervisor.reload()`.
+Mitigated (disabling the WiFi radio before reload, unconfirmed whether fully sufficient) -- see
+that guardrails section and `docs/ota.md` for details.
+
+**The actual headline finding, same day:** the real reason OTA had reportedly never once
+succeeded, before any of the above -- `import app` alone pulled in the entire device-driver stack
+(`driver.py`/`dial_ui.py`/the active backend) regardless of which branch `main()` took, leaving
+only ~30KB free by the time a Check Now/Install Update tried a TLS handshake to GitHub -- which
+fails outright with a `MemoryError` at that level, independent of `adafruit_requests`, headers, or
+retry logic (all real, legitimate fixes above, none of which were the deciding factor -- confirmed
+by re-testing the headers fix through the real code path and watching it fail identically). Fixed
+by splitting OTA into its own `ota_boot.py` module that `code.py` imports *instead of* `app.py`
+when an OTA action is pending, so the backend stack is never imported at all for that boot. See
+[docs/ota.md](ota.md)'s "The real root cause: app.py's own imports" for the full isolation.
+**Not yet confirmed on real hardware** -- implemented and syntax-checked only; testing this is the
+immediate next step, and the number to watch is `gc.mem_free()` right before the network call.
 
 All five backends are implemented against the same
 pluggable-driver contract; Denon and MiniDSP are verified against real hardware (AVR-X4800H,

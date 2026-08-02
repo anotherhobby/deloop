@@ -205,6 +205,28 @@ OTA_CHECK_TIMEOUT_MS   = int(os.getenv("OTA_CHECK_TIMEOUT", "10000"))
 # it has been, same as every other backend's *_TIMEOUT_MS constants here.
 OTA_INSTALL_TIMEOUT_MS = int(os.getenv("OTA_INSTALL_TIMEOUT", "60000"))
 
+# NVM byte indices for the OTA action/result/version flags -- shared between
+# app.py (normal-mode UI: reads result/version, writes a pending action to
+# trigger a reload) and ota_boot.py (the actual lean network/install pass).
+# Defined once here, in the one module both already import, so they can
+# never drift apart. Bytes 0/1 are used elsewhere (brightness/sound, see
+# app.py) -- not redefined here since only app.py touches those.
+NVM_OTA_ACTION  = 2   # 0=idle, 1=pending check, 2=pending install
+NVM_OTA_RESULT  = 3   # 0=none, 1=available, 2=up_to_date, 3=check_error,
+                      # 4=install_ok, 5=install_failed, 6=eject_needed
+NVM_OTA_VERSION = 4   # latest version found by a check (valid when result==1)
+
+# Dev-only: read by boot.py to decide whether to call
+# storage.disable_usb_drive() -- lets Install Update's storage.remount()
+# succeed without physically ejecting/reconnecting CIRCUITPY for every
+# test, while keeping the USB serial console (REPL/prints) fully available.
+# Toggle via `make usb-drive-off`/`make usb-drive-on` (see Makefile) --
+# both require a hard reset to take effect, since boot.py only runs then.
+# Has zero effect on production/normal use: unset (0, the erased-flash
+# default reads as 255 but boot.py only acts on an exact 1) means
+# CIRCUITPY mounts exactly as it always has.
+NVM_USB_DRIVE_DISABLED = 5
+
 # Polling interval -- display state is truth; poll is error correction only
 POLL_INTERVAL_S  = float(os.getenv("POLL_INTERVAL", "30.0"))
 POLL_INTERVAL_MS = int(POLL_INTERVAL_S * 1000)
