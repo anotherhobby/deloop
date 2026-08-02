@@ -27,9 +27,11 @@ volume changes from outside the Dial.
 
 ## Build / deploy / test
 
-- `make deploy` -- fast dev iteration: plain `.py` copy to CIRCUITPY, no `mpy-cross` needed.
-- `make deploy-mpy` -- precompiles everything except `code.py` to `.mpy`; this is what the device
-  should actually run day to day (see boot-memory guardrails in docs/architecture.md).
+- `make deploy` -- what the device should run day to day: precompiles everything except `code.py`
+  to `.mpy` first (low heap footprint at boot). `make deploy-src` is the plain, uncompiled `.py`
+  copy for fast iteration when `local/mpy-cross` isn't available -- **not** the day-to-day command,
+  despite the name similarity. Confirm against the Makefile itself if in doubt; these target names
+  changed once already (see [docs/hardware.md](../docs/hardware.md)'s "Deployment Goal").
 - `make shell` -- opens an `mpremote` REPL over USB for live debugging.
 - Flashing CircuitPython onto new hardware: see [docs/hardware.md](../docs/hardware.md).
 

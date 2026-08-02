@@ -45,7 +45,18 @@ except ImportError:
     _BT = False
 
 import config
-import driver as _driver
+# driver is deliberately NOT imported at module level. Every function that
+# needs it (media tap-zones, draw_status_rows, draw_main, draw_busy) does
+# its own local `import driver as _driver`; Python caches the import so
+# this costs nothing extra once it's genuinely needed. This was an early
+# attempt at fixing the OTA memory problem investigated 2026-08-01 (see
+# docs/ota.md's "Reliability investigation") -- it turned out NOT to be
+# the actual fix, since app.py's own top-level `import driver` (separate
+# from dial_ui.py's) meant the backend stack got imported regardless. The
+# real fix was moving OTA's network/install logic into its own ota_boot.py
+# module that never imports dial_ui.py (or driver.py, or app.py) at all --
+# see ota_boot.py's docstring. Left in place anyway since it's still a
+# real, harmless reduction in what importing dial_ui.py alone costs.
 
 # ── Screen ────────────────────────────────────────────────────────────────────
 CX = CY = 120
@@ -284,16 +295,19 @@ def media_status_tap(x, y):
     """True if (x, y) falls within the play/pause status-text row. Only
     meaningful when state.media_state is "playing"/"paused" -- see
     app.py's _tap_main_screen, which checks that first."""
+    import driver as _driver
     return _driver.ui_impl is not None and _driver.ui_impl.media_status_tap(x, y)
 
 
 def media_prev_tap(x, y):
     """True if (x, y) falls on the '<<' skip-back icon."""
+    import driver as _driver
     return _driver.ui_impl is not None and _driver.ui_impl.media_prev_tap(x, y)
 
 
 def media_next_tap(x, y):
     """True if (x, y) falls on the '>>' skip-forward icon."""
+    import driver as _driver
     return _driver.ui_impl is not None and _driver.ui_impl.media_next_tap(x, y)
 
 
@@ -301,6 +315,7 @@ def menu_standby_tap(x, y):
     """True if (x, y) falls within the power-off screen's centered MENU
     zone. Only meaningful when driver.CAPS["player_select"] -- see app.py's
     _dispatch_tap, which checks that first."""
+    import driver as _driver
     return _driver.ui_impl is not None and _driver.ui_impl.standby_menu_tap(x, y)
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
@@ -790,6 +805,7 @@ def _draw_status_rows(ui, state, dim_color):
     draw_status_rows() swaps in a two-row layout (device name up top,
     Playing/Paused below it) plus the skip icons; see that module for why.
     """
+    import driver as _driver
     if _driver.ui_impl is not None:
         _driver.ui_impl.draw_status_rows(ui, state, dim_color)
         return
@@ -999,6 +1015,7 @@ def init():
 
 def draw_main(ui, state):
     """Render current AVRState to the display."""
+    import driver as _driver
     ui["status"].text = ""
     for ml in ui["items"]:
         ml.text = ""
@@ -1047,6 +1064,7 @@ def draw_busy(ui, state):
     breathing effect, and the caller swaps back to normal color via
     draw_main() once the blocking call returns.
     """
+    import driver as _driver
     ui["status"].text = ""
     for ml in ui["items"]:
         ml.text = ""
