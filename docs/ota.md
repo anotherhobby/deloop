@@ -122,8 +122,11 @@ rather than silently reloading into a boot that's likely to fail.
 
 ### Versioning: fully automatic, never hand-chosen
 
-`.github/workflows/release.yml` triggers on **every push to `main`** (plus manual
-`workflow_dispatch`) -- not on a pushed tag. It computes the release version as
+`.github/workflows/release.yml` triggers on **push to `main`, filtered to `src/**`,
+`tools/build_release_manifest.py`, and the workflow file itself** (plus manual
+`workflow_dispatch`) -- not on a pushed tag, and not on docs/README/CLAUDE.md-only pushes, which
+don't change anything that ships to the device (added 2026-08-02 after a README-only push
+needlessly cut `v8`). It computes the release version as
 **`(highest existing vN tag) + 1`**, always, via `git tag -l 'v[0-9]*' | sed 's/^v//' | sort -n |
 tail -1`, then `gh release create vN --target $GITHUB_SHA --generate-notes`. `v1`-`v4` predate this
 workflow (hand-created, no assets) and are handled fine -- the version step just sees them as
