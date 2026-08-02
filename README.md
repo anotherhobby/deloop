@@ -35,6 +35,7 @@ If you decide you want to modify/extend the deloop code, this file will make Cla
 - Runs on [CircuitPython](https://circuitpython.org/board/m5stack_dial/)
 - Pluggable device backend (`src/driver.py`) -- see [Device backends](#device-backends)
 - Note that deloop is not currently designed to support displaying and/or switching Audyssey filters on Deonon/Marantz.
+- Manual over-the-air updates directly from this GitHub repo (not a phone-home or update server) thru the Menu.
 
 ## User Interface
 
