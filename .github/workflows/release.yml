@@ -21,6 +21,14 @@ name: Build and publish deloop release
 on:
   push:
     branches: [main]
+    # Only paths that actually change what ships to the device -- docs/README/
+    # CLAUDE.md pushes to main should not burn a version number. Keep this in
+    # sync with the compile step's module list and tools/build_release_manifest.py
+    # below if either changes.
+    paths:
+      - "src/**"
+      - "tools/build_release_manifest.py"
+      - ".github/workflows/release.yml"
   workflow_dispatch: {}
 
 # Serializes runs so two near-simultaneous triggers can't compute the same
