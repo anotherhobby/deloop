@@ -300,9 +300,10 @@ CAMILLADSP_PORT ?= $(shell grep '^CAMILLADSP_PORT' src/settings.toml 2>/dev/null
 probe-camilladsp:
 	$(PYTHON) tools/probe_camilladsp.py --host $(CAMILLADSP_HOST) --port $(or $(CAMILLADSP_PORT),1234) $(PROBE_ARGS)
 
-# Run the host-side GitHub Releases probe (no device/daemon needed -- just
-# network access to github.com). Confirms release/manifest/asset shapes
-# against the real repo before ota.py's assumptions are trusted.
+# Run the host-side GitHub Release sanity check (no device/daemon needed --
+# just network access to github.com). Confirms the changelog/history
+# release release.yml published has the expected release/manifest/asset
+# shapes -- the device's own update path is S3, see src/ota.py.
 # Usage: make probe-ota
 OTA_REPO ?= $(shell grep '^OTA_REPO' src/settings.toml 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
 probe-ota:

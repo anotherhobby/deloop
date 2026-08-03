@@ -48,15 +48,13 @@ import config
 # driver is deliberately NOT imported at module level. Every function that
 # needs it (media tap-zones, draw_status_rows, draw_main, draw_busy) does
 # its own local `import driver as _driver`; Python caches the import so
-# this costs nothing extra once it's genuinely needed. This was an early
-# attempt at fixing the OTA memory problem investigated 2026-08-01 (see
-# docs/ota.md's "Reliability investigation") -- it turned out NOT to be
-# the actual fix, since app.py's own top-level `import driver` (separate
-# from dial_ui.py's) meant the backend stack got imported regardless. The
-# real fix was moving OTA's network/install logic into its own ota_boot.py
-# module that never imports dial_ui.py (or driver.py, or app.py) at all --
-# see ota_boot.py's docstring. Left in place anyway since it's still a
-# real, harmless reduction in what importing dial_ui.py alone costs.
+# this costs nothing extra once it's genuinely needed. Doesn't help OTA's
+# memory budget by itself, since app.py's own top-level `import driver`
+# (separate from dial_ui.py's) pulls in the backend stack regardless --
+# see ota_boot.py's module docstring for the actual fix (a separate boot
+# path that never imports dial_ui.py/driver.py/app.py at all). Kept anyway
+# since it's still a real, harmless reduction in what importing dial_ui.py
+# alone costs.
 
 # ── Screen ────────────────────────────────────────────────────────────────────
 CX = CY = 120

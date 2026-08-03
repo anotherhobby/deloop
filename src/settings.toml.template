@@ -111,11 +111,12 @@ AVR_HOST = "192.168.1.100"
 # CAMILLADSP_PRESET_TIMEOUT = "10000"
 
 # --- Self-update (optional) ---
-# Pulls new deloop app-file releases from GitHub -- NOT CircuitPython
-# firmware. Manual only: opens via the "Update" menu, nothing runs in the
-# background. See README.md "Updating deloop".
+# Pulls new deloop app-file releases from a flat S3 layout -- NOT
+# CircuitPython firmware. Manual only: opens via the "Update" menu, nothing
+# runs in the background. See README.md "Updating deloop" and docs/ota.md.
 # OTA_ENABLED = "true"
-# OTA_REPO = "anotherhobby/deloop"
+# OTA_S3_BASE = "https://deloop.s3.us-east-1.amazonaws.com"
+# OTA_REPO = "anotherhobby/deloop"  # CI-side GitHub Release only (changelog/history) -- device never reads this
 # OTA_CHECK_TIMEOUT = "10000"
 # OTA_INSTALL_TIMEOUT = "60000"
 

@@ -49,9 +49,8 @@ Read these on demand when a task touches them -- don't pull their content back i
   recipe for adding a 6th backend, hard lessons from Denon/MiniDSP/HA/WiiM/CamillaDSP, and each
   backend's protocol reference. Read before touching `driver.py` or any
   `<backend>.py`/`<backend>_ui.py`.
-- [docs/ota.md](../docs/ota.md) -- self-update (OTA) design, versioning workflow, and the
-  reliability investigation. Read before touching `ota.py`, `denon.py`'s retry logic, or `app.py`'s
-  OTA lean-mode/menu code.
+- [docs/ota.md](../docs/ota.md) -- self-update (OTA) design, versioning workflow, and S3 hosting.
+  Read before touching `ota.py`, `ota_boot.py`, or `app.py`'s Update-menu code.
 
 ## How these docs are maintained
 

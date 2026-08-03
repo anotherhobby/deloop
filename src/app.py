@@ -232,6 +232,8 @@ def _ota_update_items(loop):
     on the first normal boot after a check/install reload -- see main()."""
     if loop.ota_status == "available":
         return ["Install Update (v{})".format(loop.ota_latest_version), "Check Again"]
+    if loop.ota_status == "pending_power_cycle":
+        return ["Power cycle now\nto install v{}".format(loop.ota_latest_version), "Cancel"]
     if loop.ota_status == "up_to_date":
         return ["Up to date", "Check Again"]
     if loop.ota_status == "error":
@@ -301,9 +303,12 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop):
 
     Returns a truthy value to mean "stay open, refresh items" instead of
     the usual "close back to MODE_MAIN" -- every branch below except
-    "update"'s check action implicitly returns None (falsy), so existing
-    behavior for every other sub_type is unchanged. Only "Check Now"/
-    "Check Again" needs to show a result in place rather than closing.
+    "update"'s Install/Cancel actions implicitly returns None (falsy), so
+    existing behavior for every other sub_type is unchanged. "Check Now"/
+    "Check Again" reload immediately and never return at all; "Install"
+    sets the pending action and stays open to show "power cycle now"
+    instead (see that branch's comment for why); "Cancel" clears the
+    pending action and closes normally.
     """
     if sub_type == "input":
         index, _ = state.input_names[sub_cursor]
@@ -361,15 +366,31 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop):
         items = _ota_update_items(loop)
         label = items[sub_cursor] if 0 <= sub_cursor < len(items) else ""
         if label.startswith("Install"):
+            # Deliberately does NOT reload itself -- see docs/ota.md's
+            # "wifi_inited is power-cycle-scoped" finding. The ESP-IDF WiFi
+            # stack's real init (esp_wifi_init(), netif/event-handler setup)
+            # only ever runs once per power cycle; every soft reload after
+            # that just re-enables the same already-initialized radio. A
+            # supervisor.reload() here would give ota_boot.run() a fresh
+            # Python VM but the SAME wifi state every other reload this
+            # power cycle has been reusing, which is less reliable than a
+            # genuine power cycle's first-ever use of a freshly
+            # re-initialized radio. code.py already reads NVM_OTA_ACTION
+            # before importing app.py/ota_boot, so simply leaving action=2
+            # set is enough -- the next real power-on picks it up
+            # automatically.
             _set_ota_action(2)
-            dial_ui.show_message(ui["display"], "Updating...")
-            import supervisor
-            supervisor.reload()   # never returns
+            loop.ota_status = "pending_power_cycle"
+            return True   # stay open, refresh items to show the new status
         elif label.startswith("Check"):
             _set_ota_action(1)
             dial_ui.show_message(ui["display"], "Checking...")
             import supervisor
             supervisor.reload()   # never returns
+        elif label == "Cancel":
+            _set_ota_action(0)
+            loop.ota_status = "idle"
+            # falls through, returns None -> closes back to MODE_MAIN
         # else: tapped/confirmed an inert informational row -- no-op, closes normally
 
 
@@ -455,7 +476,7 @@ class _Loop:
         # sub_type above: reset fresh every boot, surfaced once from NVM
         # (see main()) right after a check/install reload. Deliberately
         # not on AVRState -- that's the amp/DSP model, this is not.
-        self.ota_status          = "idle"   # idle|available|up_to_date|error|eject_needed|just_installed|just_failed
+        self.ota_status          = "idle"   # idle|available|pending_power_cycle|up_to_date|error|eject_needed|just_installed|just_failed
         self.ota_latest_version  = None
 
 
@@ -1439,7 +1460,12 @@ def main():
             5: "just_failed",
             6: "eject_needed",
         }.get(_result, "idle")
-        if _result == 1:
+        if _result in (1, 5):
+            # 1 (available): "Install Update (vN)". 5 (just_failed): "Install
+            # failed" -- tapping either starts with "Install" in
+            # _confirm_sub, which now shows "Power cycle now to install vN"
+            # (see that branch's comment), so both need the version number
+            # populated, not just the first-check-ever case.
             loop.ota_latest_version = _ota_latest_version()
         _set_ota_result(0)
 

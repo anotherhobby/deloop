@@ -1,41 +1,26 @@
 # ota_regression_check.py -- on-device regression check for src/ota.py's
-# real install sequence (release fetch -> minimal metadata extraction ->
-# manifest resolve+fetch -> every real asset resolved+downloaded+verified).
+# real install sequence (latest.json fetch -> manifest fetch -> every real
+# asset downloaded+verified).
 #
 # This is NOT a host-side test (see tools/probe_ota.py for that -- it only
-# checks GitHub's response *shapes* from a Mac, never touches this
-# project's actual Fetcher/session code). This script runs ON THE DEVICE,
-# using the real config.WIFI_SSID/PASS and the real ota.py/ota_boot.py
-# already deployed there, exercising the exact same call sequence
-# ota.apply() uses -- release fetch, _asset_url_map() extraction, manifest
-# resolve+fetch, then every real asset in the current release, resolved
-# and downloaded for real -- but stops short of ota.apply()'s final
-# os.rename() commit step, so a full pass never overwrites the files
-# actually running on the device.
-#
-# Exists because of a real regression (found + fixed 2026-08-02, see
-# docs/ota.md's "The real, final root cause" section): ota.apply() used
-# to keep the ENTIRE parsed GitHub release JSON (~53KB for this project's
-# ~17-asset release) referenced for the whole file-download loop, even
-# though only each asset's name/browser_download_url is ever read again.
-# That held memory (confirmed live via gc.mem_free() at each step, not
-# assumed) starved the file-download loop of the headroom it needed,
-# producing OSError -12288 partway through -- the fix (_asset_url_map())
-# extracts only what's needed and lets the full object be garbage
-# collected immediately. This script exists so that regression is
-# checkable again with one command instead of another multi-hour
-# real-hardware debugging session.
+# checks the CI-side GitHub Release's response *shapes* from a Mac, never
+# touches this project's actual Fetcher/session code). This script runs ON
+# THE DEVICE, using the real config.WIFI_SSID/PASS and the real
+# ota.py/ota_boot.py already deployed there, exercising the exact same
+# call sequence ota.apply() uses -- latest-version fetch, manifest fetch,
+# then every real asset in that release downloaded for real -- but stops
+# short of ota.apply()'s final os.rename() commit step, so a full pass
+# never overwrites the files actually running on the device.
 #
 # Usage:
 #   make shell   # or otherwise get a REPL, then Ctrl-] to leave it and:
 #   ./.venv/bin/python -m mpremote connect auto run tools/ota_regression_check.py
 #
-# Run this after ANY change to ota.py/ota_boot.py's Fetcher, session, or
+# Run this after any change to ota.py/ota_boot.py's Fetcher, session, or
 # apply()/check_latest_version() internals -- a clean pass here is not a
 # substitute for testing the real Check Now / Install Update menu items
-# end to end at least once, but it catches the class of memory-retention
-# regression this file was written for far faster than a full manual
-# Install Update cycle (including the device UI/reload) would.
+# end to end at least once, but it's far faster to iterate on than a full
+# manual Install Update cycle (including the device UI/reload).
 
 import gc
 import os
@@ -53,7 +38,7 @@ def _log(msg):
 
 def main():
     if not config.WIFI_SSID:
-        _log("FAIL: no WIFI_SSID configured -- can't run against real GitHub")
+        _log("FAIL: no WIFI_SSID configured -- can't run against real S3")
         return False
 
     if not wifi.radio.connected:
@@ -64,19 +49,10 @@ def main():
 
     fetcher = ota._Fetcher(ota_boot._new_session)
 
-    release = ota._latest_release(fetcher)
-    latest = ota._parse_tag_version(release.get("tag_name"))
-    asset_urls = ota._asset_url_map(release)
-    release = None
-    gc.collect()
-    _log("release v{} fetched, {} assets, free mem: {}".format(
-        latest, len(asset_urls), gc.mem_free()))
+    latest = ota._latest_version(fetcher)
+    _log("latest.json fetched, version {}, free mem: {}".format(latest, gc.mem_free()))
 
-    manifest_browser_url = asset_urls.get("manifest.json")
-    if manifest_browser_url is None:
-        _log("FAIL: release has no manifest.json asset")
-        return False
-    manifest_url = fetcher.resolve_download_url(manifest_browser_url, config.OTA_CHECK_TIMEOUT_MS)
+    manifest_url = ota._s3_url(latest, "manifest.json")
     manifest = fetcher.get_json(manifest_url, config.OTA_CHECK_TIMEOUT_MS)
     files = manifest.get("files") or []
     if not files:
@@ -96,13 +72,8 @@ def main():
             want_sha = entry["sha256"]
             want_size = entry["size"]
 
-            browser_url = asset_urls.get(path)
-            if browser_url is None:
-                _log("FAIL: release is missing an asset for manifest path {!r}".format(path))
-                return False
-
             gc.collect()
-            asset_url = fetcher.resolve_download_url(browser_url, config.OTA_INSTALL_TIMEOUT_MS)
+            asset_url = ota._s3_url(latest, path)
             dest = ota._STAGING_DIR + "/" + path
             got_sha = fetcher.download(asset_url, dest, config.OTA_INSTALL_TIMEOUT_MS)
             got_size = os.stat(dest)[6]
@@ -113,7 +84,7 @@ def main():
             _log("{}/{} {} OK, free mem: {}".format(i + 1, len(files), path, gc.mem_free()))
 
         ota._clear_staging()   # never committed -- see module docstring
-        _log("PASS: all {} files resolved, downloaded, and verified".format(len(files)))
+        _log("PASS: all {} files downloaded and verified".format(len(files)))
         return True
     finally:
         storage.remount("/", readonly=True)

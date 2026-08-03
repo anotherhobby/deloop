@@ -1,9 +1,10 @@
 # Builds and publishes a deloop OTA release automatically on every push to
 # main. The version number is never chosen by hand -- it's always
 # "highest existing vN release tag + 1" (see "Determine next version" below),
-# computed the same way no matter what triggered the run. Consumed by
-# src/ota.py on the device -- see its module docstring and CLAUDE.md's OTA
-# section for the full design.
+# computed the same way no matter what triggered the run. Publishes the
+# real release assets to S3 (config.OTA_S3_BASE) for the device to fetch,
+# plus a GitHub Release for changelog/history -- see docs/ota.md and
+# src/ota.py's module docstring for the full design.
 #
 # Also runnable manually (Actions tab -> "Run workflow", or `gh workflow run
 # release.yml`) for a release with no new commit -- same version-computation
@@ -39,6 +40,7 @@ concurrency:
 
 permissions:
   contents: write
+  id-token: write   # required for the AWS OIDC role assumption below (no stored keys)
 
 env:
   # Must match the CircuitPython build actually running on the device
@@ -114,3 +116,25 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
           gh release create "$TAG" --target "$GITHUB_SHA" --generate-notes
           gh release upload "$TAG" dist/* --clobber
+
+      # The device's real update path -- config.OTA_S3_BASE. The GitHub
+      # Release above is changelog/history only; the device never talks to
+      # GitHub.
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::223166783801:role/GHADeloop
+          aws-region: us-east-1
+
+      - name: Upload release to S3
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          aws s3 sync dist/ "s3://deloop/v${VERSION}/"
+
+      # Written LAST, only after every versioned asset above finished
+      # uploading -- ota.py's _latest_version() reads this, so a device can
+      # never observe "latest" pointing at a partially-uploaded version.
+      - name: Publish latest.json
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "{\"version\": ${VERSION}}" | aws s3 cp - s3://deloop/latest.json --content-type application/json
