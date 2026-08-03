@@ -6,13 +6,11 @@ See [docs/hardware.md](hardware.md) for physical/flashing details, and
 [docs/device-drivers.md](device-drivers.md) for the pluggable backend architecture and each
 backend's protocol reference.
 
-Last updated: 2026-08-01 (v2.4 -- self-update (OTA) added: deloop can now pull app-file releases
-from GitHub over Wi-Fi via a manual Update menu, live `storage.remount()` + `supervisor.reload()`
-only (never a hard reset -- see why below), with a fully automated "merge to main = new release"
-versioning workflow. Check Now is confirmed working live but not yet 100% reliable on a single
-attempt against GitHub's WAN round trip; Install Update hasn't been re-tested since the latest
-reliability hardening; none of today's OTA hardening work is committed yet -- see
-[docs/ota.md](ota.md) for the full story and its own "Status as of this writing".)
+Last updated: 2026-08-03 (v2.5 -- self-update (OTA) now fetches from a flat S3 layout: deloop can
+pull app-file releases over Wi-Fi via a manual Update menu, live `storage.remount()` +
+`supervisor.reload()` only (never a hard reset -- see why below), with a fully automated "merge to
+main = new release" versioning workflow. Confirmed live, real hardware, full 16-file Install Update
+through the real menu path -- see [docs/ota.md](ota.md) for the full design.)
 
 This file (now `docs/architecture.md`) captures the current project discussion so a future agent
 session can build a full project plan without needing the whole conversation repeated. It moved
@@ -108,12 +106,12 @@ deloop/
     state.py          # in-memory device state model
     sound.py          # piezo click feedback
     config.py         # settings.toml loader/defaults
-    ota.py             # self-update: check/download/verify/install a GitHub Release --
+    ota.py             # self-update: check/download/verify/install a release from S3 --
                       # see docs/ota.md. Pure network+filesystem, no NVM/reset.
     ota_boot.py          # code.py imports THIS instead of app.py when an OTA action is
-                      # pending -- never imports driver.py/dial_ui.py/the backend module.
-                      # Added 2026-08-01; see docs/ota.md for why (a memory-budget bug that
-                      # every earlier OTA "fix" this same day had missed).
+                      # pending -- never imports driver.py/dial_ui.py/the backend module,
+                      # since importing those alone leaves too little free memory for a
+                      # reliable TLS handshake. See docs/ota.md.
     version.py          # CURRENT_VERSION placeholder (real value baked in by the release
                       # workflow, never committed back)
     settings.toml.template
@@ -122,7 +120,7 @@ deloop/
     probe_minidsp.py   # host-side minidsp-rs HTTP API probe
     probe_ha.py        # host-side HA REST API probe
     probe_wiim.py      # host-side WiiM/LinkPlay HTTPS API probe
-    probe_ota.py        # host-side GitHub Releases probe
+    probe_ota.py        # host-side sanity check for the CI-published GitHub Release
     build_release_manifest.py   # builds manifest.json from a built dist/ dir (make build-manifest)
     dump_denonavr.py
     dial_sim.py        # renders dial_ui.py off-device to PNGs (make renders)
@@ -241,6 +239,25 @@ on whichever frame first produces a real point, not necessarily the literal firs
 which is exactly why the symptom looked identical before and after the first fix alone. Not yet
 confirmed live.
 
+**Still broken, confirmed by real extended use (2026-08-02) -- both fixes above were NOT
+sufficient, and this is not up for debate: 100% reproducible for the user, predates this entire
+session, real.** Symptom as reported directly: opening the top-level menu itself routinely takes
+"tons of tries" before it registers at all, and tapping any item in a short (1-2 row) submenu --
+Update's "Check Now"/"Check Again" specifically named -- reliably fails to register and drops back
+to the main screen instead. This was initially, wrongly, attributed to `mpremote exec` calls
+interrupting `app.py` mid-session during live debugging in the same conversation that's the source
+of most of this doc's OTA-adjacent findings -- that theory does not hold: the user confirms this
+predates that debugging session entirely and is unrelated to it. **Do not re-open the question of
+whether this is real; it is confirmed, reproducible, and actively degrades the device day to day.**
+Not yet root-caused. Candidates not yet checked: whether a blocking call elsewhere in the main loop
+(an AVR poll taking longer than expected, `_auto_close_menu`, `_pulse_mute`, or something in the
+FocalTouch I2C read path) is stealing touch-poll frames often enough to feel like "tons of tries";
+whether the touch_y/touch_x_start fix above has its own remaining gap; or something else in
+`_handle_touch`/`_handle_touch_down`/`_dispatch_tap` not yet identified. This needs real,
+instrumented live investigation (prints on every touch-poll frame showing `touch_ok`/`is_touched`/
+`touch_y` over a real tap sequence), not another read-through of code that already looked correct
+once before and wasn't.
+
 ### Power-off screen flashing at boot (found + fixed 2026-08-01)
 User-reported: "it goes to the power off screen before the menu screen. it's not powered off."
 An earlier, unrelated doc note ([docs/ota.md](ota.md)'s "Known-noisy diagnostic prints") had
@@ -302,7 +319,7 @@ per-driver `VOLUME_MIN`/`VOLUME_MAX` defaults, the `MINIDSP_*` keys (`HOST`, `PO
 `PORT`, `TOKEN`, `ENTITY_ID`, `TIMEOUT`), and the `WIIM_*` keys (`HOST`, `TIMEOUT`, `INPUTS`) --
 see `settings.toml.template` for current defaults and comments on each.
 
-As of v2.4, `config.py` also has `OTA_ENABLED`/`OTA_REPO`/`OTA_CHECK_TIMEOUT_MS`/
+`config.py` also has `OTA_ENABLED`/`OTA_S3_BASE`/`OTA_REPO`/`OTA_CHECK_TIMEOUT_MS`/
 `OTA_INSTALL_TIMEOUT_MS`, orthogonal to `DEVICE_DRIVER` -- see [docs/ota.md](ota.md).
 
 ## CircuitPython heap/boot-memory guardrails (read before touching boot-path code)
@@ -346,15 +363,11 @@ lasting rules that came out of it:
 
 ## Suggested Prompt For Next Session
 
-> Most recent/pressing: read [docs/ota.md](ota.md) in full before touching `ota.py`, `denon.py`'s
-> retry logic, or `app.py`'s OTA lean-mode/menu code -- especially its "reliability investigation"
-> subsection before changing any retry logic. Two concrete next steps, in order: (1) commit and
-> merge today's OTA hardening work (currently uncommitted on the `ota` branch -- see that doc's
-> "Status as of this writing"), which will itself trigger a new automated release; (2) run a full
-> Install Update end-to-end against current code, since it hasn't been re-tested since the
-> retry/session-rebuild rewrite touched that exact path. Separately, the presets-retry fix
-> (`_retry_presets()` in `app.py`, unrelated to OTA) is deployed but not yet confirmed live from a
-> genuine boot-time failure.
+> Read [docs/ota.md](ota.md) before touching `ota.py`/`ota_boot.py`'s Fetcher/session logic or
+> `app.py`'s Update-menu code. OTA is implemented and confirmed working end to end on real
+> hardware, fetching from S3 -- see that doc for the design. Separately (unrelated to OTA), the
+> real, 100%-reproducible touch/menu responsiveness bug documented below under "Still broken,
+> confirmed by real extended use" remains open and needs real, instrumented live investigation.
 >
 > Read "CircuitPython heap/boot-memory guardrails" above before touching boot-path code (`app.py`'s
 > `main()`), `.mpy` deploy tooling, or the `driver.py`/`ha_ui.py`/`wiim_ui.py` UI-extension split.
@@ -379,44 +392,14 @@ lasting rules that came out of it:
 
 ## Current Recommendation
 
-**Self-update (OTA)**, added 2026-07-31/08-01: implemented, and Check Now is confirmed working
-live on real hardware from a genuine cold boot -- but not yet 100% reliable on a single attempt
-(occasional `ETIMEDOUT` against GitHub's WAN round trip, always recoverable by retrying, never a
-hang/crash/loop). Install Update has real, correct release assets to install against (`v5`,
-confirmed) but hasn't been run end-to-end since the retry/session-rebuild reliability work landed --
-that's the top open item. All of today's OTA hardening (the `_Fetcher` retry rewrite, `denon.py`'s
-matching fix, `power_management = NONE`, the version-display UI fix) is uncommitted, sitting on the
-`ota` branch. See [docs/ota.md](ota.md) for the full design rationale, the reliability
-investigation's findings (real, sourced, not network hand-waving), and exactly what's still open.
+**Self-update (OTA)**: implemented and confirmed working end to end on real hardware -- Check Now
+and a full 16-file Install Update both succeed through the real Update menu, fetching from S3. See
+[docs/ota.md](ota.md) for the full design (architecture, versioning, S3 layout, the power-cycle
+requirement for Install Update, and known deferred limitations).
 
 The app boots and connects cleanly on real hardware, both `denon` and `ha` configs. `make deploy`
 (`.mpy`-compiled) is what the device should run day to day; `make deploy-src` is for fast dev
 iteration only (no `mpy-cross` needed) and should not be mistaken for the shipped configuration.
-
-**Update, 2026-08-01, post-merge live testing:** merging today's OTA hardening (PR #10) triggered
-`v6`. Testing it live surfaced a real boot-loop bug (a failed check's retry path could exhaust
-memory badly enough that even the failure-recovery NVM write failed, leaving the pending-action
-flag stuck and looping forever) -- root-caused and fixed same-day, see
-[docs/ota.md](ota.md)'s "Reliability investigation" -> "Resolved 2026-08-01". Confirmed live that
-the loop itself is fixed. But the same failed-check sequence then left the heap fragmented enough
-that the *next normal boot* failed its own `dial_ui.init()` allocation (`MemoryError`, 28800
-bytes) -- the same historical class of bug as "CircuitPython heap/boot-memory guardrails" above,
-now newly triggered by OTA network activity leaving state that survives a `supervisor.reload()`.
-Mitigated (disabling the WiFi radio before reload, unconfirmed whether fully sufficient) -- see
-that guardrails section and `docs/ota.md` for details.
-
-**The actual headline finding, same day:** the real reason OTA had reportedly never once
-succeeded, before any of the above -- `import app` alone pulled in the entire device-driver stack
-(`driver.py`/`dial_ui.py`/the active backend) regardless of which branch `main()` took, leaving
-only ~30KB free by the time a Check Now/Install Update tried a TLS handshake to GitHub -- which
-fails outright with a `MemoryError` at that level, independent of `adafruit_requests`, headers, or
-retry logic (all real, legitimate fixes above, none of which were the deciding factor -- confirmed
-by re-testing the headers fix through the real code path and watching it fail identically). Fixed
-by splitting OTA into its own `ota_boot.py` module that `code.py` imports *instead of* `app.py`
-when an OTA action is pending, so the backend stack is never imported at all for that boot. See
-[docs/ota.md](ota.md)'s "The real root cause: app.py's own imports" for the full isolation.
-**Not yet confirmed on real hardware** -- implemented and syntax-checked only; testing this is the
-immediate next step, and the number to watch is `gc.mem_free()` right before the network call.
 
 All five backends are implemented against the same
 pluggable-driver contract; Denon and MiniDSP are verified against real hardware (AVR-X4800H,

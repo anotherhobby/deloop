@@ -193,16 +193,24 @@ CAMILLADSP_QUICK_PRESETS = _parse_camilladsp_quick_presets(
     os.getenv("CAMILLADSP_QUICK_PRESETS", ""), CAMILLADSP_PRESETS)
 
 # OTA self-update settings -- orthogonal to DEVICE_DRIVER, see ota.py. This
-# updates deloop's own app files from a GitHub release, never CircuitPython
+# updates deloop's own app files from a flat S3 layout, never CircuitPython
 # firmware itself. Manual only: nothing here runs in the background -- the
 # Update menu's "Check Now"/"Install Update" are the only entry points. See
 # README.md's "Updating deloop" section.
 OTA_ENABLED            = _get_bool("OTA_ENABLED", True)
+# CI-side only (release.yml/tools/probe_ota.py) -- the changelog/history
+# GitHub Release published alongside each version. The device itself never
+# reads this; see OTA_S3_BASE below.
 OTA_REPO               = os.getenv("OTA_REPO", "anotherhobby/deloop")
+# Bucket the device fetches releases from -- config.OTA_S3_BASE + "/latest.json"
+# and ".../vN/<file>" (see ota.py's _s3_url()), a flat layout with no
+# redirects: every request lands on this one host directly.
+OTA_S3_BASE            = os.getenv("OTA_S3_BASE", "https://deloop.s3.us-east-1.amazonaws.com")
 OTA_CHECK_TIMEOUT_MS   = int(os.getenv("OTA_CHECK_TIMEOUT", "10000"))
-# Generous headroom for a ~15-file sequential download over Wi-Fi -- not yet
-# measured against real hardware (see CLAUDE.md's OTA section); revisit once
-# it has been, same as every other backend's *_TIMEOUT_MS constants here.
+# Per-file timeout for a real install's sequential downloads -- real
+# hardware measurements land well under this (largest file, ~14KB, took
+# ~12s including sha256 verification), so this is comfortable headroom,
+# not a tight budget.
 OTA_INSTALL_TIMEOUT_MS = int(os.getenv("OTA_INSTALL_TIMEOUT", "60000"))
 
 # NVM byte indices for the OTA action/result/version flags -- shared between

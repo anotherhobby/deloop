@@ -1,12 +1,12 @@
 """
-probe_ota.py -- Host-side GitHub Releases discovery tool for deloop's OTA
-self-update feature (src/ota.py).
+probe_ota.py -- Host-side sanity check for the GitHub Release release.yml
+publishes alongside each version (changelog/history only -- the device's
+real update path is S3, see src/ota.py's module docstring).
 
-Run this on your Mac (not the device) against the real repo to confirm the
-exact response shapes ota.py expects before trusting them on-device: the
-releases/latest JSON, the manifest.json asset, and one representative
-release asset's download. No device or daemon needed -- just network
-access to github.com.
+Run this on your Mac (not the device) against the real repo to confirm a
+release's assets are what's expected: the releases/latest JSON, the
+manifest.json asset, and one representative release asset's download. No
+device or daemon needed -- just network access to github.com.
 
 Usage:
     python tools/probe_ota.py --repo anotherhobby/deloop
@@ -97,13 +97,10 @@ def probe_one_asset(release: dict, manifest: dict) -> None:
     print(f"  HTTP {resp.status_code}  Content-Type: {resp.headers.get('Content-Type')!r}")
     print(f"  {size} bytes in {elapsed:.2f}s  (manifest says size={files[0]['size']},"
           f" {'MATCH' if size == files[0]['size'] else 'MISMATCH'})")
-    print("  -> feeds OTA_INSTALL_TIMEOUT_MS sizing: measure real per-file latency,")
-    print("     don't guess (this is one file over a wired/Wi-Fi host connection,")
-    print("     not the device's own Wi-Fi -- a rough floor, not the real number).")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Probe deloop's GitHub Releases OTA source")
+    parser = argparse.ArgumentParser(description="Sanity-check deloop's published GitHub Release")
     parser.add_argument("--repo", required=True, help="owner/name, e.g. anotherhobby/deloop")
     parser.add_argument("--tag", default=None,
                         help="specific tag to probe (default: whatever /releases/latest returns)")
@@ -120,7 +117,7 @@ def main() -> None:
         print(f"\nFAIL: {exc}")
         sys.exit(1)
 
-    print("\n\nDone. Compare the shapes above against src/ota.py's assumptions.")
+    print("\n\nDone.")
 
 
 if __name__ == "__main__":

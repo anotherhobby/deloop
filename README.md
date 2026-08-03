@@ -35,7 +35,7 @@ If you decide you want to modify/extend the deloop code, this file will make Cla
 - Runs on [CircuitPython](https://circuitpython.org/board/m5stack_dial/)
 - Pluggable device backend (`src/driver.py`) -- see [Device backends](#device-backends)
 - Note that deloop is not currently designed to support displaying and/or switching Audyssey filters on Deonon/Marantz.
-- Manual over-the-air updates directly from this GitHub repo (not a phone-home or update server) thru the Menu.
+- Manual over-the-air updates via the Menu, self-hosted (not a third-party phone-home/update service).
 
 ## User Interface
 
@@ -152,7 +152,7 @@ After the first deploy, `make deploy` is the fast path for iterating on code cha
 | `probe-camilladsp` | Host-side WebSocket probe against a CamillaDSP process (`PROBE_ARGS=...`) |
 | `probe-ha`     | Host-side REST probe against a Home Assistant instance (`PROBE_ARGS=...`) |
 | `probe-wiim`   | Host-side HTTPS probe against a WiiM/LinkPlay streamer (`PROBE_ARGS=...`) |
-| `probe-ota`    | Host-side probe against GitHub Releases for the OTA feature (`PROBE_ARGS=...`) |
+| `probe-ota`    | Host-side sanity check for the CI-published GitHub Release (`PROBE_ARGS=...`) |
 | `build-manifest` | Build an OTA `manifest.json` locally from whatever `make deploy` last compiled, for testing before a real release |
 
 `fonts` and `renders` need the Inter font family locally -- it's not shipped with the project. Grab v4.1 from [github.com/rsms/inter/releases](https://github.com/rsms/inter/releases) and extract it to `local/Inter-4.1` (gitignored). Neither target is required for normal flashing/use, only for regenerating fonts or screenshots.
@@ -163,13 +163,13 @@ Settings live in `src/settings.toml` (see `src/settings.toml.template` for all a
 
 ## Updating deloop
 
-deloop can update its own app files over Wi-Fi from this repo's GitHub Releases, without plugging into a computer. This is **not** a CircuitPython firmware updater — it never touches the CircuitPython build itself, only the app files this repo's own `make deploy` ships.
+deloop can update its own app files over Wi-Fi from a flat S3 layout, without plugging into a computer. This is **not** a CircuitPython firmware updater — it never touches the CircuitPython build itself, only the app files this repo's own `make deploy` ships.
 
-- **Manual only.** deloop never checks for updates in the background. Open the on-screen **Update** menu, which shows the currently installed version, and tap **Check Now**. If a newer release is available, tap **Install Update** to download, verify, and apply it.
-- **How it actually runs.** Both actions do a `supervisor.reload()` (CircuitPython's own file-change-reload mechanism, not a hardware reset) into a lightweight mode that does the real network/filesystem work, then reload back to the normal screen with the result. The whole check-or-install happens live, in one pass — no reboot involved at all.
+- **Manual only.** deloop never checks for updates in the background. Open the on-screen **Update** menu, which shows the currently installed version, and tap **Check Now**. If a newer release is available, tap **Install Update** to download, verify, and stage it.
+- **How it actually runs.** Check Now does a `supervisor.reload()` (CircuitPython's own file-change-reload mechanism, not a hardware reset) into a lightweight mode that makes the real network call, then reloads back to the normal screen with the result. Install Update instead shows "Power cycle now to install" — the actual install runs on the next real power-on, so it always gets a freshly-initialized Wi-Fi radio for its longer download sequence. See `docs/ota.md` for why.
 - **The one dependency: if the Dial happens to be plugged into a computer with the drive actively mounted, eject it first.** Writing its own files requires the device to briefly take write access back from the host, which only works when the host isn't holding the drive open. If it's mounted, the Update menu will say so (`Eject drive first`) instead of failing silently.
-- **How releases are built.** Every push to `main` triggers a GitHub Actions workflow (`.github/workflows/release.yml`) that computes the next version (highest existing `vN` tag + 1 — versions are never hand-chosen), compiles every module to `.mpy` with a version-matched `mpy-cross`, builds a manifest, and publishes it all as a new GitHub Release. Nothing to do locally to publish a release beyond merging to `main`; it can also be re-run with no new commit from the Actions tab ("Run workflow").
-- **Settings** (`src/settings.toml.template`, "Self-update" section): `OTA_ENABLED` (kill switch — set `false` to hide the Update menu entirely), `OTA_REPO` (which GitHub repo to check, defaults to this one), and timeouts. None of these need changing for normal use.
+- **How releases are built.** Every push to `main` triggers a GitHub Actions workflow (`.github/workflows/release.yml`) that computes the next version (highest existing `vN` tag + 1 — versions are never hand-chosen), compiles every module to `.mpy` with a version-matched `mpy-cross`, builds a manifest, and publishes it to S3 (what the device fetches from) plus a GitHub Release (changelog/history only). Nothing to do locally to publish a release beyond merging to `main`; it can also be re-run with no new commit from the Actions tab ("Run workflow").
+- **Settings** (`src/settings.toml.template`, "Self-update" section): `OTA_ENABLED` (kill switch — set `false` to hide the Update menu entirely), `OTA_S3_BASE` (which bucket the device fetches from), and timeouts. None of these need changing for normal use.
 - **Safety.** Every file is downloaded and its checksum verified *before* any live file is touched — a failed or interrupted download never leaves a half-installed state. Worst case if something does go wrong: plug in USB and `make deploy` again, exactly like any other code update.
 
 ## Code layout
@@ -188,9 +188,9 @@ deloop can update its own app files over Wi-Fi from this repo's GitHub Releases,
 - `src/state.py` — in-memory model of device state, reconciled against periodic polls
 - `src/sound.py` — piezo buzzer click feedback for taps and menu actions
 - `src/config.py` — settings loader/defaults
-- `src/ota.py` — self-update: checks GitHub Releases, downloads and verifies a new release, installs it. Orthogonal to `DEVICE_DRIVER` — see "Updating deloop" above
+- `src/ota.py` — self-update: checks S3 for a new release, downloads and verifies it, installs it. Orthogonal to `DEVICE_DRIVER` — see "Updating deloop" above
 - `src/version.py` — deloop's own app version (a bare integer); overwritten by the release workflow, not meaningful in git history
-- `tools/` — host-side scripts used during development (AVR/minidsp-rs/HA/GitHub Releases protocol probing, font/splash generation, off-device screen rendering, OTA manifest building); not deployed to the device
+- `tools/` — host-side scripts used during development (AVR/minidsp-rs/HA/GitHub Release probing, font/splash generation, off-device screen rendering, OTA manifest building); not deployed to the device
 - `.github/workflows/release.yml` — builds and publishes a new OTA release on every push to `main` (version auto-incremented, never hand-chosen)
 - `local/` — gitignored, not shipped: the `mpy-cross` compiler binary, its `.mpy` build staging dir, the Inter font family download, and `make renders` output all land here
 
