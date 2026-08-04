@@ -253,6 +253,14 @@ PROBE_ARGS ?=
 probe:
 	$(PYTHON) tools/probe_denon.py --host $(AVR_HOST) --port $(AVR_PORT) $(PROBE_ARGS)
 
+# Host-side AVR latency/reliability check -- independent of the M5 Dial
+# entirely, so a bad run here is real evidence the AVR itself is the
+# problem rather than deloop/ESP32-side flakiness. See tools/avr_health_check.py.
+# Usage: make avr-health
+#        make avr-health PROBE_ARGS="--count 30 --timeout 2"
+avr-health:
+	$(PYTHON) tools/avr_health_check.py --host $(AVR_HOST) $(PROBE_ARGS)
+
 # Dump full AVR state using python-denonavr (same lib as Home Assistant).
 # Run once to discover API version, endpoint, and working command format.
 # Requires: ./.venv/bin/pip install denonavr
@@ -328,4 +336,24 @@ build-manifest:
 probe-ota-regression:
 	$(PYTHON) -m mpremote connect auto run tools/ota_regression_check.py
 
-.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression renders ui-renders
+# ON-DEVICE network-only stress test -- no dial_ui.py/rendering at all, just
+# continuous status polling + periodic commands over the real denon.py async
+# engine, with plain-text live stats on screen (no gauge bitmap). Isolates
+# networking behavior from rendering-caused memory pressure. Runs forever;
+# Ctrl-C or power cycle to stop. WARNING: toggles AVR mute periodically --
+# see tools/network_stress_check.py's docstring.
+network-stress:
+	$(PYTHON) -m mpremote connect auto run tools/network_stress_check.py
+
+# ON-DEVICE combined stress test -- real dial_ui.py rendering AND the real
+# denon.py networking engine running together, plus synthetic random-sized
+# bytearray churn to actively fragment the heap. Deliberately worse than the
+# real app (fixed-cadence redraws regardless of change, continuous alloc
+# noise) -- built to try to reproduce the rendering/networking interaction
+# instability that network-stress and avr-health each failed to reproduce in
+# isolation. Runs forever; Ctrl-C or power cycle to stop. WARNING: toggles
+# AVR mute periodically -- see tools/chaos_stress_check.py's docstring.
+chaos-stress:
+	$(PYTHON) -m mpremote connect auto run tools/chaos_stress_check.py
+
+.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe avr-health dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression network-stress chaos-stress renders ui-renders
