@@ -196,6 +196,28 @@ def _connect_wifi(ui):
     except Exception as e:
         print("power_management NONE failed:", type(e), e)
     wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
+    # TEMPORARY: AVR-unreachable investigation 2026-08-04. Confirmed live
+    # that a fresh power cycle associates and gets a DHCP lease, then every
+    # AVR request ETIMEDOUTs immediately -- while a Mac on the same flat /23
+    # reaches the AVR in 3-7ms. Printing the full lease (not just the
+    # address, which is all the title bar shows) to check the mask/gateway:
+    # a /24 lease on a /23 network would make AVR_HOST look off-subnet and
+    # route via a gateway that shouldn't be involved, timing out exactly
+    # like this. The AP/BSSID identifies which radio it actually joined,
+    # since a roam to an isolated AP would look identical from here.
+    try:
+        r = wifi.radio
+        ap = r.ap_info
+        print("wifi lease: ip=%s subnet=%s gw=%s dns=%s" % (
+            r.ipv4_address, r.ipv4_subnet, r.ipv4_gateway, r.ipv4_dns))
+        if ap is not None:
+            print("wifi ap: ssid=%s rssi=%s ch=%s bssid=%s" % (
+                ap.ssid, ap.rssi, ap.channel,
+                "".join("%02x" % b for b in ap.bssid)))
+        print("wifi target: AVR_HOST=%s port=%s port_ui=%s" % (
+            config.AVR_HOST, config.AVR_PORT, config.AVR_PORT_UI))
+    except Exception as e:
+        print("wifi lease print failed:", e)
 
 
 def _top_menu_entries():
