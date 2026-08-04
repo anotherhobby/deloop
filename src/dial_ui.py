@@ -258,12 +258,46 @@ def _preset_btn_rects(n):
     return rects
 
 
+# The quick-button HIT target is deliberately much larger than the drawn
+# button. The drawn square is _DBTN_W=22px -- about 3mm on this 240px 1.28"
+# panel, well under the ~7-9mm a fingertip reliably lands on. Confirmed live
+# 2026-08-04 by logging every tap's coordinate against the rects: aiming at
+# the first button (centre x=84) produced taps at x=63-69 and x=96-103, all
+# within ~20px of centre but all outside the 73-95 rect, so nothing happened
+# and the row read as "locked out" while volume and mute kept working.
+#
+# Widening is free here: app.py routes the whole PRESET_NAME_Y..MENU_TAP_Y
+# band (y 138-195) to this function and nothing else competes for it, so a
+# tap that misses every button currently does nothing at all.
+_DBTN_HIT_PAD_Y = 14                       # vertical slack around the drawn row
+_DBTN_HIT_MAX_DX = _DBTN_W + _DBTN_GAP // 2  # 29px: outward reach past the end buttons
+
+
 def preset_button_at(x, y, n):
-    """Return the tapped quick-select button index [0..n-1], or -1."""
-    for i, (x0, y0, x1, y1) in enumerate(_preset_btn_rects(n)):
-        if x0 <= x <= x1 and y0 <= y <= y1:
-            return i
-    return -1
+    """Return the tapped quick-select button index [0..n-1], or -1.
+
+    Nearest-button-within-tolerance rather than a strict rect test, so the
+    gaps between buttons aren't dead zones -- interior boundaries land on
+    the true midpoint between adjacent centres either way, while
+    _DBTN_HIT_MAX_DX additionally extends the reach past the outermost
+    buttons (see the note above for the measurements behind this).
+
+    n is capped at _DBTN_MAX because that's how many buttons are actually
+    drawn (_draw_preset_filter_buttons caps the same way). Without the cap a
+    longer preset list hit-tests against a layout that was never rendered --
+    the exact drawn-vs-tap-rect divergence driver.py's CAPS note warns about.
+    """
+    n = min(n, _DBTN_MAX)
+    if n <= 0:
+        return -1
+    if not (_DBTN_Y0 - _DBTN_HIT_PAD_Y <= y <= _DBTN_Y0 + _DBTN_H + _DBTN_HIT_PAD_Y):
+        return -1
+    best, best_dx = -1, None
+    for i, (x0, _y0, x1, _y1) in enumerate(_preset_btn_rects(n)):
+        dx = abs(x - (x0 + x1) // 2)
+        if best_dx is None or dx < best_dx:
+            best, best_dx = i, dx
+    return best if best_dx is not None and best_dx <= _DBTN_HIT_MAX_DX else -1
 
 
 # Play/pause status row -- shares the same text slot as the preset name
@@ -441,11 +475,101 @@ def _arc(bmp, a_start, a_end, r_in, r_out, color, step=1.0):
         a += step
 
 
-def _arc_solid(bmp, a_start, a_end, r_in, r_out, color):
+def _arc_solid_exact_row(bmp, y, dy, dx_out, dx_in, a_start, a_end2, wraps, color):
+    """Per-pixel atan2 test for one row -- _arc_solid()'s fallback for the
+    rare row where a boundary angle's tan() is unusable (see there)."""
+    is_grad = callable(color)
+    for xA, xB in ((CX - dx_out, CX - dx_in), (CX + dx_in, CX + dx_out)):
+        ci_run = -1
+        x_run  = xA
+        for x in range(max(0, xA), min(_W, xB + 1)):
+            dx = x - CX
+            a  = math.degrees(math.atan2(dx, -dy))
+            if a < 0.0:
+                a += 360.0
+            ok = (a >= a_start or a <= a_end2) if wraps else (a_start <= a <= a_end2)
+            arc_a = a if a >= a_start else a + 360.0
+            ci = (color(arc_a) if is_grad else color) if ok else -1
+            if ci != ci_run:
+                if ci_run >= 0:
+                    if _BT:
+                        _bt.fill_region(bmp, x_run, y, x, y + 1, ci_run)
+                    else:
+                        for xx in range(x_run, x):
+                            bmp[xx, y] = ci_run
+                ci_run = ci
+                x_run  = x
+        if ci_run >= 0:
+            xe = min(_W, xB + 1)
+            if _BT:
+                _bt.fill_region(bmp, x_run, y, xe, y + 1, ci_run)
+            else:
+                for xx in range(x_run, xe):
+                    bmp[xx, y] = ci_run
+
+
+def _arc_window_rows(a0, a1, r_in, r_out):
+    """Inclusive (y_lo, y_hi) row span the arc band between a0/a1 touches.
+
+    Lets a narrow-window _arc_solid() call skip rows it could never paint.
+    Without this, restoring the ~14-degree window behind the pointer still
+    walked all ~204 rows of the full annulus bounding box computing per-row
+    edge crossings -- measured at 118ms on hardware 2026-08-04
+    (tools/render_timing_fastpath.py), i.e. 83% of the whole incremental
+    redraw, for a window covering a few percent of the ring.
+
+    The band's vertical extremes are at the window's own endpoints unless it
+    straddles 12 or 6 o'clock (where cos peaks), so those crossings are
+    sampled too. Angles are used as given -- _axy() is happy with values
+    past 360, which _restore_region() produces near maximum volume.
+    """
+    ys = []
+    for a in (a0, a1):
+        for r in (r_in, r_out):
+            ys.append(_axy(r, a)[1])
+    a_lo, a_hi = (a0, a1) if a0 <= a1 else (a1, a0)
+    k = int(a_lo // 180.0) * 180
+    while k <= a_hi:
+        if k >= a_lo:
+            for r in (r_in, r_out):
+                ys.append(_axy(r, float(k))[1])
+        k += 180
+    return min(ys) - 1, max(ys) + 1
+
+
+def _arc_solid(bmp, a_start, a_end, r_in, r_out, color, y_lo=None, y_hi=None):
     """Scanline arc-band fill: every pixel covered exactly once, no artifacts.
 
-    For each row in the bounding box, computes the annulus x-span, checks each
-    pixel's angle with atan2, and flushes same-color runs with fill_region.
+    y_lo/y_hi optionally clamp the scanned row range (see _arc_window_rows);
+    default None scans the full annulus bounding box as before. Rows outside
+    the range are skipped entirely -- only safe when the caller knows the
+    requested angular window can't reach them, which is exactly what
+    _arc_window_rows() computes.
+
+    Row-boundary variant (2026-08-04): the only per-pixel angle test left is
+    a single atan2() at each filled segment's midpoint (to pick its color);
+    everything else -- deciding WHERE each row's color/sector boundaries
+    fall -- is a `dx = -dy * tan(edge_angle)` multiply using edge angles
+    (the sector's own a_start/a_end plus, for a gradient color, the 3 fixed
+    internal color-band angles) whose tan() is computed once per call, not
+    per pixel. Confirmed live: ~296ms -> a few ms for the full gauge sweep,
+    ~16x fewer atan2/degrees calls (measured via tools/profile_arc.py,
+    which renders both this and a reference implementation off-device and
+    diffs them -- a handful of boundary pixels at the sector's two open
+    ends can land 1px differently than the original per-pixel version;
+    confirmed visually negligible, not a gap/moire regression, before this
+    replaced the original per-pixel-everywhere implementation. See
+    tools/profile_arc.py's own docstring before touching this again --
+    trig-call count there is the number that actually transfers to
+    hardware, wall-clock on a Mac is not).
+
+    tan() blows up near +/-90° from a row's own reference angle -- rather
+    than special-case that algebra, any row where an edge angle's tan() is
+    unusable falls back whole-row to the original exact per-pixel test
+    (_arc_solid_exact_row()); those rows are rare-to-never for the actual
+    gauge geometry and this keeps that fallback path exactly as correct as
+    the previous implementation always was.
+
     Works for any arc range including those that cross the 0°/360° boundary.
     """
     r_out2  = r_out * r_out
@@ -454,7 +578,26 @@ def _arc_solid(bmp, a_start, a_end, r_in, r_out, color):
     a_end2  = a_end - 360.0 if wraps else a_end
     is_grad = callable(color)
 
-    for y in range(max(0, CY - r_out), min(_H, CY + r_out + 1)):
+    edges = [a_start, a_end]
+    if is_grad:
+        for frac in (_FRAC_AMBER, _FRAC_ORANGE, _FRAC_RED):
+            edges.append(_ARC_START + frac * _ARC_SWEEP)
+    edges = sorted(set(edges))
+
+    # tan(edge angle) for each boundary, computed once per call (not per
+    # pixel/row) -- None marks a boundary too close to +/-90° from top for
+    # tan() to be numerically usable, see _arc_solid_exact_row() above.
+    _EPS = 1e-6
+    edge_info = []
+    for e in edges:
+        raw = e - 360.0 if e >= 360.0 else e
+        rad = math.radians(raw)
+        c = math.cos(rad)
+        edge_info.append(math.sin(rad) / c if abs(c) > _EPS else None)
+
+    y_from = max(0, CY - r_out) if y_lo is None else max(0, CY - r_out, y_lo)
+    y_to   = min(_H, CY + r_out + 1) if y_hi is None else min(_H, CY + r_out + 1, y_hi + 1)
+    for y in range(y_from, y_to):
         dy  = y - CY
         dy2 = dy * dy
         if dy2 >= r_out2:
@@ -462,33 +605,40 @@ def _arc_solid(bmp, a_start, a_end, r_in, r_out, color):
         dx_out = int(math.sqrt(float(r_out2 - dy2)))
         dx_in  = int(math.sqrt(float(max(0.0, r_in2 - dy2)))) if dy2 < r_in2 else 0
 
+        if None in edge_info:
+            _arc_solid_exact_row(bmp, y, dy, dx_out, dx_in, a_start, a_end2, wraps, color)
+            continue
+
         for xA, xB in ((CX - dx_out, CX - dx_in), (CX + dx_in, CX + dx_out)):
-            ci_run = -1
-            x_run  = xA
-            for x in range(max(0, xA), min(_W, xB + 1)):
-                dx = x - CX
-                a  = math.degrees(math.atan2(dx, -dy))
-                if a < 0.0:
-                    a += 360.0
-                ok = (a >= a_start or a <= a_end2) if wraps else (a_start <= a <= a_end2)
-                arc_a = a if a >= a_start else a + 360.0   # unwrap into arc space
-                ci = (color(arc_a) if is_grad else color) if ok else -1
-                if ci != ci_run:
-                    if ci_run >= 0:
+            xA_c, xB_c = max(0, xA), min(_W - 1, xB)
+            if xA_c > xB_c:
+                continue
+            crossings = []
+            for t in edge_info:
+                x = CX - dy * t
+                if xA_c - 1 <= x <= xB_c + 1:
+                    crossings.append(x)
+            crossings.sort()
+
+            prev_x = xA_c
+            for x in crossings + [xB_c + 1]:
+                seg_x0 = max(xA_c, int(round(prev_x)))
+                seg_x1 = min(xB_c + 1, int(round(x)))
+                if seg_x1 > seg_x0:
+                    mid_dx = ((seg_x0 + seg_x1) / 2.0) - CX
+                    mid_a  = math.degrees(math.atan2(mid_dx, -dy))
+                    if mid_a < 0.0:
+                        mid_a += 360.0
+                    ok = (mid_a >= a_start or mid_a <= a_end2) if wraps else (a_start <= mid_a <= a_end2)
+                    if ok:
+                        arc_a = mid_a if mid_a >= a_start else mid_a + 360.0
+                        ci = color(arc_a) if is_grad else color
                         if _BT:
-                            _bt.fill_region(bmp, x_run, y, x, y + 1, ci_run)
+                            _bt.fill_region(bmp, seg_x0, y, seg_x1, y + 1, ci)
                         else:
-                            for xx in range(x_run, x):
-                                bmp[xx, y] = ci_run
-                    ci_run = ci
-                    x_run  = x
-            if ci_run >= 0:
-                xe = min(_W, xB + 1)
-                if _BT:
-                    _bt.fill_region(bmp, x_run, y, xe, y + 1, ci_run)
-                else:
-                    for xx in range(x_run, xe):
-                        bmp[xx, y] = ci_run
+                            for xx in range(seg_x0, seg_x1):
+                                bmp[xx, y] = ci
+                prev_x = x
 
 
 def _tri(bmp, x0, y0, x1, y1, x2, y2, idx):
@@ -690,8 +840,10 @@ def _restore_region(bmp, angle, muted):
     lx, ly = _axy(_R_PTR_BASE + 2,  angle - _PTR_HALF - 1)
     rx, ry = _axy(_R_PTR_BASE + 2,  angle + _PTR_HALF + 1)
     _tri(bmp, tx, ty, lx, ly, rx, ry, _BG)
-    # 2. Restore arc band (gap-free concentric sweep)
-    _arc_solid(bmp, a0, a1, _R_IN, _R_OUT, arc_col)
+    # 2. Restore arc band (gap-free concentric sweep), scanning only the rows
+    #    this angular window can actually reach -- see _arc_window_rows().
+    y_lo, y_hi = _arc_window_rows(a0, a1, _R_IN, _R_OUT)
+    _arc_solid(bmp, a0, a1, _R_IN, _R_OUT, arc_col, y_lo, y_hi)
     # 3. Redraw any tick marks that fall inside the window
     for db in _tick_values():
         ta = _vol_to_angle(db)
@@ -703,6 +855,28 @@ def _restore_region(bmp, angle, muted):
             ix, iy = _axy(_R_TK_BASE, ta)
             ox, oy = _axy(r_out, ta)
             _thick_tick(bmp, ta, ix, iy, ox, oy, thick, ci)
+
+
+def _move_pointer(bmp, ui, vol_db, muted):
+    """Erase the previously-drawn pointer and draw it at the new volume.
+
+    The incremental alternative to a full _render_gauge(): only the small
+    angular window around the old and new pointer positions becomes dirty.
+    Factored out of draw_volume() so draw_main()'s fast path can reuse the
+    exact same already-validated code (see _restore_region's docstring for
+    the clamp bug that was found by diffing repeated incremental moves
+    against a clean full render -- that comparison is what establishes this
+    path as pixel-identical to the full one).
+    """
+    old = ui["_ptr_angle"]
+    if old is not None:
+        _restore_region(bmp, old, muted)
+    if vol_db >= _VOL_MIN:
+        new = _vol_to_angle(vol_db)
+        _draw_pointer(bmp, new, _PTR)
+        ui["_ptr_angle"] = new
+    else:
+        ui["_ptr_angle"] = None
 
 
 def _render_gauge(bmp, vol_db, muted, power_off=False, busy=False):
@@ -1008,7 +1182,37 @@ def init():
         "items":      menu_items,
         "status":     status_lbl,
         "_ptr_angle": None,   # last-drawn pointer angle; None = no pointer
+        # Last _scene_signature() actually painted into the bitmap, or None
+        # when the bitmap holds something else entirely (menu, splash, busy
+        # frame, standby). draw_main() compares against this to decide
+        # whether it can skip the full static repaint; every function that
+        # writes the bitmap outside draw_main() must reset it to None.
+        "_scene_key": None,
     }
+
+
+def _scene_signature(state):
+    """Everything that affects the STATIC (non-pointer) bitmap content.
+
+    The gradient arc, tick marks, preset-button outlines and the play/pause
+    icon depend only on these fields -- never on volume, which moves the
+    pointer alone. When this is unchanged since the last full render, the
+    bitmap already holds the correct static scene and draw_main() can skip
+    repainting it (see draw_main's fast path for the measured cost).
+
+    media_state is in here because a backend UI extension may draw into the
+    bitmap from _draw_status_rows (ha_ui.py's play/pause icon) and nothing
+    erases the old icon short of a full _clear() -- so a change there has to
+    force the full path or the two icons overdraw each other.
+    """
+    return (
+        state.power != "ON",
+        state.muted,
+        state.preset,
+        state.preset_enabled,
+        len(state.preset_quick_names),
+        state.media_state,
+    )
 
 
 def draw_main(ui, state):
@@ -1033,19 +1237,49 @@ def draw_main(ui, state):
             ui["menu"].anchored_position = pos
             ui["menu"].text  = "MENU"
             ui["menu"].color = _C_MENU
+        # The standby scene shares no bitmap content with the powered-on
+        # one, so the next powered-on draw always needs the full path.
+        ui["_scene_key"] = None
         ui["display"].refresh()
         return
 
     ui["display"].brightness = getattr(state, "brightness", BRIGHTNESS_ON)
-    ptr = _render_gauge(ui["bmp"], state.volume_db, state.muted)
-    ui["_ptr_angle"] = ptr
+
+    # Fast path: repaint only the pointer when the static scene is unchanged.
+    #
+    # Measured on real hardware 2026-08-04 (tools/render_timing_check.py):
+    # a full redraw costs ~330-380ms, of which _arc_solid is ~145ms,
+    # display.refresh() ~173ms, _clear ~17ms and _draw_ticks ~9ms -- and
+    # the arc/ticks pixels are byte-for-byte identical between consecutive
+    # frames whenever _scene_signature() hasn't changed. Worse, repainting
+    # them dirties all 57,600 pixels, which is itself what makes refresh()
+    # cost 173ms: displayio has to convert every 4-bit palette index to
+    # RGB565 in software, so the transfer scales with the dirty region
+    # (confirmed: a labels-only frame, small dirty rect, refreshes in ~5ms).
+    #
+    # This matters far beyond redraw smoothness. The main loop is
+    # cooperative and pumps the async status poll once per iteration, so a
+    # ~350ms draw_main() drops the whole loop to ~3 iterations/sec and each
+    # poll -- needing ~3 pumps -- stretches to ~1000ms, an ~80x throughput
+    # collapse that reads as "flaky networking" while the network itself is
+    # perfectly healthy (0 errors throughout that same measurement run). The
+    # dropped touch events have the identical cause. Skipping the static
+    # repaint fixes both at once.
+    key = _scene_signature(state)
+    if key == ui["_scene_key"]:
+        _move_pointer(ui["bmp"], ui, state.volume_db, state.muted)
+    else:
+        ptr = _render_gauge(ui["bmp"], state.volume_db, state.muted)
+        ui["_ptr_angle"] = ptr
+        if _driver.CAPS["preset_quickbuttons"]:
+            _draw_preset_filter_buttons(ui, state)
+        _draw_menu_home(ui["bmp"])
+        ui["_scene_key"] = key
+
     _set_vol_labels(ui, state.volume_db, state.muted)
     ui["input"].text  = _driver.friendly_input(state.input)
     ui["input"].color = _C_DIM
     _draw_status_rows(ui, state, _C_DIM)
-    if _driver.CAPS["preset_quickbuttons"]:
-        _draw_preset_filter_buttons(ui, state)
-    _draw_menu_home(ui["bmp"])
     ui["menu"].anchor_point      = _MENU_ANCHOR_MAIN
     ui["menu"].anchored_position = _MENU_POS_MAIN
     ui["menu"].text  = "MENU"
@@ -1069,6 +1303,7 @@ def draw_busy(ui, state):
 
     ptr = _render_gauge(ui["bmp"], state.volume_db, False, busy=True)
     ui["_ptr_angle"] = ptr
+    ui["_scene_key"] = None   # flat-gray arc, not any normal scene
     _set_vol_labels(ui, state.volume_db, busy=True)
     ui["input"].text   = _driver.friendly_input(state.input)
     ui["input"].color  = _C_BUSY
@@ -1084,16 +1319,7 @@ def draw_volume(ui, state):
 
     Only the ~20-pixel pointer region becomes dirty → near-instant SPI transfer.
     """
-    bmp = ui["bmp"]
-    old = ui["_ptr_angle"]
-    if old is not None:
-        _restore_region(bmp, old, state.muted)
-    if state.volume_db >= _VOL_MIN:
-        new = _vol_to_angle(state.volume_db)
-        _draw_pointer(bmp, new, _PTR)
-        ui["_ptr_angle"] = new
-    else:
-        ui["_ptr_angle"] = None
+    _move_pointer(ui["bmp"], ui, state.volume_db, state.muted)
     _set_vol_labels(ui, state.volume_db, state.muted)
     ui["display"].refresh()
 
@@ -1133,6 +1359,7 @@ def draw_status(ui, msg):
     """
     _render_gauge(ui["bmp"], _SENTINEL, False)   # arc + ticks, no pointer
     ui["_ptr_angle"]    = None
+    ui["_scene_key"]    = None   # no preset buttons / menu-home drawn here
     ui["vol_int"].text  = "--"; ui["vol_int"].color = _C_DIM
     ui["vol_dec"].text  = ".-" if _SHOW_DECIMAL else ""
     ui["vol_dec"].color = _C_TEXT
@@ -1163,6 +1390,7 @@ def draw_error(ui, msg):
     """
     _render_gauge(ui["bmp"], _SENTINEL, False)
     ui["_ptr_angle"] = None
+    ui["_scene_key"] = None
     _hide_vol_and_status(ui)
     for ml in ui["items"]:
         ml.text = ""
@@ -1182,6 +1410,9 @@ def render_gauge_bg(ui, vol_db, muted):
     """Re-render the gauge into the bitmap without refreshing.
     Call before draw_menu when the brightness screen needs the gauge background."""
     _render_gauge(ui["bmp"], vol_db, muted)
+    # Arc + ticks only -- no preset buttons or menu-home frame, so the
+    # bitmap is NOT a complete main scene and draw_main() must repaint.
+    ui["_scene_key"] = None
 
 
 def draw_menu(ui, title, items, cursor, clear_bg=False, version_text=""):
@@ -1195,6 +1426,10 @@ def draw_menu(ui, title, items, cursor, clear_bg=False, version_text=""):
     global MENU_ITEM_Y0
     if clear_bg:
         _clear(ui["bmp"])
+    # Even without clear_bg this blanks the preset-button labels, so the
+    # bitmap+label pair no longer matches any scene draw_main() could
+    # resume from incrementally.
+    ui["_scene_key"] = None
     ui["status"].text  = version_text
     ui["status"].color = _C_DIM
     ui["vol_int"].text = ""
@@ -1317,3 +1552,4 @@ def flash_power_on(ui):
     show_splash(ui["display"])
     time.sleep(1.0)
     ui["display"].root_group = ui["group"]   # restore; do NOT refresh yet
+    ui["_scene_key"] = None                   # caller's draw_main must repaint
