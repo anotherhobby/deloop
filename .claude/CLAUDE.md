@@ -51,6 +51,10 @@ Read these on demand when a task touches them -- don't pull their content back i
   `<backend>.py`/`<backend>_ui.py`.
 - [docs/ota.md](../docs/ota.md) -- self-update (OTA) design, versioning workflow, and S3 hosting.
   Read before touching `ota.py`, `ota_boot.py`, or `app.py`'s Update-menu code.
+- [docs/memory-headroom.md](../docs/memory-headroom.md) -- open investigation into reclaiming the
+  ~28.8KB gauge bitmap by streaming static layers off flash (`displayio.OnDiskBitmap`), and why
+  `gc.mem_free()` cannot measure any of it. Read before any work on memory headroom, the gauge
+  bitmap, or a memory-shaped networking theory.
 
 ## How these docs are maintained
 
