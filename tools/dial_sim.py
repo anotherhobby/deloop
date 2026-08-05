@@ -257,6 +257,10 @@ def save(ui, name):
 def _base_state():
     state = AVRState()
     state.power          = "ON"
+    # Mirrors a device we have actually polled -- draw_main() now refuses to
+    # render real state it hasn't heard confirmed (see AVRState.power_known),
+    # so without this every render here is the connection-lost screen.
+    state.power_known    = True
     state.brightness     = 1.0
     state.input          = "SAT/CBL"
     state.preset         = "2"

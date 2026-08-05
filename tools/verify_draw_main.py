@@ -123,6 +123,7 @@ def main():
         ("after draw_busy", lambda ui, st: dial_ui.draw_busy(ui, st)),
         ("after draw_status", lambda ui, st: dial_ui.draw_status(ui, "connecting...")),
         ("after draw_error", lambda ui, st: dial_ui.draw_error(ui, "Reconnecting...")),
+        ("after draw_reconnecting", lambda ui, st: dial_ui.draw_reconnecting(ui)),
         ("after render_gauge_bg", lambda ui, st: dial_ui.render_gauge_bg(
             ui, st.volume_db, st.muted)),
     ):

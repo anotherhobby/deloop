@@ -41,6 +41,23 @@ from state import AVRState
 
 _MAX_ERRORS = 5
 
+# How long after a locally-issued power command to stop trusting the polled
+# power state for external-change detection.
+#
+# Power commands are applied optimistically (state.power is set immediately,
+# see _handle_touch_power) but the device takes seconds to actually get
+# there, so polls in between report the OLD state. That makes the local
+# write and the poll disagree in exactly the shape _apply_poll_result's
+# "powered on/off externally" tests look for -- a local power-OFF reads as
+# "was standby, now reports ON", i.e. someone just turned it on.
+#
+# It was always a race; it became reliable when the 2026-08-04 rendering fix
+# took poll latency from ~1000ms to ~20ms and the loop from 3 to ~240
+# iterations/sec, so the confirming poll now lands well before the device
+# settles. Confirmed live: a long-press power-off played the power-on splash
+# and bounced straight back to the volume screen.
+_POWER_SETTLE_S = 10.0
+
 # Bound to the denon module only for a DEVICE_DRIVER=="denon" build (set in
 # main(), see its init_transport branch) -- lets _poll_avr/_pulse_mute route
 # the background status poll through denon.py's non-blocking engine instead
@@ -490,6 +507,12 @@ class _Loop:
         self.touch_y           = 0
         self.touch_x_start     = 0   # x at touch-down (for swipe detection)
         self.touch_power_fired = False
+
+        # monotonic time of the last locally-issued power command. Polls for
+        # the next _POWER_SETTLE_S report the pre-command state, which looks
+        # identical to the device being changed from its own remote -- see
+        # _POWER_SETTLE_S.
+        self.power_cmd_at = -1000.0
         self.last_touch_poll   = 0.0   # throttles touch reads -- see TOUCH_FRAME_S
 
         self.last_poll   = time.monotonic() + 2.0
@@ -789,6 +812,9 @@ def _handle_touch_down(loop, ui, state, touch, now):
     # (this is the only way to wake the AVR from standby).
     loop.touch_power_fired = True
     sound.click_heavy()
+    # Both branches below apply the new power state optimistically; polls for
+    # the next _POWER_SETTLE_S will still report the old one.
+    loop.power_cmd_at = now
     try:
         if state.power == "ON":
             _denon.async_power_standby(now) if _denon is not None else driver.power_standby()
@@ -1120,8 +1146,13 @@ def _tap_main_screen(loop, ui, state, now):
 def _dispatch_tap(loop, ui, state, now):
     """Route a completed tap by current mode and touch zone."""
     if loop.mode == MODE_ERROR:
-        # Error screen: any tap restarts the device
-        microcontroller.reset()
+        # Connection-lost screen: deliberately inert. This used to restart
+        # the device on any tap, which was worse than useless -- a reset
+        # never cleared the states we actually hit (only pulling power did),
+        # and .claude/CLAUDE.md documents microcontroller.reset() leaving the
+        # next boot's networking broken, so tapping could turn a recoverable
+        # blip into a failed boot. Polling continues regardless and
+        # _apply_poll_result clears MODE_ERROR the moment one succeeds.
         return
 
     if state.power != "ON" and loop.mode == MODE_MAIN:
@@ -1213,16 +1244,31 @@ def _apply_poll_result(loop, ui, state, now, status):
         was_standby = state.power != "ON"
         was_on      = state.power == "ON"
         was_muted   = state.muted
+        prev_power  = state.power
         changed = state.apply_status(status)
 
-        if was_standby and state.power == "ON" and not loop.first_poll:
+        # Don't let a poll that predates the device acting on our own power
+        # command undo it. apply_status() would otherwise write the stale
+        # pre-command state straight back over the optimistic one, flipping
+        # the UI back to the screen the user just left. See _POWER_SETTLE_S.
+        if (now - loop.power_cmd_at) < _POWER_SETTLE_S and state.power != prev_power:
+            state.power = prev_power
+
+        # Both "changed externally" tests below compare our local power state
+        # against what the device just reported. Right after a local power
+        # command those legitimately disagree -- we applied it optimistically
+        # and the device hasn't got there yet -- so the disagreement means
+        # nothing until it settles. See _POWER_SETTLE_S.
+        settled = (now - loop.power_cmd_at) >= _POWER_SETTLE_S
+
+        if was_standby and state.power == "ON" and not loop.first_poll and settled:
             # AVR just powered on externally – show splash then normal UI.
             state.volume_db = config.VOLUME_MIN
             changed = True
             dial_ui.flash_power_on(ui)
             powered_on_externally = True
 
-        if was_on and state.power != "ON" and not loop.first_poll:
+        if was_on and state.power != "ON" and not loop.first_poll and settled:
             # AVR went to standby from its own remote/panel -- same fade as
             # the local long-press, so the transition feels the same either way.
             loop.power_fade_from  = state.brightness
@@ -1266,7 +1312,13 @@ def _apply_poll_error(loop, ui, state, e):
     loop.error_count += 1
     if loop.error_count >= _MAX_ERRORS and loop.mode != MODE_ERROR:
         loop.mode = MODE_ERROR
-        dial_ui.draw_error(ui, "Reconnecting...")
+        # Contact lost: whatever power state we last saw is now stale, and
+        # continuing to render it would show a standby ring for a device we
+        # simply cannot reach. Clearing this makes every draw_main() call
+        # site fall through to the connection-lost screen until a poll
+        # succeeds again (see state.AVRState.power_known).
+        state.power_known = False
+        dial_ui.draw_reconnecting(ui)
     loop.pending_poll_interval = None
 
 

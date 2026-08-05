@@ -1222,6 +1222,16 @@ def draw_main(ui, state):
     for ml in ui["items"]:
         ml.text = ""
 
+    # Never claim the device is off on state we have not actually heard from
+    # it. state.power initialises to "STANDBY", so without this check a
+    # device we simply cannot reach renders the identical standby power ring
+    # -- indistinguishable from a real power-off, from every call site (see
+    # state.AVRState.power_known).
+    if not getattr(state, "power_known", True):
+        ui["display"].brightness = getattr(state, "brightness", BRIGHTNESS_ON)
+        draw_reconnecting(ui)
+        return
+
     if state.power != "ON":
         ui["display"].brightness = state.brightness * _STANDBY_BRIGHTNESS_FRAC
         _render_gauge(ui["bmp"], 0, False, power_off=True)
@@ -1279,6 +1289,13 @@ def draw_main(ui, state):
     _set_vol_labels(ui, state.volume_db, state.muted)
     ui["input"].text  = _driver.friendly_input(state.input)
     ui["input"].color = _C_DIM
+    # Restore the preset label's normal row position before drawing into it.
+    # draw_error/draw_reconnecting recenter this label for their own layout
+    # and nothing ever put it back, so it stayed stranded mid-screen on the
+    # first main render afterwards (user-confirmed, seen twice). Set before
+    # _draw_status_rows so a UI extension with its own placement still wins.
+    ui["preset"].anchor_point      = (0.5, 0.5)
+    ui["preset"].anchored_position = (CX, PRESET_NAME_Y)
     _draw_status_rows(ui, state, _C_DIM)
     ui["menu"].anchor_point      = _MENU_ANCHOR_MAIN
     ui["menu"].anchored_position = _MENU_POS_MAIN
@@ -1402,6 +1419,36 @@ def draw_error(ui, msg):
     ui["menu"].anchor_point      = (0.5, 0.5)
     ui["menu"].anchored_position = (CX, CY + 20)
     ui["menu"].text  = "Tap to Restart"
+    ui["menu"].color = _C_DIM
+    ui["display"].refresh()
+
+
+def draw_reconnecting(ui):
+    """Connection-lost state: two centered lines, nothing to tap.
+
+    Distinct from draw_error(): that one is for fatal boot-time problems the
+    user must act on, and offers a restart. This is a transient state the
+    device is expected to come out of on its own, so it deliberately offers
+    no affordance -- it is a status report, not a prompt.
+
+    Wording is backend-neutral on purpose: the thing that went quiet may be
+    a Denon, a MiniDSP, a WiiM, a CamillaDSP host or a Home Assistant
+    entity, so naming any one of them would be wrong for most users.
+    """
+    _render_gauge(ui["bmp"], _SENTINEL, False)
+    ui["_ptr_angle"] = None
+    ui["_scene_key"] = None
+    _hide_vol_and_status(ui)
+    for ml in ui["items"]:
+        ml.text = ""
+    ui["status"].text = ""
+    ui["preset"].anchor_point      = (0.5, 0.5)
+    ui["preset"].anchored_position = (CX, CY - 12)
+    ui["preset"].text  = "lost connection"
+    ui["preset"].color = _C_DIM
+    ui["menu"].anchor_point      = (0.5, 0.5)
+    ui["menu"].anchored_position = (CX, CY + 12)
+    ui["menu"].text  = "reconnecting..."
     ui["menu"].color = _C_DIM
     ui["display"].refresh()
 

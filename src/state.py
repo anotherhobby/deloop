@@ -15,6 +15,17 @@ class AVRState:
         self.power = "STANDBY"
         self.input = ""
 
+        # Have we actually heard the device state this, or is "STANDBY" just
+        # the initial value above? Without this they are indistinguishable,
+        # and dial_ui.draw_main() renders the standby power ring for both --
+        # so a device we cannot reach at all looked exactly like one that is
+        # switched off (confirmed 2026-08-04: it fooled both of us during a
+        # debugging session). Set True by apply_status(); app.py clears it
+        # again when a run of failed polls means we have lost contact, so
+        # the UI falls back to "lost connection" rather than claiming the
+        # device is off.
+        self.power_known = False
+
         # Raw playback-state string from backends that track it (currently
         # only ha.py -- "playing"/"paused"/"on"/"idle"/etc, or "" for
         # backends that never report this). dial_ui.py shows a play/pause
@@ -92,6 +103,7 @@ class AVRState:
         self.volume_db = status["volume_db"]
         self.muted = status["muted"]
         self.power = status["power"]
+        self.power_known = True    # heard it from the device, not a default
         self.input = status["input"]
         self.media_state = media_state
         self.channels = channels
