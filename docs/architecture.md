@@ -6,7 +6,15 @@ See [docs/hardware.md](hardware.md) for physical/flashing details, and
 [docs/device-drivers.md](device-drivers.md) for the pluggable backend architecture and each
 backend's protocol reference.
 
-Last updated: 2026-08-03 (v2.5 -- self-update (OTA) now fetches from a flat S3 layout: deloop can
+Last updated: 2026-08-05 (v2.6 -- the gauge is composed from `vectorio` shapes instead of painted
+into a 240x240 bitmap: 28,800 bytes of the displayio pool reclaimed, GC heap free roughly doubled,
+`draw_main` ~350ms -> ~92ms, and ~500 lines of raster primitives deleted. See
+[docs/rendering.md](rendering.md). That speedup unmasked three latent bugs -- two optimistic-write
+races and a touch double-dispatch -- all fixed. Separately, the long-running cold-boot networking
+failure stopped entirely once an overlapping AP was disabled; see the next-session prompt for why
+that does not contradict the earlier elimination.)
+
+Previously: 2026-08-03 (v2.5 -- self-update (OTA) now fetches from a flat S3 layout: deloop can
 pull app-file releases over Wi-Fi via a manual Update menu, live `storage.remount()` +
 `supervisor.reload()` only (never a hard reset -- see why below), with a fully automated "merge to
 main = new release" versioning workflow. Confirmed live, real hardware, full 16-file Install Update
@@ -416,19 +424,37 @@ lasting rules that came out of it:
   reported a cost of **432 bytes**; and failing vs. succeeding boots showed *identical* free
   memory. This invalidated three separate conclusions in one session. **Never use `gc.mem_free()`
   as the metric for a displayio or WiFi memory question** -- it will report ~zero change no matter
-  what actually happened. See [docs/memory-headroom.md](memory-headroom.md).
-- **The display allocation is the fragile one, not the radio -- do not "fix" boot by connecting
-  WiFi first.** Tried and reverted 2026-08-05, on the theory that the ~28.8KB bitmap was starving
-  the WiFi driver. The opposite is true: associating first lets the driver claim its buffers, and
-  then `dial_ui.init()` has nowhere to go -- `MemoryError` on **every** boot, turning an
-  intermittent ~50% network failure into a 100% brick. `show_splash()` -> `dial_ui.init()` ->
-  `connect()` is the order that reliably gets the bitmap allocated, and it exists for that reason.
-- **Speeding up the main loop exposes latent races.** The 2026-08-04 rendering fix took poll
-  latency ~1000ms -> ~20ms and the loop 3 -> ~240 iterations/sec, and immediately surfaced a
-  dormant bug: the power long-press applies its new state optimistically, and the confirming poll
-  now lands *before* the device has settled, so `_apply_poll_result` read the disagreement as
-  "powered on externally" and played the splash. Guarded by `_POWER_SETTLE_S`. Assume other things
-  quietly depended on the loop being slow.
+  what actually happened. **Use the pool probe instead**: allocate `displayio.Bitmap(120, 120, 16)`
+  in a loop until `MemoryError` and count them (`pool_probe()` in
+  `tools/vector_gauge_spike.py`). That priced the gauge bitmap at exactly 28,800 bytes on 2026-08-05
+  -- and showed the radio takes nothing measurable from that same pool, which kills the
+  "reclaim display RAM to help WiFi" theory outright.
+  See [docs/rendering.md](rendering.md).
+- **RESOLVED 2026-08-05: the fragile display allocation is gone.** This slot used to hold a
+  guardrail -- "do not fix boot by connecting WiFi first, the ~28.8KB gauge bitmap needs its
+  contiguous chunk before the radio claims anything, or `dial_ui.init()` raises `MemoryError` on
+  every boot." That was true, and it was tried and reverted the same day. It no longer applies:
+  the gauge is composed from `vectorio` shapes and there is no 28.8KB contiguous allocation left
+  to fail (see [docs/rendering.md](rendering.md)). The `show_splash()` -> `dial_ui.init()` ->
+  `connect()` order is retained because it is also the right *user-facing* order, not because
+  memory demands it. Kept here rather than deleted so the reasoning isn't rediscovered and
+  re-applied to a constraint that has since evaporated.
+- **Speeding up the main loop exposes latent races. This has now happened twice.** The pattern:
+  a local state change applied optimistically, then a poll issued *before* the device acted writes
+  the stale value straight back. These were always races; ~1000ms poll latency simply gave the
+  device time to settle before the answer arrived.
+    - 2026-08-04, power: the long-press applies optimistically and the confirming poll landed
+      first, so `_apply_poll_result` read the disagreement as "powered on externally" and played
+      the splash. Guarded by `_POWER_SETTLE_S` (10s).
+    - 2026-08-05, mute and play/pause: same shape, after composing the gauge took `draw_main`
+      ~350ms -> ~92ms. Mute's root cause was sharper than "a poll landed" -- the breathing cycle
+      starts *at* a trough and `_pulse_mute` polls at troughs, so muting armed a poll milliseconds
+      after its own command. Fixed at the source plus `_MUTE_SETTLE_S`/`_MEDIA_SETTLE_S` (1.5s).
+      Audited safe: `preset`/`preset_enabled` (never written by `apply_status()`) and `volume_db`
+      (poll skipped while the encoder moves). See [docs/rendering.md](rendering.md).
+    - Same speedup also unmasked a touch bug: any single untouched frame counted as a release, so
+      one FocalTouch dropout mid-press dispatched two taps. Unreachable at ~3 iterations/sec.
+  **Every optimistic write is a candidate. Re-audit them after anything gets faster.**
 - **Font glyph codepoint risk is documented in `Makefile`'s `fonts` target** -- read it before
   adding any character outside the existing ASCII 32-126 range.
 - **Before declaring anything "fixed" or "root cause found": check the cheapest available number
@@ -437,22 +463,35 @@ lasting rules that came out of it:
 
 ## Suggested Prompt For Next Session
 
-> **The top open problem is a cold-boot networking failure.** Roughly half of power-ons (rate has
-> varied 50-90% across sessions) associate to WiFi, take a *correct* DHCP lease, and then fail
-> every subsequent request permanently -- until power is physically cut. A `microcontroller.reset()`
-> does not clear it. A host on the same subnet reaches the target throughout, and
-> `tools/avr_health_check.py` has repeatedly confirmed the target is fine (30/30, then 20/20, at
-> 7-103ms) *while the device could not reach it at all*. Five theories have been eliminated with
-> evidence -- socket/pool exhaustion, access-point choice, CircuitPython heap pressure, boot
-> ordering, and BSSID pinning; do not re-open them without new data (details in the guardrails
-> section above and in [docs/memory-headroom.md](memory-headroom.md)).
+> **The cold-boot networking failure has not recurred since 2026-08-05.** For months, roughly half
+> of power-ons (50-90% across sessions) associated to WiFi, took a *correct* DHCP lease, and then
+> failed every subsequent request permanently until power was cut. On 2026-08-05 the user disabled
+> a second, poorly-placed AP that overlapped the primary in the same space. **Every boot since has
+> succeeded -- not one miss.**
 >
-> The one surviving lead: **`EHOSTUNREACH` (errno 118) appearing alongside `ETIMEDOUT`**, while
-> DHCP succeeds. DHCP is broadcast; every failing peer is unicast, including the gateway. That
-> points at **ARP resolution failing** for on-link addresses, which is independent of which AP the
-> device joined. That is the thread to pull, and it wants a focused experiment rather than another
-> speculative fix -- the four attempted fixes that day all failed, and two made the device
-> materially worse.
+> Read that carefully before concluding "it was the network, nothing to do with us," and before
+> concluding the opposite. Two things are true at once:
+>
+> - **This does not contradict the earlier "access-point choice" elimination.**
+>   `tools/wifi_pin_check.py` pinned association to the suspect BSSID and got 4/4 working TCP,
+>   which ruled out *which AP we associate with*. It could not rule out *co-channel interference
+>   between two overlapping APs* -- a different mechanism entirely, and one that a pinning test is
+>   structurally unable to see. The elimination was sound for what it tested; the conclusion drawn
+>   from it was broader than the evidence.
+> - **The resilience work was still worth doing.** The user's stance throughout was "even if it is
+>   the network, we need to be resilient," and the stack that came out of it is materially more
+>   reliable regardless of what the trigger was. Do not treat the AP fix as a reason to unwind any
+>   of it.
+>
+> The surviving technical lead, if it ever returns: **`EHOSTUNREACH` (errno 118) alongside
+> `ETIMEDOUT`** while DHCP succeeds. DHCP is broadcast; every failing peer is unicast, including
+> the gateway -- which points at **ARP resolution failing** for on-link addresses. Consistent with
+> an interference-driven cause: ARP is small, unacknowledged at the IP layer, and exactly what a
+> marginal RF environment loses first.
+>
+> Still eliminated with evidence, do not re-open without new data: socket/pool exhaustion,
+> CircuitPython heap pressure, boot ordering, BSSID pinning, and display memory pressure on the
+> radio (measured directly -- see [docs/rendering.md](rendering.md)).
 >
 > Note also that the device has **no network recovery at all**: once wedged, nothing ever
 > re-associates. Whatever the root cause turns out to be, a recovery path is worth having. A

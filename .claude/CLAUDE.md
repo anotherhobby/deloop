@@ -51,10 +51,11 @@ Read these on demand when a task touches them -- don't pull their content back i
   `<backend>.py`/`<backend>_ui.py`.
 - [docs/ota.md](../docs/ota.md) -- self-update (OTA) design, versioning workflow, and S3 hosting.
   Read before touching `ota.py`, `ota_boot.py`, or `app.py`'s Update-menu code.
-- [docs/memory-headroom.md](../docs/memory-headroom.md) -- open investigation into reclaiming the
-  ~28.8KB gauge bitmap by streaming static layers off flash (`displayio.OnDiskBitmap`), and why
-  `gc.mem_free()` cannot measure any of it. Read before any work on memory headroom, the gauge
-  bitmap, or a memory-shaped networking theory.
+- [docs/rendering.md](../docs/rendering.md) -- the rendering-architecture decision:
+  compose the gauge from `vectorio` shapes instead of painting it into a 28.8KB bitmap (measured
+  2026-08-05: full 28,800 bytes reclaimed, 29.2ms -> 1.7ms per frame). Also why `gc.mem_free()`
+  cannot measure any of it and what to use instead. Read before any work on `dial_ui.py`'s drawing
+  code, memory headroom, or a memory-shaped networking theory.
 
 ## How these docs are maintained
 
