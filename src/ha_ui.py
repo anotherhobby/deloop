@@ -62,7 +62,7 @@ def draw_status_rows(ui, state, dim_color):
     if not name and state.media_state in _ui._MEDIA_STATE_TEXT:
         ci = _ui._GRAY if dim_color == _ui._C_BUSY else _ui._TK_L
         _ui.draw_play_pause_icon(
-            ui["bmp"], _ui.CX, _ui._PLAYER_NAME_Y,
+            ui, _ui.CX, _ui._PLAYER_NAME_Y,
             state.media_state == "playing", ci,
         )
 
