@@ -9,13 +9,17 @@
 # ~15-25ms/frame the dirty-region model predicted, and the loop still stalls
 # on nearly every redraw.
 #
-# So the fast path itself is still expensive, and this measures where.
-# Prime suspect: _restore_region() calls _arc_solid() for a narrow angular
-# window, but _arc_solid iterates every row of the FULL annulus bounding box
-# (range(CY - r_out, CY + r_out + 1), ~204 rows) computing per-row edge
-# crossings regardless of how narrow the requested sweep is -- so a +/-5
-# degree pointer window may cost nearly what the whole 240 degree arc does,
-# while filling almost no pixels.
+# That diagnosis held: _restore_region() called _arc_solid() for a narrow
+# angular window, but _arc_solid iterated every row of the FULL annulus
+# bounding box regardless of how narrow the requested sweep was -- ~24ms of
+# a ~48ms frame to repaint an arc the pointer had scribbled over.
+#
+# SUPERSEDED 2026-08-05: the gauge is composed from vectorio shapes now, so
+# there is no arc to repaint and no bitmap to scribble on. The frame cost
+# went 29.2ms -> 1.7ms (docs/rendering.md). This harness is kept pointed at
+# the new path so that figure stays re-measurable under a real network load
+# rather than only remembered -- the "restore" column is structurally zero
+# and retained purely so the historical output lines up.
 #
 # Mirrors draw_main()'s fast-path body stage by stage, calling dial_ui's own
 # unmodified private functions, with the volume moved every frame so the
@@ -105,7 +109,6 @@ def main():
     state = AVRState()
     state.brightness = 1.0
     display = ui["display"]
-    bmp = ui["bmp"]
     display.brightness = state.brightness
 
     # One full render first, so the fast path has a valid scene to resume
@@ -163,20 +166,19 @@ def main():
         if now >= next_render:
             next_render = now + RENDER_INTERVAL_S
 
-            # Walk the pointer across the dial so _restore_region does real
-            # work every frame rather than repainting the same window.
+            # Walk the pointer across the dial so the pointer genuinely
+            # relocates every frame; a stationary one understates the cost.
             vol_step = (vol_step + 1) % 40
             vol = config.VOLUME_MIN + 10.0 + vol_step * 1.2
 
-            old = ui["_ptr_angle"]
+            # "restore" is kept as a stage so the historical numbers still
+            # line up column-for-column, but it is structurally zero now:
+            # nothing is erased, because nothing was painted over. It was
+            # 24ms of the old ~48ms frame.
             t0 = time.monotonic_ns()
-            if old is not None:
-                dial_ui._restore_region(bmp, old, False)
             t1 = time.monotonic_ns(); timings.add("restore", (t1 - t0) // 1000)
 
-            ang = dial_ui._vol_to_angle(vol)
-            dial_ui._draw_pointer(bmp, ang, dial_ui._PTR)
-            ui["_ptr_angle"] = ang
+            dial_ui._set_pointer(ui, vol)
             t2 = time.monotonic_ns(); timings.add("pointer", (t2 - t1) // 1000)
 
             dial_ui._set_vol_labels(ui, vol, False)

@@ -4,7 +4,7 @@
 #
 # Why this exists: 2026-08-04 investigation found two separate, real sources
 # of instability -- expensive gauge rendering (fixed the same day, see
-# dial_ui.py's _arc_solid()) and AVR-network flakiness (an intermittent
+# dial_ui.py's since-removed _arc_solid()) and AVR-network flakiness (an intermittent
 # ETIMEDOUT on one specific endpoint, ongoing) -- both of which pressure the
 # same tight heap, making it hard to tell which lever is causing what when
 # they're tangled together. This script pulls rendering out of the picture

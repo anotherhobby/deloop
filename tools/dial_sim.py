@@ -3,12 +3,15 @@
 dial_sim.py – Render deloop's actual dial_ui.py off-device, as PNGs.
 
 Runs the real src/dial_ui.py unmodified by stubbing just enough of
-CircuitPython's board/displayio/terminalio/adafruit_display_text/
-adafruit_bitmap_font surface for it to import and draw. Every arc, tick,
-pointer and fill comes from dial_ui.py's own drawing code -- deliberately
-not registering a `bitmaptools` module means dial_ui.py falls back to its
-own pure-Python primitives (the same ones it uses on a device that lacks
-bitmaptools), so nothing here reimplements the rendering math.
+CircuitPython's board/displayio/terminalio/vectorio/adafruit_display_text/
+adafruit_bitmap_font surface for it to import and build its scene. Every
+arc, tick and pointer is the shape dial_ui.py itself constructs, from its
+own geometry helpers -- nothing here reimplements the rendering math.
+
+Since 2026-08-05 the gauge is retained vectorio shapes rather than a
+painted bitmap (docs/rendering.md), so this composites a shape tree instead
+of exporting a pixel buffer: _composite() walks the group tree honouring
+`hidden`, which is how dial_ui.py selects what each screen shows.
 
 Text is the one place this can't be pixel-identical to the device: labels
 are rendered with the same Inter-Medium.ttf the on-device .pcf bitmap
@@ -90,9 +93,16 @@ class _FakePalette:
 class _FakeGroup:
     def __init__(self):
         self._children = []
+        self.hidden = False
 
     def append(self, child):
         self._children.append(child)
+
+    def __len__(self):
+        return len(self._children)
+
+    def __getitem__(self, i):
+        return self._children[i]
 
 
 class _FakeTileGrid:
@@ -110,6 +120,42 @@ class _FakeLabel:
         self.color             = color
         self.anchor_point      = anchor_point
         self.anchored_position = anchored_position
+
+
+class _FakeVectorShape:
+    """Common base for the vectorio shims -- a passive record of what would
+    be composited, resolved to pixels by render() rather than by any drawing
+    code of its own. That is the whole point of retained-mode shapes: there
+    is no rasterizer here to keep in sync with dial_ui.py."""
+
+    def __init__(self, pixel_shader, x=0, y=0, color_index=0):
+        self.pixel_shader = pixel_shader
+        self.x, self.y    = x, y
+        self.color_index  = color_index
+        self.hidden       = False
+
+
+class _FakePolygon(_FakeVectorShape):
+    def __init__(self, pixel_shader=None, points=None, x=0, y=0, color_index=0):
+        super().__init__(pixel_shader, x, y, color_index)
+        self.points = list(points or [])
+
+
+class _FakeRectangle(_FakeVectorShape):
+    def __init__(self, pixel_shader=None, width=1, height=1, x=0, y=0, color_index=0):
+        super().__init__(pixel_shader, x, y, color_index)
+        self.width, self.height = width, height
+
+    @property
+    def points(self):
+        w, h = self.width, self.height
+        return [(0, 0), (w, 0), (w, h), (0, h)]
+
+
+class _FakeCircle(_FakeVectorShape):
+    def __init__(self, pixel_shader=None, radius=1, x=0, y=0, color_index=0):
+        super().__init__(pixel_shader, x, y, color_index)
+        self.radius = radius
 
 
 class _FakeDisplay:
@@ -164,6 +210,10 @@ def _install_shims():
         Group=_FakeGroup, TileGrid=_FakeTileGrid,
     )
     sys.modules["terminalio"] = _module("terminalio", FONT=None)
+    sys.modules["vectorio"] = _module(
+        "vectorio",
+        Polygon=_FakePolygon, Rectangle=_FakeRectangle, Circle=_FakeCircle,
+    )
 
     label_mod = _module("adafruit_display_text.label", Label=_FakeLabel)
     sys.modules["adafruit_display_text"] = _module("adafruit_display_text", label=label_mod)
@@ -204,15 +254,49 @@ def _draw_label(draw, label):
     draw.multiline_text((x, y), label.text, font=font, fill=fill)
 
 
-def render(ui):
-    """Composite the current ui state into an RGB image, brightness applied."""
-    img = Image.new("RGB", (SCREEN, SCREEN), (0, 0, 0))
-    for child in ui["display"].root_group._children:
-        if isinstance(child, _FakeTileGrid):
+def _draw_vector(draw, shape):
+    """Rasterize a vectorio shim. Pillow's polygon fill rule isn't vectorio's,
+    so edges land within a pixel of the device rather than exactly on it --
+    same caveat as the text above, and for the same reason."""
+    c = shape.pixel_shader[shape.color_index]
+    fill = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+    if isinstance(shape, _FakeCircle):
+        r = shape.radius
+        draw.ellipse((shape.x - r, shape.y - r, shape.x + r, shape.y + r), fill=fill)
+        return
+    pts = [(x + shape.x, y + shape.y) for x, y in shape.points]
+    if len(pts) >= 3:
+        draw.polygon(pts, fill=fill)
+
+
+def _composite(img, group):
+    """Walk a group tree back-to-front, skipping hidden branches.
+
+    dial_ui.py now nests one Group per gauge layer and shows/hides whole
+    layers rather than repainting -- so honouring `hidden`, and recursing,
+    is the difference between rendering the real screen and rendering
+    every screen at once on top of each other.
+    """
+    if getattr(group, "hidden", False):
+        return
+    for child in group._children:
+        if isinstance(child, _FakeGroup):
+            _composite(img, child)
+        elif getattr(child, "hidden", False):
+            continue
+        elif isinstance(child, _FakeTileGrid):
             tile = child.bitmap.to_image(child.pixel_shader)
             img.paste(tile, (child.x, child.y))
         elif isinstance(child, _FakeLabel):
             _draw_label(ImageDraw.Draw(img), child)
+        elif isinstance(child, _FakeVectorShape):
+            _draw_vector(ImageDraw.Draw(img), child)
+
+
+def render(ui):
+    """Composite the current ui state into an RGB image, brightness applied."""
+    img = Image.new("RGB", (SCREEN, SCREEN), (0, 0, 0))
+    _composite(img, ui["display"].root_group)
 
     brightness = getattr(ui["display"], "brightness", 1.0)
     if brightness < 1.0:
