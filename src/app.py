@@ -80,8 +80,12 @@ _SETTLE_S = {
     "muted":        1.5,   # lands in well under a second
     "media_state":  1.5,   # transport commands are immediate
     "input":        5.0,   # AVRs keep reporting the old source while HDMI re-handshakes
-    "preset":       8.0,   # MiniDSP config switches measured 4-10s on real hardware
 }
+# Only fields apply_status() actually writes belong here. A "preset": 8.0 entry
+# lived here briefly and was pure dead weight -- apply_status() never writes
+# preset, so nothing could ever revert it and the window never once ran. Add
+# the line if a backend starts reporting preset back; do not pre-add windows
+# for fields on the theory that some future backend might.
 
 # There is deliberately no timed "switching" transition state to go with this.
 # A backend slow enough to need one blocks the loop outright while it switches,
