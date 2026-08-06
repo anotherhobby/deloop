@@ -58,6 +58,28 @@ _MAX_ERRORS = 5
 # and bounced straight back to the volume screen.
 _POWER_SETTLE_S = 10.0
 
+# The same race, on mute. Tapping mute applies state.muted optimistically, and
+# a poll issued before the AVR acted reports the old value -- apply_status()
+# writes that straight back, so the display goes blue, snaps back to full
+# colour, then goes blue again a poll later. User-confirmed 2026-08-05, once
+# composing the gauge (docs/rendering.md) made the loop fast enough for the
+# poll to beat the AVR.
+#
+# Far shorter than _POWER_SETTLE_S: a mute command lands in well under a
+# second (a power-on takes seconds of real boot time), and every second of
+# this window is a second in which a mute from the AVR's own remote is
+# ignored. Long enough to cover the in-flight poll, short enough that
+# external mutes still feel immediate.
+_MUTE_SETTLE_S = 1.5
+
+# And again for play/pause. _tap_toggle_playback applies state.media_state
+# optimistically and apply_status() overwrites it, so this is the identical
+# bug -- it just needs a backend that reports media_state (ha, wiim) to be
+# visible at all, which is why it has never been reported. Same 1.5s
+# reasoning as mute: transport commands land fast, and the window is time
+# in which a play/pause from another controller is ignored.
+_MEDIA_SETTLE_S = 1.5
+
 # Bound to the denon module only for a DEVICE_DRIVER=="denon" build (set in
 # main(), see its init_transport branch) -- lets _poll_avr/_pulse_mute route
 # the background status poll through denon.py's non-blocking engine instead
@@ -100,6 +122,21 @@ ENC_DEBOUNCE_S = 0.15
 # Touch long-press / tap thresholds
 TOUCH_POWER_S   = 1.5
 TOUCH_MIN_S     = 0.05  # minimum tap duration; filters electrical noise
+
+# Release debounce + post-tap lockout. Both exist because the FocalTouch chip
+# has no queue and can report touched=0 for a single frame in the MIDDLE of a
+# real press. _handle_touch samples at TOUCH_FRAME_S (~60Hz) and used to treat
+# any untouched frame as a release: dispatch the tap, reset, done. One dropout
+# therefore split one press into two taps -- two mute toggles from one finger.
+#
+# This was latent for as long as the code existed and only became reachable
+# 2026-08-05, when composing the gauge (docs/rendering.md) took draw_main from
+# ~350ms to ~90ms. At ~3 loop iterations/sec a press got sampled once or twice
+# and a mid-press dropout landed in a gap nobody looked at; sampling it at the
+# real 60Hz exposes it. Same shape as the _POWER_SETTLE_S race the last
+# rendering speedup surfaced -- assume more of these are waiting.
+TOUCH_RELEASE_S = 0.05  # untouched must persist this long to count as a release
+TAP_RELOCK_S    = 0.25  # ignore new touch-downs this long after dispatching a tap
 MENU_TAP_Y      = 195   # pixels from top: taps below this open the menu
 SWIPE_THRESHOLD = 50    # pixels; horizontal delta to register a swipe
 
@@ -117,19 +154,27 @@ PULSE_FRAME_S = 1.0 / 30   # ~30 fps
 # the pulse frame rate above.
 TOUCH_FRAME_S = 1.0 / 60   # ~60 fps
 
-# --- TEMPORARY: touch-drop investigation (see docs/architecture.md's
-# "Still broken, confirmed by real extended use" note) -----------------
+# --- Loop-stall detector -----------------------------------------------
 # The FocalTouch chip has no queue -- it only reports whatever is touched
 # *right now*. The main loop has no sleep (see TOUCH_FRAME_S's comment
 # above), so if any single iteration runs long (a blocking AVR/network
 # poll is the prime suspect), every touch-poll frame that would have
 # landed during that stall is simply never taken -- a tap that begins and
 # ends entirely inside the gap leaves no trace anywhere, in state or in
-# the FocalTouch chip itself. This block prints a breakdown of any
-# iteration slower than STALL_THRESHOLD_S so a stall can be lined up
-# against a tap the user reports as "didn't register" with nothing else
-# to explain it. Remove once root-caused.
-STALL_THRESHOLD_S = 0.03   # ~2 frames at 60fps
+# the FocalTouch chip itself. Prints a per-stage breakdown of any
+# iteration slower than STALL_THRESHOLD_S.
+#
+# The per-touch and per-tap prints that used to accompany this were removed
+# 2026-08-05. One of them fired on every touch-poll frame -- ~60/sec while a
+# finger was down -- and a blocking USB CDC write at that rate is a credible
+# cause of the very dropouts it was added to investigate.
+#
+# Threshold raised 0.03 -> 0.12 the same day. 30ms was ~2 frames back when a
+# draw_main() cost ~350ms and any draw tripped it anyway; now that composing
+# the gauge (docs/rendering.md) took that to ~90ms, 30ms would fire on every
+# single frame that draws. 120ms sits above a normal draw and below anything
+# that could swallow a tap.
+STALL_THRESHOLD_S = 0.12
 
 
 def _load_brightness():
@@ -278,7 +323,23 @@ def _ota_version_text():
     "input" label (dim gray) rather than a bright title. Separate from
     _ota_menu_title() because draw_menu()'s title parameter is never
     actually rendered (see its own comment: "no title; context comes from
-    the items themselves") -- version_text is a real, distinct label."""
+    the items themselves") -- version_text is a real, distinct label.
+
+    Returns "" for a local build. version.CURRENT_VERSION is 0 in git and
+    only ever gets a real number baked in by the release workflow, in its
+    own working copy -- so every `make deploy` is 0 (see src/version.py and
+    docs/ota.md). Showing "v0" reads as a bug on a new user's very first
+    screen; showing nothing reads as what it is, since a local build is
+    implied by the absence of a release version. The row simply isn't there
+    and "Check Now" stands alone.
+
+    Deliberately not "the version from the git tag": that would let a build
+    made from a modified or post-tag tree claim to be release vN, and since
+    check_latest_version() compares N < N, it would then SUPPRESS the update
+    prompt -- a device running unreleased code, convinced it is current.
+    0 means "no release provenance," which is both true and self-healing."""
+    if version.CURRENT_VERSION == 0:
+        return ""
     return "v{}".format(version.CURRENT_VERSION)
 
 
@@ -503,6 +564,8 @@ class _Loop:
         self.enc_last_tick = 0.0
 
         self.touch_start       = 0.0
+        self.touch_up_at       = 0.0   # provisional release time; 0 = none pending
+        self.tap_relock_until  = 0.0   # touch-downs ignored until this time
         self.touch_x           = 0   # coordinates captured at touch-down
         self.touch_y           = 0
         self.touch_x_start     = 0   # x at touch-down (for swipe detection)
@@ -513,6 +576,9 @@ class _Loop:
         # identical to the device being changed from its own remote -- see
         # _POWER_SETTLE_S.
         self.power_cmd_at = -1000.0
+        # Same, for mute and play/pause -- see _MUTE_SETTLE_S.
+        self.mute_cmd_at  = -1000.0
+        self.media_cmd_at = -1000.0
         self.last_touch_poll   = 0.0   # throttles touch reads -- see TOUCH_FRAME_S
 
         self.last_poll   = time.monotonic() + 2.0
@@ -724,12 +790,14 @@ def _send_volume_debounced(loop, ui, state, now):
         # _pump_denon_command, same error_count bookkeeping either way.
         if was_muted:
             _denon.async_mute_off(now)
+            loop.mute_cmd_at = now      # see _MUTE_SETTLE_S
             state.muted = False
         _denon.async_set_volume(state.volume_db, now)
     else:
         try:
             if was_muted:
                 driver.mute_off()
+                loop.mute_cmd_at = now  # see _MUTE_SETTLE_S
                 state.muted = False
             driver.set_volume(state.volume_db)
             loop.error_count = 0
@@ -800,10 +868,6 @@ def _handle_touch_down(loop, ui, state, touch, now):
         if first_frame or got_first_point:
             loop.touch_x_start = loop.touch_x
 
-    # TEMPORARY: touch-drop investigation -- see STALL_THRESHOLD_S above.
-    print("TOUCH down t=%.3f first=%d pt=%r xy=(%d,%d) mode=%d" % (
-        now, first_frame, pt, loop.touch_x, loop.touch_y, loop.mode))
-
     held = now - loop.touch_start
     if not driver.CAPS["power"] or loop.touch_power_fired or held < TOUCH_POWER_S:
         return
@@ -862,8 +926,6 @@ def _swipe_back(loop, ui, state, now):
 def _tap_menu_top(loop, ui, state, now):
     top_items = _build_top_menu()
     tapped = _menu_item_at_y(loop.touch_y, min(dial_ui.MENU_VISIBLE, len(top_items)))
-    # TEMPORARY: touch-drop investigation -- see STALL_THRESHOLD_S above.
-    print("TAP menu_top y=%d n_items=%d -> tapped=%d" % (loop.touch_y, len(top_items), tapped))
     if not (0 <= tapped < len(top_items)):
         sound.click()
         loop.mode = MODE_MAIN
@@ -890,8 +952,6 @@ def _tap_menu_top(loop, ui, state, now):
 def _tap_menu_dev(loop, ui, state, now):
     dev_items = _build_dev_menu()
     tapped = _menu_item_at_y(loop.touch_y, min(dial_ui.MENU_VISIBLE, len(dev_items)))
-    # TEMPORARY: touch-drop investigation -- see STALL_THRESHOLD_S above.
-    print("TAP menu_dev y=%d n_items=%d -> tapped=%d" % (loop.touch_y, len(dev_items), tapped))
     if not (0 <= tapped < len(dev_items)):
         sound.click()
         loop.mode = MODE_MENU_TOP
@@ -914,8 +974,6 @@ def _tap_menu_sub(loop, ui, state, now):
     items = _build_sub_items(loop.sub_type, state, loop)
     vis_count = min(dial_ui.MENU_VISIBLE, len(items) - loop.sub_scroll)
     tapped = _menu_item_at_y(loop.touch_y, vis_count)
-    # TEMPORARY: touch-drop investigation -- see STALL_THRESHOLD_S above.
-    print("TAP menu_sub y=%d vis_count=%d -> tapped=%d" % (loop.touch_y, vis_count, tapped))
     stay_open = False
     if 0 <= tapped < vis_count:
         # Tap a visible item -> select + confirm it
@@ -949,7 +1007,19 @@ def _tap_open_menu(loop, ui, now):
 
 def _start_mute_pulse(loop, now):
     loop.mute_phase_origin  = now
-    loop.mute_trough_polled = False
+    # NOT False. _pulse_mute polls the AVR at the trough of the breathing
+    # cycle, and frac = 0.5*(1 - cos(2*pi*t/8)) is 0 at t=0 -- so the cycle
+    # STARTS at a trough. Arming the poll here fires one on the very next
+    # pulse frame, milliseconds after we sent the mute command, and it comes
+    # back reporting the pre-command state: the display goes blue, snaps back
+    # to full colour, then blue again at the real trough 8s later.
+    #
+    # Survivable until 2026-08-05 only by accident -- poll latency was ~1000ms,
+    # which gave the AVR time to actually apply the mute before the answer
+    # arrived. At ~20ms the poll now wins the race. Skipping this one trough
+    # costs nothing: it immediately follows our own command, so it can only
+    # ever confirm what we just did or report staleness.
+    loop.mute_trough_polled = True
 
 
 def _try_action(loop, label, action):
@@ -984,6 +1054,7 @@ def _tap_toggle_mute(loop, ui, state, now):
     sound.click()
 
     def action():
+        loop.mute_cmd_at = now          # see _MUTE_SETTLE_S
         if state.muted:
             _denon.async_mute_off(now) if _denon is not None else driver.mute_off()
             state.muted = False
@@ -1006,6 +1077,7 @@ def _tap_toggle_playback(loop, ui, state, now):
     sound.click()
 
     def action():
+        loop.media_cmd_at = now         # see _MEDIA_SETTLE_S
         if state.media_state == "playing":
             driver.media_pause()
             state.media_state = "paused"
@@ -1188,15 +1260,14 @@ def _dispatch_tap(loop, ui, state, now):
 
 def _handle_touch_released(loop, ui, state, now):
     held = (now - loop.touch_start) if loop.touch_start > 0.0 else 0.0
-    # TEMPORARY: touch-drop investigation -- see STALL_THRESHOLD_S above.
-    if loop.touch_start > 0.0:
-        print("TOUCH up   t=%.3f held=%.3f xy=(%d,%d) mode=%d dispatch=%d" % (
-            now, held, loop.touch_x, loop.touch_y, loop.mode,
-            held >= TOUCH_MIN_S and not loop.touch_power_fired))
     if held >= TOUCH_MIN_S and not loop.touch_power_fired:
         _dispatch_tap(loop, ui, state, now)
+        # Re-arm only after TAP_RELOCK_S. A tap that ends in a bounce would
+        # otherwise start a fresh gesture on the very next frame.
+        loop.tap_relock_until = now + TAP_RELOCK_S
 
     loop.touch_start       = 0.0
+    loop.touch_up_at       = 0.0
     loop.touch_x           = 0
     loop.touch_y           = 0
     loop.touch_x_start     = 0
@@ -1214,9 +1285,22 @@ def _handle_touch(loop, ui, state, touch, touch_ok, now):
         is_touched = False
 
     if is_touched:
+        if now < loop.tap_relock_until:
+            return                      # post-tap lockout; ignore the bounce
+        # A touched frame cancels any pending release: the untouched frame
+        # that started it was a dropout, not the finger leaving the glass.
+        loop.touch_up_at = 0.0
         _handle_touch_down(loop, ui, state, touch, now)
-    else:
-        _handle_touch_released(loop, ui, state, now)
+        return
+
+    if loop.touch_start == 0.0:
+        return                          # no gesture in progress
+    if loop.touch_up_at == 0.0:
+        loop.touch_up_at = now          # provisional -- wait for confirmation
+        return
+    if (now - loop.touch_up_at) < TOUCH_RELEASE_S:
+        return                          # not yet confirmed
+    _handle_touch_released(loop, ui, state, now)
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1328,7 @@ def _apply_poll_result(loop, ui, state, now, status):
         was_standby = state.power != "ON"
         was_on      = state.power == "ON"
         was_muted   = state.muted
+        prev_media  = state.media_state
         prev_power  = state.power
         changed = state.apply_status(status)
 
@@ -1253,6 +1338,15 @@ def _apply_poll_result(loop, ui, state, now, status):
         # the UI back to the screen the user just left. See _POWER_SETTLE_S.
         if (now - loop.power_cmd_at) < _POWER_SETTLE_S and state.power != prev_power:
             state.power = prev_power
+
+        # Same guard for mute. Deliberately does NOT cover the power-on path's
+        # `state.muted = False`: that one clears stale mute on purpose and
+        # wants the poll to fill in the real value.
+        if (now - loop.mute_cmd_at) < _MUTE_SETTLE_S and state.muted != was_muted:
+            state.muted = was_muted
+
+        if (now - loop.media_cmd_at) < _MEDIA_SETTLE_S and state.media_state != prev_media:
+            state.media_state = prev_media
 
         # Both "changed externally" tests below compare our local power state
         # against what the device just reported. Right after a local power
@@ -1759,7 +1853,6 @@ def main():
         _retry_presets(loop, ui, state, now)
         t9 = time.monotonic()
 
-        # TEMPORARY: touch-drop investigation -- see STALL_THRESHOLD_S above.
         if (t9 - t0) >= STALL_THRESHOLD_S:
             print(
                 "STALL %dms enc_btn=%d enc_rot=%d vol=%d autoclose=%d "
