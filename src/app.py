@@ -136,6 +136,14 @@ TOUCH_MIN_S     = 0.05  # minimum tap duration; filters electrical noise
 # real 60Hz exposes it. Same shape as the _POWER_SETTLE_S race the last
 # rendering speedup surfaced -- assume more of these are waiting.
 TOUCH_RELEASE_S = 0.05  # untouched must persist this long to count as a release
+#
+# CAUTION: TOUCH_RELEASE_S delays the release, so tap duration must be measured
+# to the last frame that was actually TOUCHED (loop.touch_last_seen), never to
+# the release time. Measuring to release adds TOUCH_RELEASE_S to every gesture,
+# which makes even a single-frame noise blip clear TOUCH_MIN_S -- defeating the
+# very filter that constant exists to be. That regression shipped briefly on
+# 2026-08-05 and produced phantom mute taps, confirmed by the AVR itself
+# reporting it had been muted with nobody touching the device.
 TAP_RELOCK_S    = 0.25  # ignore new touch-downs this long after dispatching a tap
 MENU_TAP_Y      = 195   # pixels from top: taps below this open the menu
 SWIPE_THRESHOLD = 50    # pixels; horizontal delta to register a swipe
@@ -565,6 +573,8 @@ class _Loop:
 
         self.touch_start       = 0.0
         self.touch_up_at       = 0.0   # provisional release time; 0 = none pending
+        self.touch_last_seen   = 0.0   # last frame the panel actually reported a touch
+        self.touch_got_point   = False # did any frame yield real coordinates?
         self.tap_relock_until  = 0.0   # touch-downs ignored until this time
         self.touch_x           = 0   # coordinates captured at touch-down
         self.touch_y           = 0
@@ -864,6 +874,7 @@ def _handle_touch_down(loop, ui, state, touch, now):
     pt = _read_touch_point(touch)
     if pt:
         got_first_point = loop.touch_x_start == 0 and loop.touch_y == 0
+        loop.touch_got_point = True
         loop.touch_x, loop.touch_y = pt
         if first_frame or got_first_point:
             loop.touch_x_start = loop.touch_x
@@ -1259,8 +1270,14 @@ def _dispatch_tap(loop, ui, state, now):
 
 
 def _handle_touch_released(loop, ui, state, now):
-    held = (now - loop.touch_start) if loop.touch_start > 0.0 else 0.0
-    if held >= TOUCH_MIN_S and not loop.touch_power_fired:
+    # Measured to the last TOUCHED frame, not to now -- see TOUCH_RELEASE_S.
+    held = (loop.touch_last_seen - loop.touch_start) if loop.touch_start > 0.0 else 0.0
+    # A gesture that never produced real coordinates is not a tap. The panel
+    # can report touched>0 with an empty touches list (see _handle_touch_down),
+    # and touch_y then stays at its reset value of 0 -- which on the main
+    # screen is above the preset line, i.e. mute. So a phantom does not just
+    # fire something random, it reliably fires mute.
+    if held >= TOUCH_MIN_S and loop.touch_got_point and not loop.touch_power_fired:
         _dispatch_tap(loop, ui, state, now)
         # Re-arm only after TAP_RELOCK_S. A tap that ends in a bounce would
         # otherwise start a fresh gesture on the very next frame.
@@ -1268,6 +1285,8 @@ def _handle_touch_released(loop, ui, state, now):
 
     loop.touch_start       = 0.0
     loop.touch_up_at       = 0.0
+    loop.touch_last_seen   = 0.0
+    loop.touch_got_point   = False
     loop.touch_x           = 0
     loop.touch_y           = 0
     loop.touch_x_start     = 0
@@ -1290,6 +1309,7 @@ def _handle_touch(loop, ui, state, touch, touch_ok, now):
         # A touched frame cancels any pending release: the untouched frame
         # that started it was a dropout, not the finger leaving the glass.
         loop.touch_up_at = 0.0
+        loop.touch_last_seen = now
         _handle_touch_down(loop, ui, state, touch, now)
         return
 
@@ -1359,6 +1379,13 @@ def _apply_poll_result(loop, ui, state, now, status):
             # AVR just powered on externally – show splash then normal UI.
             state.volume_db = config.VOLUME_MIN
             changed = True
+            # Close any open menu first. This path takes over the whole
+            # screen, and flash_power_on() deliberately restores the main
+            # group WITHOUT refreshing -- it relies on the draw_main() below
+            # for the final paint. The menu guard there would otherwise
+            # suppress that paint and leave the display restored but never
+            # repainted.
+            loop.mode = MODE_MAIN
             dial_ui.flash_power_on(ui)
             powered_on_externally = True
 
@@ -1380,7 +1407,20 @@ def _apply_poll_result(loop, ui, state, now, status):
             changed = True
 
         loop.first_poll = False
-        if changed:
+        # Only draw the main screen if the main screen is what's showing.
+        # Without this a poll paints the volume display OVER an open menu
+        # while loop.mode stays MODE_MENU_*: the menu looks gone, but the
+        # encoder is still navigating it, so the next knob turn jumps back
+        # to whatever menu screen was open instead of changing volume.
+        #
+        # Reliably reproducible after an OTA install, which boots straight
+        # into the Update submenu to show its result -- the first poll after
+        # boot always reports "changed" (real status vs. defaults) and lands
+        # a second or two later, right on top of it. User-confirmed on the
+        # v11 -> v12 upgrade. Whoever closes the menu (_auto_close_menu, a
+        # tap, a swipe) calls draw_main() itself, so nothing is lost by
+        # deferring to them. Same guard _retry_presets already uses.
+        if changed and loop.mode == MODE_MAIN:
             dial_ui.draw_main(ui, state)
         loop.error_count = 0
 
