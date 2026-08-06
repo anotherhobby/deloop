@@ -238,6 +238,28 @@ Stored in `microcontroller.nvm[0]` as `int(brightness * 100)`.
 Always use `board.I2C()` (singleton), never `busio.I2C(board.SCL, board.SDA)`.
 "No I2C device at 0x38" on boot = stale lock from REPL session; power-cycle.
 
+**The FocalTouch I2C read fails intermittently, in bursts** (`OSError [Errno 5] Input/output
+error`), measured live 2026-08-06. This is normal background behaviour on this hardware, not a
+fault state -- do not treat an isolated EIO as something to fix or report.
+
+What matters is how it is *interpreted*. `_handle_touch` used to catch it into
+`is_touched = False`, making a bus error indistinguishable from the finger leaving the glass. A
+tap landing inside a burst threw on every frame but one, so the gesture was sampled once and
+`_handle_touch_released` rejected it (`held=0.000`, `got_point=False`) -- silently losing a real
+tap. Symptom: "the menu button does nothing." Bursts are denser shortly after boot, which made it
+look like a boot-settle problem; it is not, one captured failure was 145s into a session.
+
+A failed read now **skips the frame** rather than reporting a release, bounded by
+`TOUCH_ERR_GRACE_S` (0.5s) so a permanently dead bus cannot wedge a gesture open -- a stuck
+gesture is worse than a lost one, since it keeps the long-press power timer running against a
+finger that already left. `_read_touch_point()` retries once for the same reason.
+
+**Still unexplained: why the bus errors at all.** Only the interpretation was fixed, not the cause.
+Rate and clustering were never characterised, and no attempt was made at bus speed, pull-ups, or
+contention with the display. Worth revisiting if touch reliability regresses -- but note the
+mitigation makes the symptom invisible, so a worsening bus would now show up only as the
+once-per-run "I2C reads failing past grace" print.
+
 ### Menu tap hit-testing must be bounded by the menu's real item count (found + fixed 2026-08-01)
 `app.py`'s `_menu_item_at_y(y)` used to scan all `MENU_VISIBLE` (5) slot positions unconditionally,
 regardless of how many items the current menu actually has. A menu with fewer than 5 items --
@@ -489,9 +511,11 @@ lasting rules that came out of it:
   Windows are per-field because devices differ enormously in how fast they report truth again --
   too short and the flicker returns, too long and a change made from the device's own remote takes
   that long to appear. **Tune them against real hardware, not reasoning.** Note `input` (5.0s)
-  exists because AVRs keep reporting the old source while HDMI re-handshakes, and `preset` (8.0s)
-  is currently inert: `apply_status()` never writes `preset`, so it is there for a future backend
-  that does. There is deliberately **no** timed "switching" transition state -- a backend slow
+  exists because AVRs keep reporting the old source while HDMI re-handshakes. **Only fields
+  `apply_status()` actually writes belong in the dict** -- a `preset` entry lived there briefly and
+  was dead weight, since nothing could ever revert `preset` and the window never once ran. Add the
+  line when a backend starts reporting a field back, not on the theory that one might.
+  There is deliberately **no** timed "switching" transition state -- a backend slow
   enough to need one blocks the loop outright, so the honest signal is a static frame painted
   before the blocking call, not a timer laid over a frozen loop.
 - **Font glyph codepoint risk is documented in `Makefile`'s `fonts` target** -- read it before
@@ -502,11 +526,16 @@ lasting rules that came out of it:
 
 ## Suggested Prompt For Next Session
 
-> **The cold-boot networking failure has not recurred since 2026-08-05.** For months, roughly half
-> of power-ons (50-90% across sessions) associated to WiFi, took a *correct* DHCP lease, and then
-> failed every subsequent request permanently until power was cut. On 2026-08-05 the user disabled
-> a second, poorly-placed AP that overlapped the primary in the same space. **Every boot since has
-> succeeded -- not one miss.**
+> **The cold-boot networking failure is considered RESOLVED (maintainer's call, 2026-08-06).** For
+> months, roughly half of power-ons (50-90% across sessions) associated to WiFi, took a *correct*
+> DHCP lease, and then failed every subsequent request permanently until power was cut. On
+> 2026-08-05 the user disabled a second, poorly-placed AP that overlapped the primary in the same
+> space. Every boot since has succeeded -- not one miss, across many power cycles and several full
+> OTA install cycles.
+>
+> Treat it as closed, not as an active investigation. The material below is kept because the fault
+> was environmental rather than proven-and-patched, so if it ever returns this is the accumulated
+> evidence -- not because anything here is still owed work.
 >
 > Read that carefully before concluding "it was the network, nothing to do with us," and before
 > concluding the opposite. Two things are true at once:
@@ -552,20 +581,16 @@ lasting rules that came out of it:
 > (v2.0)" if the task involves adding or changing a device backend, and its "hard lessons" list
 > before touching backend-specific code.
 >
-> If the WiiM backend's rewritten raw-socket transport hasn't been redeployed and booted fresh yet,
-> that's the first thing to try -- the approach itself is confirmed working (see
-> docs/device-drivers.md's "Backend #4: WiiM / LinkPlay streamer" -> TLS section), but only via
-> ad-hoc REPL snippets, not the actual shipped module code end to end. Check `gc.mem_free()` before/
-> after on that first real boot regardless, same as any other memory theory in this file.
+> **All five backends are now confirmed against their real hardware**, including the two that were
+> previously only partly verified: the WiiM raw-socket transport has run as shipped module code
+> against a real WiiM (not just the ad-hoc REPL snippets the approach was proven with), and
+> CamillaDSP's quick-preset-button design
+> (`CAMILLADSP_QUICK_PRESETS`/`get_quick_presets()`/`state.preset_quick_names`) has been exercised
+> on the Dial against a real `camilladsp` process. Neither is an open item any more.
 >
-> The CamillaDSP backend (`src/camilladsp.py`, see docs/device-drivers.md's "Backend #5" section)
-> has booted successfully on real M5 Dial hardware against a real `camilladsp` process --
-> volume/mute/touch all confirmed working. The final quick-preset-button design
-> (`CAMILLADSP_QUICK_PRESETS`/`get_quick_presets()`/`state.preset_quick_names`) is verified
-> host-side only -- redeploying and confirming it on the Dial is the next concrete step for this
-> backend. Still open beyond that: preset-switch timing was only measured against a trivial
-> synthetic test config, not a real production one with actual filter files, and
-> `CAMILLADSP_PRESET_TIMEOUT_MS` is still a guess for that case.
+> Still genuinely untested for CamillaDSP: preset-switch timing against a real production config
+> with actual filter files, rather than the trivial synthetic ones in `local/camilladsp/`.
+> `CAMILLADSP_PRESET_TIMEOUT_MS` remains a guess for that case.
 
 ## Current Recommendation
 
@@ -607,10 +632,9 @@ favorites were configured on the test unit yet).
 real `camilladsp` 4.1.3 process -- volume, mute, and touch all functioning -- see
 docs/device-drivers.md's "Backend #5: CamillaDSP" section for the full design rationale and what's
 still open (Pong/ping tolerance beyond the short test session, and preset-switch timing against a
-real production config rather than the trivial synthetic test configs in `local/camilladsp/`). One
-piece is verified host-side only, not yet redeployed to the Dial: the final quick-preset-button
-design (`CAMILLADSP_QUICK_PRESETS`, `get_quick_presets()`, `state.preset_quick_names`) -- that's
-the next concrete step for this backend, not a question of whether the approach works.
+real production config rather than the trivial synthetic test configs in `local/camilladsp/`). The
+quick-preset-button design (`CAMILLADSP_QUICK_PRESETS`, `get_quick_presets()`,
+`state.preset_quick_names`) has since been confirmed on the Dial too.
 
 Future work could include: input selection UI polish, sound
 mode selection, multi-zone support, wiring up MiniDSP's real Dirac-series per-slot filter names
