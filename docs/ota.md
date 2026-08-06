@@ -23,16 +23,23 @@ retrying succeeded with no further intervention. Worth noting because this path 
 and reasoned about but never actually exercised until it triggered by accident -- if it regresses,
 it will regress silently, because the happy path never touches it.
 
-> **Worth re-testing (2026-08-05, not yet done).** This finding was established while a
-> poorly-placed second AP overlapped the primary -- the same RF environment now believed to be
-> behind the long-running cold-boot networking fault (see `docs/architecture.md`). A first TLS
-> `send()` failing right after a hard reset is entirely consistent with a marginal link rather
-> than with anything reset-specific. The rule stays in force until someone actually re-runs it in
-> the clean environment; if it turns out to have been the AP all along, that removes a real
-> constraint from the OTA flow. Do not relax it on this speculation alone.
+> **RESOLVED 2026-08-06 -- the rule below is retired.** Re-tested in the clean RF environment
+> after the overlapping AP was disabled: three hard-reset cycles, each followed by a TLS request to
+> the real OTA endpoint (`tools/reset_tls_check.py`). All three succeeded, 806-895ms, RSSI -50 to
+> -52. The control run before any reset behaved identically.
+>
+> The original finding was almost certainly an artifact of the two overlapping APs. What was
+> observed was well-timed link flapping that correlated with resets and read as causal -- a first
+> TLS `send()` failing after a reset is exactly what a marginal link produces, and nothing about it
+> was reset-specific. The reasoning was sound given the evidence; the evidence was contaminated.
+>
+> Kept rather than deleted so the conclusion isn't independently rediscovered from the same
+> symptom. One gap worth knowing: `mpremote run` soft-reboots before executing, so those cycles
+> were "hard reset, soft reboot, TLS" rather than the app's own very first network call. A Check
+> Now from the menu after a power cycle, with no serial attached, would close it completely.
 
-**Hard rule: never call `microcontroller.reset()` anywhere in the OTA flow, including for test
-setup.** A genuine hardware reset breaks the first post-handshake TLS `send()` on the very next
+**Former hard rule (retired -- see above): never call `microcontroller.reset()` anywhere in the
+OTA flow, including for test setup.** A genuine hardware reset breaks the first post-handshake TLS `send()` on the very next
 boot's first network attempt -- confirmed via raw-socket diagnostics that TCP connect and the TLS
 handshake itself both succeed, only the first post-handshake `send()` fails, 100% reproducibly,
 specifically following a hard reset earlier in the same power cycle. `supervisor.reload()`
