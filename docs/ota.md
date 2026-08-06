@@ -23,6 +23,14 @@ retrying succeeded with no further intervention. Worth noting because this path 
 and reasoned about but never actually exercised until it triggered by accident -- if it regresses,
 it will regress silently, because the happy path never touches it.
 
+> **Worth re-testing (2026-08-05, not yet done).** This finding was established while a
+> poorly-placed second AP overlapped the primary -- the same RF environment now believed to be
+> behind the long-running cold-boot networking fault (see `docs/architecture.md`). A first TLS
+> `send()` failing right after a hard reset is entirely consistent with a marginal link rather
+> than with anything reset-specific. The rule stays in force until someone actually re-runs it in
+> the clean environment; if it turns out to have been the AP all along, that removes a real
+> constraint from the OTA flow. Do not relax it on this speculation alone.
+
 **Hard rule: never call `microcontroller.reset()` anywhere in the OTA flow, including for test
 setup.** A genuine hardware reset breaks the first post-handshake TLS `send()` on the very next
 boot's first network attempt -- confirmed via raw-socket diagnostics that TCP connect and the TLS
