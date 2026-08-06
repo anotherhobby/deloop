@@ -196,6 +196,52 @@ def _do_install():
     ota.apply(_new_session, on_progress=_show_install_progress)
 
 
+def _prompt_install(latest):
+    """Arm the install from right here, without reloading into the full app
+    first. NEVER RETURNS -- both exits are the user's, not this function's.
+
+    Why this exists: a Check Now that finds an update used to reload back
+    into normal mode just so the Update submenu could offer "Install
+    Update (vN)", and the install then needs a genuine power cycle anyway
+    (see docs/ota.md). That put a full deloop boot -- driver stack, fonts,
+    WiFi association, first poll, ~30-40s -- in between the check and a
+    reboot the user was about to perform regardless. Prompting here skips
+    it entirely.
+
+    Waits indefinitely, by explicit design: an unattended check parks on
+    this screen rather than timing out. The two ways out are the two the
+    user already has in hand:
+
+      - press the knob -> NVM_OTA_ACTION = 2, "power cycle now" screen.
+      - power cycle without pressing -> action is already 0 (run()
+        consumes it up front), so the device just boots normally. The
+        check's NVM_OTA_RESULT/NVM_OTA_VERSION writes have already
+        happened by the time we get here, so that normal boot still comes
+        up with "Install Update (vN)" waiting in the Update submenu --
+        nothing is lost by skipping, it only costs the boot back.
+
+    Deliberately does not call _reload_to_normal() on the arming path:
+    that clears NVM_OTA_ACTION, which is the very flag we just set."""
+    _show_message(
+        "Update available: v{}\n\nPress encoder button to install\n\n"
+        "or power cycle to skip".format(latest))
+
+    import digitalio
+    btn = digitalio.DigitalInOut(board.KNOB_BUTTON)
+    btn.direction = digitalio.Direction.INPUT
+    btn.pull = digitalio.Pull.UP   # active low, same as app.py's
+
+    while not btn.value:   # ignore a press still held from before this screen
+        time.sleep(0.02)
+    while btn.value:
+        time.sleep(0.02)
+
+    _set_ota_action(2)
+    _show_message("Power cycle now\nto install v{}".format(latest))
+    while True:
+        time.sleep(1)
+
+
 def run():
     """Entry point -- code.py calls this INSTEAD OF app.main() whenever an
     OTA action is pending. Never returns; every path ends in a reload."""
@@ -243,6 +289,7 @@ def run():
     gc.collect()
 
     if action == 1:   # Check Now
+        available = None
         try:
             latest, current = _do_check()
             gc.collect()   # pool/ssl_context/session are out of scope now
@@ -250,11 +297,17 @@ def run():
             if latest > current:
                 _set_ota_latest_version(latest)
                 _set_ota_result(1)
+                available = latest
             else:
                 _set_ota_result(2)
         except Exception as e:
             print("ota check failed:", type(e), e)
             _set_ota_result(3)
+        # Only the found-an-update case gets to stay here and offer the
+        # install; up-to-date and error have nothing to arm, so they take
+        # the normal reload back into the app to report themselves.
+        if available is not None:
+            _prompt_install(available)   # never returns
         _reload_to_normal()
         return
 

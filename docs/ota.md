@@ -68,10 +68,8 @@ are brightness/sound, defined once in `config.py` since both `app.py` and `ota_b
 
 ## Install Update requires a genuine physical power cycle
 
-Check Now reloads immediately (it only ever makes one request, to `latest.json`, and has been
-reliable that way). Install Update does **not** self-reload: tapping "Install" sets
-`NVM_OTA_ACTION = 2` and shows "Power cycle now to install vN" / "Cancel" instead, and the actual
-install only runs on the next genuine power-on.
+Install Update does **not** self-reload: arming it sets `NVM_OTA_ACTION = 2` and shows "Power
+cycle now to install vN", and the actual install only runs on the next genuine power-on.
 
 Why: ESP-IDF's real WiFi stack bring-up (`esp_wifi_init()`, netif creation, event-handler
 registration, in `ports/espressif/common-hal/wifi/__init__.c`) is gated by a plain `static bool
@@ -87,6 +85,36 @@ next real power-on picks it up automatically.
 The install screen shows live progress ("Updating to vN... X of 16 packages"), updated right
 before each file's own download starts (via `apply()`'s `on_progress` callback) -- so a stalled or
 crashed install shows the file it actually died on, not the last one that already finished.
+
+## Check Now arms the install from the boot screen, not from the app
+
+A Check Now that finds an update stays in `ota_boot.py` and prompts there
+(`_prompt_install()`): "Update available: vN / Press encoder button to install / or power cycle
+to skip".
+It does **not** reload into the full app first.
+
+Why: the install needs a real power cycle regardless (previous section), so reloading back into
+normal mode purely to render an "Install Update (vN)" menu row inserted a complete deloop boot --
+driver stack, three PCF fonts, WiFi association, first poll, roughly 30-40 seconds -- between the
+check and a reboot the user was about to perform anyway. The prompt needs none of that: it reuses
+this module's existing terminalio status screen and adds one `digitalio` read of
+`board.KNOB_BUTTON`, both far below the memory budget that keeps `ota_boot.py` away from
+`dial_ui.py` in the first place, and both after the TLS work has already finished.
+
+It waits **indefinitely** -- deliberately, no timeout. An unattended check parks on this screen.
+The two exits are the ones the user already has:
+
+- **Press the encoder button** -> `NVM_OTA_ACTION = 2`, then the same "Power cycle now to install vN" screen
+  the app used to show. This path must not call `_reload_to_normal()`, which would clear the very
+  flag it just set.
+- **Power cycle without pressing** -> `run()` consumed the action byte up front, so the device
+  just boots normally. Nothing is lost: `NVM_OTA_RESULT`/`NVM_OTA_VERSION` are written *before*
+  the prompt, so that normal boot still comes up with "Install Update (vN)" waiting in the Update
+  submenu. Skipping only costs the boot back.
+
+Only the found-an-update case gets the prompt. Up-to-date and check-error have nothing to arm, so
+they take the normal reload and report themselves through the app's Update submenu as before --
+which is why `_ota_update_items()`'s `available` branch still exists and is still reachable.
 
 ## Versioning: fully automatic, never hand-chosen
 
