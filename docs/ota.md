@@ -17,6 +17,12 @@ chrome: no backend-specific code anywhere in this feature.
 isn't actively host-mounted -- the one real dependency this feature has, surfaced to the user as
 the Update menu's `Eject drive first` result rather than failing silently.
 
+**Confirmed live 2026-08-05**, incidentally rather than deliberately: a v10 -> v11 update was
+attempted with the drive still mounted, the guard fired, the screen said so, and ejecting and
+retrying succeeded with no further intervention. Worth noting because this path had been designed
+and reasoned about but never actually exercised until it triggered by accident -- if it regresses,
+it will regress silently, because the happy path never touches it.
+
 **Hard rule: never call `microcontroller.reset()` anywhere in the OTA flow, including for test
 setup.** A genuine hardware reset breaks the first post-handshake TLS `send()` on the very next
 boot's first network attempt -- confirmed via raw-socket diagnostics that TCP connect and the TLS
