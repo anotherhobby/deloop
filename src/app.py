@@ -177,6 +177,14 @@ TOUCH_RELEASE_S = 0.05  # untouched must persist this long to count as a release
 # 2026-08-05 and produced phantom mute taps, confirmed by the AVR itself
 # reporting it had been muted with nobody touching the device.
 TAP_RELOCK_S    = 0.25  # ignore new touch-downs this long after dispatching a tap
+
+# How long an unbroken run of failed I2C reads is tolerated before the touch
+# frame is treated as a real "untouched" again. Long enough to ride out the
+# observed bursts (which lose a whole tap otherwise -- see _handle_touch),
+# short enough that a genuinely dead bus can't hold a gesture open. A stuck
+# gesture is worse than a lost one: it would keep the long-press power timer
+# running against a finger that left.
+TOUCH_ERR_GRACE_S = 0.5
 MENU_TAP_Y      = 195   # pixels from top: taps below this open the menu
 SWIPE_THRESHOLD = 50    # pixels; horizontal delta to register a swipe
 
@@ -652,6 +660,11 @@ class _Loop:
         self.touch_x_start     = 0   # x at touch-down (for swipe detection)
         self.touch_power_fired = False
 
+        # First frame of the current unbroken I2C-error run; 0 = no run in
+        # progress. See _handle_touch's exception branch.
+        self.touch_err_since  = 0.0
+        self.touch_err_logged = False
+
         # monotonic time of the last locally-issued power command. Polls for
         # the next _POWER_SETTLE_S report the pre-command state, which looks
         # identical to the device being changed from its own remote -- see
@@ -907,14 +920,21 @@ def _auto_close_menu(loop, ui, state, now):
 # ---------------------------------------------------------------------------
 
 def _read_touch_point(touch):
-    """Return (x, y) of the first active touch point, or None."""
-    try:
-        pts = touch.touches
-    except Exception:
-        return None
-    if not pts:
-        return None
-    return pts[0]['x'], pts[0]['y']
+    """Return (x, y) of the first active touch point, or None.
+
+    Retries once: the I2C read to the FocalTouch fails intermittently with
+    OSError EIO (see _handle_touch), and a single dropped coordinate read
+    used to be indistinguishable from a genuinely empty touch list.
+    """
+    for _attempt in range(2):
+        try:
+            pts = touch.touches
+        except Exception:
+            continue     # bus blip -- try once more before giving up
+        if not pts:
+            return None
+        return pts[0]['x'], pts[0]['y']
+    return None
 
 
 def _handle_touch_down(loop, ui, state, touch, now):
@@ -1373,7 +1393,8 @@ def _handle_touch_released(loop, ui, state, now):
     # and touch_y then stays at its reset value of 0 -- which on the main
     # screen is above the preset line, i.e. mute. So a phantom does not just
     # fire something random, it reliably fires mute.
-    if held >= TOUCH_MIN_S and loop.touch_got_point and not loop.touch_power_fired:
+    fired = held >= TOUCH_MIN_S and loop.touch_got_point and not loop.touch_power_fired
+    if fired:
         _dispatch_tap(loop, ui, state, now)
         # Re-arm only after TAP_RELOCK_S. A tap that ends in a bounce would
         # otherwise start a fresh gesture on the very next frame.
@@ -1396,7 +1417,33 @@ def _handle_touch(loop, ui, state, touch, touch_ok, now):
 
     try:
         is_touched = touch_ok and touch.touched > 0
-    except Exception:
+        loop.touch_err_since = 0.0
+    except Exception as e:
+        # An I2C read error is NOT "the finger left the glass" -- and
+        # treating it as one silently lost whole taps. Measured live
+        # 2026-08-06: the FocalTouch read fails intermittently with
+        # OSError EIO, in bursts. A tap landing inside a burst threw on
+        # every frame but one, so each throw fed the release path, the
+        # gesture ended having been sampled once, and both guards in
+        # _handle_touch_released then rejected it (held=0.000, got=False).
+        # From the outside that is "the menu button did nothing" -- denser
+        # right after boot, which made it look like a boot-settle problem.
+        #
+        # So: skip the frame entirely rather than reporting a release. The
+        # gesture stays intact across the blip and the real frames still
+        # land. Bounded, because a permanently failing bus must not wedge a
+        # gesture open forever -- after TOUCH_ERR_GRACE_S of unbroken
+        # errors, fall through and let the normal release path run.
+        if loop.touch_err_since == 0.0:
+            loop.touch_err_since = now
+            loop.touch_err_logged = False
+        if (now - loop.touch_err_since) < TOUCH_ERR_GRACE_S:
+            return
+        # Once per error run, not per frame: a genuinely dead bus would
+        # otherwise print at the touch sample rate forever.
+        if not loop.touch_err_logged:
+            loop.touch_err_logged = True
+            print("touch: I2C reads failing past grace:", type(e), e)
         is_touched = False
 
     if is_touched:

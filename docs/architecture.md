@@ -238,6 +238,28 @@ Stored in `microcontroller.nvm[0]` as `int(brightness * 100)`.
 Always use `board.I2C()` (singleton), never `busio.I2C(board.SCL, board.SDA)`.
 "No I2C device at 0x38" on boot = stale lock from REPL session; power-cycle.
 
+**The FocalTouch I2C read fails intermittently, in bursts** (`OSError [Errno 5] Input/output
+error`), measured live 2026-08-06. This is normal background behaviour on this hardware, not a
+fault state -- do not treat an isolated EIO as something to fix or report.
+
+What matters is how it is *interpreted*. `_handle_touch` used to catch it into
+`is_touched = False`, making a bus error indistinguishable from the finger leaving the glass. A
+tap landing inside a burst threw on every frame but one, so the gesture was sampled once and
+`_handle_touch_released` rejected it (`held=0.000`, `got_point=False`) -- silently losing a real
+tap. Symptom: "the menu button does nothing." Bursts are denser shortly after boot, which made it
+look like a boot-settle problem; it is not, one captured failure was 145s into a session.
+
+A failed read now **skips the frame** rather than reporting a release, bounded by
+`TOUCH_ERR_GRACE_S` (0.5s) so a permanently dead bus cannot wedge a gesture open -- a stuck
+gesture is worse than a lost one, since it keeps the long-press power timer running against a
+finger that already left. `_read_touch_point()` retries once for the same reason.
+
+**Still unexplained: why the bus errors at all.** Only the interpretation was fixed, not the cause.
+Rate and clustering were never characterised, and no attempt was made at bus speed, pull-ups, or
+contention with the display. Worth revisiting if touch reliability regresses -- but note the
+mitigation makes the symptom invisible, so a worsening bus would now show up only as the
+once-per-run "I2C reads failing past grace" print.
+
 ### Menu tap hit-testing must be bounded by the menu's real item count (found + fixed 2026-08-01)
 `app.py`'s `_menu_item_at_y(y)` used to scan all `MENU_VISIBLE` (5) slot positions unconditionally,
 regardless of how many items the current menu actually has. A menu with fewer than 5 items --
