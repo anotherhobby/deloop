@@ -177,6 +177,22 @@ deloop/
 | Touch tap (<0.5s) | Close menu |
 | 8s idle in menu | Auto-close menu |
 
+**Menu back gesture (2026-08-06).** A tap inside a menu that hits no item goes
+back one level if it lands on the left half, and closes the menu on the right.
+It reuses `_swipe_back`, so tap-back and swipe-back are one behaviour rather
+than two to learn, and it needs no on-screen affordance -- which matters
+because menu text genuinely uses the space a BACK button would want ("Install
+Update (v13)" reaches x=10). A drawn BACK strip was mocked in `dial_sim` and
+rejected for exactly that collision.
+
+Depends on `_menu_item_at()` testing **both** axes against each item's
+rendered `Label.bounding_box`. It previously tested y only, so an item's hit
+band spanned the full screen width and no left-side miss was reachable beside
+an item at all. Per-item width, not a fixed column: "PC" is 33px wide and
+"Install Update (v13)" is 221px, so no single column suits both.
+`_MENU_X_PAD` is the tuning knob -- larger widens every item's target and
+shrinks the back zone beside short labels.
+
 ## Architecture Notes
 
 ### Polling strategy

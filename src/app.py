@@ -533,8 +533,26 @@ def _scroll_for(cursor, scroll, num_items):
     return max(0, min(scroll, max(0, num_items - vis)))
 
 
-def _menu_item_at_y(y, max_items):
-    """Return visible item index [0..max_items-1] for a touch at y, or -1.
+# Horizontal slack either side of a menu item's rendered text. Wide enough
+# that aiming at the label never misses, narrow enough that the empty space
+# beside a short item is genuinely empty -- which is what makes
+# _tap_missed_target's left-half-goes-back gesture reachable at all.
+_MENU_X_PAD = 14
+
+
+def _menu_item_at(ui, x, y, max_items):
+    """Return visible item index [0..max_items-1] for a touch, or -1.
+
+    Tests BOTH axes against the item's actual rendered extent. This used to
+    test y only, which meant an item's hit band spanned the full width of the
+    screen at that row -- so a tap far to the left of "Dirac Live" selected
+    Dirac Live, and the only real miss zones were above the first item and
+    below the last. Found live 2026-08-06.
+
+    Width comes from the Label's own bounding_box rather than a fixed column,
+    because menu text varies enormously: "PC" is 33px wide while "Install
+    Update (v13)" is 221px and reaches x=10. A fixed left column wide enough
+    to hit reliably would have swallowed taps on the long ones.
 
     max_items is required, not defaulted to MENU_VISIBLE -- found live
     (2026-08-01) that scanning all MENU_VISIBLE slot positions regardless
@@ -544,11 +562,19 @@ def _menu_item_at_y(y, max_items):
     landing near one of those unused slot positions returned a real index
     that then failed the caller's `tapped < actual count` check and closed
     the menu entirely, misread as "tapped outside every item." Every
-    caller must pass its own real, currently-visible item count."""
-    half = dial_ui.MENU_ITEM_DY // 2 - 2
+    caller must pass its own real, currently-visible item count.
+    """
+    half_y = dial_ui.MENU_ITEM_DY // 2 - 2
     for i in range(max_items):
-        if abs(y - (dial_ui.MENU_ITEM_Y0 + i * dial_ui.MENU_ITEM_DY)) <= half:
-            return i
+        if abs(y - (dial_ui.MENU_ITEM_Y0 + i * dial_ui.MENU_ITEM_DY)) > half_y:
+            continue
+        # Only one row can match y, so this either hits or it is a miss --
+        # never fall through to test another row.
+        try:
+            half_x = ui["items"][i].bounding_box[2] // 2 + _MENU_X_PAD
+        except Exception:
+            half_x = 240        # can't measure -> behave as it always did
+        return i if abs(x - dial_ui.CX) <= half_x else -1
     return -1
 
 
@@ -934,14 +960,43 @@ def _swipe_back(loop, ui, state, now):
         dial_ui.draw_main(ui, state)
 
 
+def _tap_missed_target(loop, ui, state, now):
+    """A tap that registered inside a menu but hit no item.
+
+    Left half goes back one level; right half closes the menu. The split
+    matches the swipe-left-to-go-back gesture, so the two agree instead of
+    being separate things to learn, and it needs no on-screen affordance --
+    which matters because menu text genuinely uses the space a BACK button
+    would want. Measured: "Install Update (v13)" reaches x=10 and "Game
+    Console" x=36, so any left column wide enough to hit reliably would
+    collide with real content. Reinterpreting a MISS costs nothing, because
+    by definition no target was there.
+
+    This also makes the three menus agree. They previously disagreed on what
+    a miss meant -- top closed, device went back, and a submenu closed all
+    the way out rather than stepping back one level, which was the actively
+    annoying one.
+
+    Note the reachable area shrinks as menus grow: item hit bands are 34px of
+    the 38px spacing, so the gaps BETWEEN items are only 4px and effectively
+    unhittable. The real miss zones are above the first item and below the
+    last -- generous at 3 items (y<65 / y>175), tight at 5 (y<27 / y>213).
+    Swipe-back remains the reliable route in a full menu.
+    """
+    if loop.touch_x < dial_ui.CX:
+        _swipe_back(loop, ui, state, now)
+        return
+    sound.click()
+    loop.mode = MODE_MAIN
+    dial_ui.exit_menu(ui)
+    dial_ui.draw_main(ui, state)
+
+
 def _tap_menu_top(loop, ui, state, now):
     top_items = _build_top_menu()
-    tapped = _menu_item_at_y(loop.touch_y, min(dial_ui.MENU_VISIBLE, len(top_items)))
+    tapped = _menu_item_at(ui, loop.touch_x, loop.touch_y, min(dial_ui.MENU_VISIBLE, len(top_items)))
     if not (0 <= tapped < len(top_items)):
-        sound.click()
-        loop.mode = MODE_MAIN
-        dial_ui.exit_menu(ui)
-        dial_ui.draw_main(ui, state)
+        _tap_missed_target(loop, ui, state, now)
         return
 
     sound.click()
@@ -962,11 +1017,9 @@ def _tap_menu_top(loop, ui, state, now):
 
 def _tap_menu_dev(loop, ui, state, now):
     dev_items = _build_dev_menu()
-    tapped = _menu_item_at_y(loop.touch_y, min(dial_ui.MENU_VISIBLE, len(dev_items)))
+    tapped = _menu_item_at(ui, loop.touch_x, loop.touch_y, min(dial_ui.MENU_VISIBLE, len(dev_items)))
     if not (0 <= tapped < len(dev_items)):
-        sound.click()
-        loop.mode = MODE_MENU_TOP
-        dial_ui.draw_menu(ui, "", _build_top_menu(), loop.menu_cursor, clear_bg=True)
+        _tap_missed_target(loop, ui, state, now)
         return
 
     sound.click()
@@ -984,7 +1037,7 @@ def _tap_menu_dev(loop, ui, state, now):
 def _tap_menu_sub(loop, ui, state, now):
     items = _build_sub_items(loop.sub_type, state, loop)
     vis_count = min(dial_ui.MENU_VISIBLE, len(items) - loop.sub_scroll)
-    tapped = _menu_item_at_y(loop.touch_y, vis_count)
+    tapped = _menu_item_at(ui, loop.touch_x, loop.touch_y, vis_count)
     stay_open = False
     if 0 <= tapped < vis_count:
         # Tap a visible item -> select + confirm it
@@ -993,7 +1046,8 @@ def _tap_menu_sub(loop, ui, state, now):
         loop.sub_cursor = loop.sub_scroll + tapped
         stay_open = _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui, loop, now)
     else:
-        sound.click()
+        _tap_missed_target(loop, ui, state, now)
+        return
     if stay_open:
         items = _build_sub_items(loop.sub_type, state, loop)
         loop.sub_cursor = 0
