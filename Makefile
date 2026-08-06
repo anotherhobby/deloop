@@ -46,7 +46,26 @@ full-deploy: install-libs deploy
 # $(MPY_CROSS) -- see its comment below if missing; compiling locally is
 # fast (milliseconds/file) so this isn't meaningfully slower than the old
 # plain-.py path was.
-deploy: _copy-files-mpy
+# Every copy target needs the drive mounted. Without this the first cp just
+# fails with a bare "No such file or directory", which is genuinely confusing
+# when the usual cause is that you ran `make usb-drive-off` -- the one thing
+# the README now tells every new user to do (see "Last step" there).
+_require-drive:
+	@test -d $(CIRCUITPY) || { \
+	  echo ""; \
+	  echo "  $(CIRCUITPY) is not mounted."; \
+	  echo ""; \
+	  echo "  If you have run 'make usb-drive-off' (recommended, so OTA can"; \
+	  echo "  remount the filesystem), the drive is hidden on purpose. Run:"; \
+	  echo ""; \
+	  echo "      make usb-drive-on     # resets the device, drive returns in ~5s"; \
+	  echo ""; \
+	  echo "  then re-run this target. 'make usb-drive-off' puts it back."; \
+	  echo "  Otherwise: check the USB cable and that the device is powered."; \
+	  echo ""; \
+	  exit 1; }
+
+deploy: _require-drive _copy-files-mpy
 
 # deploy-code: same .mpy compile as `deploy`, but skips splash_logo.bmp and
 # the fonts/ directory entirely -- those rarely change and each cp to the
@@ -54,13 +73,13 @@ deploy: _copy-files-mpy
 # comment on _copy-files-mpy below), which adds up during rapid iteration
 # on code alone. Not what a fresh device/full-deploy needs (use `deploy`
 # for that) -- this is purely a fast path for "I only changed a .py file."
-deploy-code: _copy-code-mpy
+deploy-code: _require-drive _copy-code-mpy
 
 # deploy-src: plain, uncompiled .py -- NOT what the device should run day
 # to day (see `deploy` above). Real uses: no `local/mpy-cross` available
 # yet, or actively chasing a traceback where uncompiled source gives a
 # clearer on-device error than .mpy does. Requires no extra tooling.
-deploy-src: _copy-files
+deploy-src: _require-drive _copy-files
 
 # mpy-cross: path to the CircuitPython-matched mpy-cross binary -- NOT the
 # generic MicroPython one from pip (`pip install mpy-cross`); that targets
@@ -356,4 +375,4 @@ network-stress:
 chaos-stress:
 	$(PYTHON) -m mpremote connect auto run tools/chaos_stress_check.py
 
-.PHONY: bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe avr-health dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression network-stress chaos-stress renders ui-renders
+.PHONY: _require-drive bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe avr-health dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression network-stress chaos-stress renders ui-renders
