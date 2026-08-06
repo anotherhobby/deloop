@@ -248,19 +248,72 @@ ls:
 shell:
 	$(PYTHON) -m mpremote connect auto
 
-# Dev-only: toggle CIRCUITPY's USB mass-storage drive via boot.py's nvm-byte
-# check (src/boot.py) -- lets Install Update's storage.remount() succeed
-# without physically ejecting/reconnecting, while keeping the serial
-# console (REPL/prints) available. Requires a hard reset to take effect
-# (boot.py only runs then) -- this triggers it directly, which naturally
-# drops the mpremote connection; reconnect with `make shell` afterward.
-# Run `make usb-drive-on` before `make deploy` -- CIRCUITPY must be
-# mounted for the file copy to have anywhere to write to.
+# Toggle CIRCUITPY's USB mass-storage drive via boot.py's nvm-byte check
+# (src/boot.py) -- lets Install Update's storage.remount() succeed without
+# physically ejecting/reconnecting, while keeping the serial console
+# (REPL/prints) available. Hiding the drive is the RECOMMENDED end state for
+# any device using OTA, not just a dev convenience -- see the README's "Last
+# step". Requires a hard reset to take effect (boot.py only runs then), which
+# these trigger directly; reconnect with `make shell` afterward.
+# Run `make usb-drive-on` before `make deploy` -- CIRCUITPY must be mounted
+# for the file copy to have anywhere to write to.
+#
+# Both targets fought the same thing twice, in opposite directions: a hard
+# reset takes the USB device away, and neither mpremote nor the host copes
+# with that gracefully.
+#
+# 1. The nvm write and the reset are deliberately SEPARATE invocations.
+#    microcontroller.reset() drops the USB CDC port mid-session, so mpremote's
+#    own cleanup (transport.close() setting RTS on a vanished fd) raises
+#    "OSError: [Errno 6] Device not configured" and the target exits non-zero
+#    -- even though both the write and the reset landed. That made a working
+#    target look broken and would break any chain depending on it. Only the
+#    reset ignores errors; combining them would have swallowed a genuine
+#    failure to write the byte too.
+# 2. The nvm write RETRIES, because the port takes seconds to re-enumerate
+#    after a reset. Running these back to back (or straight after any other
+#    reset) otherwise fails instantly with "mpremote: no device found" --
+#    found live 2026-08-06 running off/on/off in sequence.
+#
+# Neither exit code is trusted regardless: each target then waits on the mount
+# point itself, which is the outcome actually being asked for.
 usb-drive-off:
-	$(PYTHON) -m mpremote connect auto exec "import gc, microcontroller; gc.collect(); microcontroller.nvm[5] = 1; microcontroller.reset()"
+	@i=0; until $(PYTHON) -m mpremote connect auto exec \
+	    "import gc, microcontroller; gc.collect(); microcontroller.nvm[5] = 1" >/dev/null 2>&1; do \
+	  i=$$((i+1)); \
+	  if [ $$i -gt 20 ]; then \
+	    echo "  ERROR: no device on the serial port after 20s."; exit 1; \
+	  fi; \
+	  sleep 1; \
+	done
+	@$(PYTHON) -m mpremote connect auto exec "import microcontroller; microcontroller.reset()" >/dev/null 2>&1 || true
+	@printf "  hiding the USB drive"
+	@i=0; while [ -d "$(CIRCUITPY)" ]; do \
+	  i=$$((i+1)); \
+	  if [ $$i -gt 30 ]; then \
+	    echo ""; echo "  ERROR: $(CIRCUITPY) still mounted after 30s."; exit 1; \
+	  fi; \
+	  printf "."; sleep 1; \
+	done; echo " done."
 
 usb-drive-on:
-	$(PYTHON) -m mpremote connect auto exec "import gc, microcontroller; gc.collect(); microcontroller.nvm[5] = 0; microcontroller.reset()"
+	@i=0; until $(PYTHON) -m mpremote connect auto exec \
+	    "import gc, microcontroller; gc.collect(); microcontroller.nvm[5] = 0" >/dev/null 2>&1; do \
+	  i=$$((i+1)); \
+	  if [ $$i -gt 20 ]; then \
+	    echo "  ERROR: no device on the serial port after 20s."; exit 1; \
+	  fi; \
+	  sleep 1; \
+	done
+	@$(PYTHON) -m mpremote connect auto exec "import microcontroller; microcontroller.reset()" >/dev/null 2>&1 || true
+	@printf "  restoring the USB drive"
+	@i=0; while [ ! -d "$(CIRCUITPY)" ]; do \
+	  i=$$((i+1)); \
+	  if [ $$i -gt 30 ]; then \
+	    echo ""; echo "  ERROR: $(CIRCUITPY) did not appear within 30s."; exit 1; \
+	  fi; \
+	  printf "."; sleep 1; \
+	done; echo " done."
 
 # Run the host-side Denon HTTP probe (requires AVR on network).
 # Usage: make probe
@@ -375,4 +428,4 @@ network-stress:
 chaos-stress:
 	$(PYTHON) -m mpremote connect auto run tools/chaos_stress_check.py
 
-.PHONY: _require-drive bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe avr-health dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression network-stress chaos-stress renders ui-renders
+.PHONY: _require-drive usb-drive-on usb-drive-off bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe avr-health dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression network-stress chaos-stress renders ui-renders
