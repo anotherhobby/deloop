@@ -129,6 +129,24 @@ Before flashing, `make probe-minidsp` / `make probe-camilladsp` / `make probe-ha
    make full-deploy
    ```
 
+### Last step: turn off the USB drive to enable OTA updates
+
+Once deloop is running and you're happy with it, run:
+
+```
+make usb-drive-off
+```
+
+**Do this before you rely on OTA updates.** deloop installs updates by
+remounting its own filesystem writable, which CircuitPython only permits while
+CIRCUITPY is *not* mounted on a computer. Leave the drive exposed and every
+update attempt stops with `Eject drive first` until you eject it by hand — and
+if the drive is mounted, even unattended updates simply can't proceed.
+
+`make usb-drive-on` brings the drive back whenever you want to deploy over USB
+again. The setting survives reboots and power cycles, so this is a one-time
+thing, not something to toggle constantly. Both commands reset the device.
+
 After the first deploy, `make deploy` is the fast path for iterating on code changes if you decide to make your own tweaks (skips reinstalling CircuitPython libraries, but still needs `local/mpy-cross` -- see step 4). If you don't have `local/mpy-cross` set up yet, or you're chasing a traceback where uncompiled source gives a clearer on-device error, `make deploy-src` copies plain `.py` files instead and needs no extra tooling.
 
 ## Makefile targets
@@ -153,6 +171,8 @@ After the first deploy, `make deploy` is the fast path for iterating on code cha
 | `probe-ha`     | Host-side REST probe against a Home Assistant instance (`PROBE_ARGS=...`) |
 | `probe-wiim`   | Host-side HTTPS probe against a WiiM/LinkPlay streamer (`PROBE_ARGS=...`) |
 | `probe-ota`    | Host-side sanity check for the CI-published GitHub Release (`PROBE_ARGS=...`) |
+| `usb-drive-off` | Hide the CIRCUITPY drive so OTA updates can remount the filesystem — run this once after your first deploy |
+| `usb-drive-on` | Expose CIRCUITPY again so `make deploy` can copy files over USB |
 | `build-manifest` | Build an OTA `manifest.json` locally from whatever `make deploy` last compiled, for testing before a real release |
 
 `fonts` and `renders` need the Inter font family locally -- it's not shipped with the project. Grab v4.1 from [github.com/rsms/inter/releases](https://github.com/rsms/inter/releases) and extract it to `local/Inter-4.1` (gitignored). Neither target is required for normal flashing/use, only for regenerating fonts or screenshots.
@@ -162,6 +182,8 @@ After the first deploy, `make deploy` is the fast path for iterating on code cha
 Settings live in `src/settings.toml` (see `src/settings.toml.template` for all available keys): Wi-Fi credentials, which device backend to use (`DEVICE_DRIVER`), that backend's host/port, and volume step sizes and acceleration thresholds. `src/config.py` reads these at boot and applies safe, per-backend defaults for anything left unset.
 
 ## Updating deloop
+
+**Before this works, run `make usb-drive-off` once** (see the end of Setup). deloop installs an update by remounting its own filesystem writable, which CircuitPython only allows while CIRCUITPY isn't mounted on a computer.
 
 deloop can update its own app files over Wi-Fi from a flat S3 layout, without plugging into a computer. This is **not** a CircuitPython firmware updater — it never touches the CircuitPython build itself, only the app files this repo's own `make deploy` ships.
 

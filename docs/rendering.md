@@ -169,7 +169,13 @@ pattern only becomes visible when something gets faster.
 Removed when this landed, all of them measuring or verifying code that no
 longer exists: `render_timing_check.py`, `profile_arc.py`, `verify_draw_main.py`,
 `chaos_stress_test_a2.py`, `make_gauge_bg.py`, `gauge_stream_check.py`,
-`vector_gauge_spike.py`, `vector_gauge_preview.py`.
+`vector_gauge_spike.py`, `vector_gauge_preview.py`, `vector_gauge_show.py`.
+
+`vector_gauge_show.py` went last and for a different reason: it put the composed
+gauge on the glass to answer "does this LOOK right on a real panel", which was
+worth having before the rewrite landed and is answered by the shipped app
+afterwards. It imported the spike module, so deleting that broke it -- a dead
+import nobody would notice until they tried to use it.
 
 ## Superseded: the flash-streaming plan
 

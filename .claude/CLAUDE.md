@@ -18,8 +18,9 @@ volume changes from outside the Dial.
   never a literal Unicode character or a `\u` escape in source.
 - **Every `adafruit_requests` response must be `.close()`'d** -- the socket pool is only ~4 deep.
 - **Always use `board.I2C()`** (the singleton), never `busio.I2C(board.SCL, board.SDA)`.
-- **Never call `microcontroller.reset()` anywhere in the OTA flow**, including for test setup --
-  it breaks the first post-handshake TLS `send()` on the next boot. See [docs/ota.md](../docs/ota.md).
+- ~~Never call `microcontroller.reset()` in the OTA flow~~ -- **retired 2026-08-06.** Re-tested
+  3/3 clean once an overlapping AP was disabled; the original finding was AP flapping that
+  correlated with resets, not the resets. See [docs/ota.md](../docs/ota.md).
 - **Never manually create a `vN` GitHub Release/tag for this repo** -- merging to `main` is the
   only version-numbering path (see [docs/ota.md](../docs/ota.md)).
 - **`code.py` must stay tiny** (`import app; app.main()` only) -- it's the boot entry point and

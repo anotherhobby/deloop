@@ -23,16 +23,23 @@ retrying succeeded with no further intervention. Worth noting because this path 
 and reasoned about but never actually exercised until it triggered by accident -- if it regresses,
 it will regress silently, because the happy path never touches it.
 
-> **Worth re-testing (2026-08-05, not yet done).** This finding was established while a
-> poorly-placed second AP overlapped the primary -- the same RF environment now believed to be
-> behind the long-running cold-boot networking fault (see `docs/architecture.md`). A first TLS
-> `send()` failing right after a hard reset is entirely consistent with a marginal link rather
-> than with anything reset-specific. The rule stays in force until someone actually re-runs it in
-> the clean environment; if it turns out to have been the AP all along, that removes a real
-> constraint from the OTA flow. Do not relax it on this speculation alone.
+> **RESOLVED 2026-08-06 -- the rule below is retired.** Re-tested in the clean RF environment
+> after the overlapping AP was disabled: three hard-reset cycles, each followed by a TLS request to
+> the real OTA endpoint (`tools/reset_tls_check.py`). All three succeeded, 806-895ms, RSSI -50 to
+> -52. The control run before any reset behaved identically.
+>
+> The original finding was almost certainly an artifact of the two overlapping APs. What was
+> observed was well-timed link flapping that correlated with resets and read as causal -- a first
+> TLS `send()` failing after a reset is exactly what a marginal link produces, and nothing about it
+> was reset-specific. The reasoning was sound given the evidence; the evidence was contaminated.
+>
+> Kept rather than deleted so the conclusion isn't independently rediscovered from the same
+> symptom. One gap worth knowing: `mpremote run` soft-reboots before executing, so those cycles
+> were "hard reset, soft reboot, TLS" rather than the app's own very first network call. A Check
+> Now from the menu after a power cycle, with no serial attached, would close it completely.
 
-**Hard rule: never call `microcontroller.reset()` anywhere in the OTA flow, including for test
-setup.** A genuine hardware reset breaks the first post-handshake TLS `send()` on the very next
+**Former hard rule (retired -- see above): never call `microcontroller.reset()` anywhere in the
+OTA flow, including for test setup.** A genuine hardware reset breaks the first post-handshake TLS `send()` on the very next
 boot's first network attempt -- confirmed via raw-socket diagnostics that TCP connect and the TLS
 handshake itself both succeed, only the first post-handshake `send()` fails, 100% reproducibly,
 specifically following a hard reset earlier in the same power cycle. `supervisor.reload()`
@@ -61,10 +68,8 @@ are brightness/sound, defined once in `config.py` since both `app.py` and `ota_b
 
 ## Install Update requires a genuine physical power cycle
 
-Check Now reloads immediately (it only ever makes one request, to `latest.json`, and has been
-reliable that way). Install Update does **not** self-reload: tapping "Install" sets
-`NVM_OTA_ACTION = 2` and shows "Power cycle now to install vN" / "Cancel" instead, and the actual
-install only runs on the next genuine power-on.
+Install Update does **not** self-reload: arming it sets `NVM_OTA_ACTION = 2` and shows "Power
+cycle now to install vN", and the actual install only runs on the next genuine power-on.
 
 Why: ESP-IDF's real WiFi stack bring-up (`esp_wifi_init()`, netif creation, event-handler
 registration, in `ports/espressif/common-hal/wifi/__init__.c`) is gated by a plain `static bool
@@ -80,6 +85,36 @@ next real power-on picks it up automatically.
 The install screen shows live progress ("Updating to vN... X of 16 packages"), updated right
 before each file's own download starts (via `apply()`'s `on_progress` callback) -- so a stalled or
 crashed install shows the file it actually died on, not the last one that already finished.
+
+## Check Now arms the install from the boot screen, not from the app
+
+A Check Now that finds an update stays in `ota_boot.py` and prompts there
+(`_prompt_install()`): "Update available: vN / Press encoder button to install / or power cycle
+to skip".
+It does **not** reload into the full app first.
+
+Why: the install needs a real power cycle regardless (previous section), so reloading back into
+normal mode purely to render an "Install Update (vN)" menu row inserted a complete deloop boot --
+driver stack, three PCF fonts, WiFi association, first poll, roughly 30-40 seconds -- between the
+check and a reboot the user was about to perform anyway. The prompt needs none of that: it reuses
+this module's existing terminalio status screen and adds one `digitalio` read of
+`board.KNOB_BUTTON`, both far below the memory budget that keeps `ota_boot.py` away from
+`dial_ui.py` in the first place, and both after the TLS work has already finished.
+
+It waits **indefinitely** -- deliberately, no timeout. An unattended check parks on this screen.
+The two exits are the ones the user already has:
+
+- **Press the encoder button** -> `NVM_OTA_ACTION = 2`, then the same "Power cycle now to install vN" screen
+  the app used to show. This path must not call `_reload_to_normal()`, which would clear the very
+  flag it just set.
+- **Power cycle without pressing** -> `run()` consumed the action byte up front, so the device
+  just boots normally. Nothing is lost: `NVM_OTA_RESULT`/`NVM_OTA_VERSION` are written *before*
+  the prompt, so that normal boot still comes up with "Install Update (vN)" waiting in the Update
+  submenu. Skipping only costs the boot back.
+
+Only the found-an-update case gets the prompt. Up-to-date and check-error have nothing to arm, so
+they take the normal reload and report themselves through the app's Update submenu as before --
+which is why `_ota_update_items()`'s `available` branch still exists and is still reachable.
 
 ## Versioning: fully automatic, never hand-chosen
 

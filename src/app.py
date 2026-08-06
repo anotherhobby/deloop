@@ -56,29 +56,61 @@ _MAX_ERRORS = 5
 # iterations/sec, so the confirming poll now lands well before the device
 # settles. Confirmed live: a long-press power-off played the power-on splash
 # and bounced straight back to the volume screen.
-_POWER_SETTLE_S = 10.0
-
-# The same race, on mute. Tapping mute applies state.muted optimistically, and
-# a poll issued before the AVR acted reports the old value -- apply_status()
-# writes that straight back, so the display goes blue, snaps back to full
-# colour, then goes blue again a poll later. User-confirmed 2026-08-05, once
-# composing the gauge (docs/rendering.md) made the loop fast enough for the
-# poll to beat the AVR.
+# ---------------------------------------------------------------------------
+# Optimistic device writes
+# ---------------------------------------------------------------------------
 #
-# Far shorter than _POWER_SETTLE_S: a mute command lands in well under a
-# second (a power-on takes seconds of real boot time), and every second of
-# this window is a second in which a mute from the AVR's own remote is
-# ignored. Long enough to cover the in-flight poll, short enough that
-# external mutes still feel immediate.
-_MUTE_SETTLE_S = 1.5
+# The interaction model: assume our command worked, update the UI immediately,
+# and let polling true it up. A device that only shows state it has read back
+# always feels slower than it is -- deloop was doing that for input switching,
+# where the row could not change until a poll landed.
+#
+# The catch, learned four separate times: a poll issued BEFORE the device acted
+# reports the pre-command value, and apply_status() writes it straight back.
+# The user sees the new state, a snap back to the old one, then the new one
+# again a poll later. So every optimistic write needs a settle window during
+# which a disagreeing poll is ignored for that field alone.
+#
+# Windows are per-field because the devices differ enormously in how fast they
+# tell the truth again. Too short and the flicker returns; too long and a
+# change made from the device's own remote takes that long to show up. That is
+# the whole tradeoff -- tune against real hardware, not reasoning.
+_SETTLE_S = {
+    "power":       10.0,   # a real power-on is seconds of boot time
+    "muted":        1.5,   # lands in well under a second
+    "media_state":  1.5,   # transport commands are immediate
+    "input":        5.0,   # AVRs keep reporting the old source while HDMI re-handshakes
+    "preset":       8.0,   # MiniDSP config switches measured 4-10s on real hardware
+}
 
-# And again for play/pause. _tap_toggle_playback applies state.media_state
-# optimistically and apply_status() overwrites it, so this is the identical
-# bug -- it just needs a backend that reports media_state (ha, wiim) to be
-# visible at all, which is why it has never been reported. Same 1.5s
-# reasoning as mute: transport commands land fast, and the window is time
-# in which a play/pause from another controller is ignored.
-_MEDIA_SETTLE_S = 1.5
+# There is deliberately no timed "switching" transition state to go with this.
+# A backend slow enough to need one blocks the loop outright while it switches,
+# so the only honest signal is a static frame painted before the blocking call
+# (see _confirm_sub) -- a timer would just be a guess laid over a frozen loop.
+# Not built until a backend actually needs it.
+
+
+# Kept as names for the places that read them directly.
+_POWER_SETTLE_S = _SETTLE_S["power"]
+
+
+def _optimistic(loop, state, now, field, value):
+    """Apply a device write locally, right now, and start its settle window."""
+    setattr(state, field, value)
+    loop.cmd_at[field] = now
+
+
+def _settle_guard(loop, state, now, prev):
+    """Undo any field a poll changed inside its settle window.
+
+    prev is the snapshot taken before apply_status(). Per-field, so a poll
+    carrying a genuine external change to some OTHER field still lands.
+    """
+    for field, window in _SETTLE_S.items():
+        if (now - loop.cmd_at.get(field, -1000.0)) >= window:
+            continue
+        if getattr(state, field, None) != prev.get(field):
+            setattr(state, field, prev[field])
 
 # Bound to the denon module only for a DEVICE_DRIVER=="denon" build (set in
 # main(), see its init_transport branch) -- lets _poll_avr/_pulse_mute route
@@ -440,24 +472,37 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop, now):
     pending action and closes normally.
     """
     if sub_type == "input":
-        index, _ = state.input_names[sub_cursor]
+        index, name = state.input_names[sub_cursor]
         try:
             _denon.async_set_input(index, now) if _denon is not None else driver.set_input(index)
             state.input_index = index
+            # get_inputs() yields friendly names and friendly_input() passes an
+            # unknown string through unchanged, so this displays correctly on
+            # every backend.
+            _optimistic(loop, state, now, "input", name)
         except Exception as e:
             print("set_input:", e)
     elif sub_type == "preset":
         val, _ = state.preset_names[sub_cursor]
         try:
-            # Some backends (confirmed on MiniDSP: ~4-10s) block for real
-            # seconds applying a preset change -- paint a static "please
-            # wait" frame first since the loop can't animate meanwhile.
-            dial_ui.draw_busy(ui, state)
-            _denon.async_set_preset(val, now) if _denon is not None else driver.set_preset(val)
+            # Only the BLOCKING path gets a "please wait" frame. A backend
+            # whose set_preset() blocks for real seconds (MiniDSP: ~4-10s
+            # measured) freezes the loop, so paint before the call -- nothing
+            # can animate meanwhile. The async path returns immediately, so
+            # painting grey there is a flash with nothing behind it, gone again
+            # on the next draw. That was unconditional until 2026-08-06 and
+            # visibly flashed on every Denon preset change.
+            if _denon is not None:
+                _denon.async_set_preset(val, now)
+            else:
+                dial_ui.draw_busy(ui, state)
+                driver.set_preset(val)
             # Optimistic, like volume/mute elsewhere -- some backends (Denon)
             # take several seconds to actually apply a preset change, so an
             # immediate re-query would just read back stale state.
-            state.preset = val
+            # The draw_busy() above covers the MiniDSP block; this just
+            # records the write and starts its settle window.
+            _optimistic(loop, state, now, "preset", val)
             # Only flip to enabled if this backend's set_preset() actually
             # does that itself (see CAPS["preset_select_enables"] in
             # driver.py) -- on MiniDSP, preset and Dirac on/off are
@@ -533,8 +578,26 @@ def _scroll_for(cursor, scroll, num_items):
     return max(0, min(scroll, max(0, num_items - vis)))
 
 
-def _menu_item_at_y(y, max_items):
-    """Return visible item index [0..max_items-1] for a touch at y, or -1.
+# Horizontal slack either side of a menu item's rendered text. Wide enough
+# that aiming at the label never misses, narrow enough that the empty space
+# beside a short item is genuinely empty -- which is what makes
+# _tap_missed_target's left-half-goes-back gesture reachable at all.
+_MENU_X_PAD = 14
+
+
+def _menu_item_at(ui, x, y, max_items):
+    """Return visible item index [0..max_items-1] for a touch, or -1.
+
+    Tests BOTH axes against the item's actual rendered extent. This used to
+    test y only, which meant an item's hit band spanned the full width of the
+    screen at that row -- so a tap far to the left of "Dirac Live" selected
+    Dirac Live, and the only real miss zones were above the first item and
+    below the last. Found live 2026-08-06.
+
+    Width comes from the Label's own bounding_box rather than a fixed column,
+    because menu text varies enormously: "PC" is 33px wide while "Install
+    Update (v13)" is 221px and reaches x=10. A fixed left column wide enough
+    to hit reliably would have swallowed taps on the long ones.
 
     max_items is required, not defaulted to MENU_VISIBLE -- found live
     (2026-08-01) that scanning all MENU_VISIBLE slot positions regardless
@@ -544,11 +607,19 @@ def _menu_item_at_y(y, max_items):
     landing near one of those unused slot positions returned a real index
     that then failed the caller's `tapped < actual count` check and closed
     the menu entirely, misread as "tapped outside every item." Every
-    caller must pass its own real, currently-visible item count."""
-    half = dial_ui.MENU_ITEM_DY // 2 - 2
+    caller must pass its own real, currently-visible item count.
+    """
+    half_y = dial_ui.MENU_ITEM_DY // 2 - 2
     for i in range(max_items):
-        if abs(y - (dial_ui.MENU_ITEM_Y0 + i * dial_ui.MENU_ITEM_DY)) <= half:
-            return i
+        if abs(y - (dial_ui.MENU_ITEM_Y0 + i * dial_ui.MENU_ITEM_DY)) > half_y:
+            continue
+        # Only one row can match y, so this either hits or it is a miss --
+        # never fall through to test another row.
+        try:
+            half_x = ui["items"][i].bounding_box[2] // 2 + _MENU_X_PAD
+        except Exception:
+            half_x = 240        # can't measure -> behave as it always did
+        return i if abs(x - dial_ui.CX) <= half_x else -1
     return -1
 
 
@@ -585,10 +656,9 @@ class _Loop:
         # the next _POWER_SETTLE_S report the pre-command state, which looks
         # identical to the device being changed from its own remote -- see
         # _POWER_SETTLE_S.
-        self.power_cmd_at = -1000.0
-        # Same, for mute and play/pause -- see _MUTE_SETTLE_S.
-        self.mute_cmd_at  = -1000.0
-        self.media_cmd_at = -1000.0
+        # monotonic time of the last locally-issued write, per field --
+        # see _SETTLE_S and _optimistic().
+        self.cmd_at = {}
         self.last_touch_poll   = 0.0   # throttles touch reads -- see TOUCH_FRAME_S
 
         self.last_poll   = time.monotonic() + 2.0
@@ -800,15 +870,13 @@ def _send_volume_debounced(loop, ui, state, now):
         # _pump_denon_command, same error_count bookkeeping either way.
         if was_muted:
             _denon.async_mute_off(now)
-            loop.mute_cmd_at = now      # see _MUTE_SETTLE_S
-            state.muted = False
+            _optimistic(loop, state, now, "muted", False)
         _denon.async_set_volume(state.volume_db, now)
     else:
         try:
             if was_muted:
                 driver.mute_off()
-                loop.mute_cmd_at = now  # see _MUTE_SETTLE_S
-                state.muted = False
+                _optimistic(loop, state, now, "muted", False)
             driver.set_volume(state.volume_db)
             loop.error_count = 0
         except Exception as e:
@@ -889,7 +957,7 @@ def _handle_touch_down(loop, ui, state, touch, now):
     sound.click_heavy()
     # Both branches below apply the new power state optimistically; polls for
     # the next _POWER_SETTLE_S will still report the old one.
-    loop.power_cmd_at = now
+    loop.cmd_at["power"] = now
     try:
         if state.power == "ON":
             _denon.async_power_standby(now) if _denon is not None else driver.power_standby()
@@ -934,14 +1002,43 @@ def _swipe_back(loop, ui, state, now):
         dial_ui.draw_main(ui, state)
 
 
+def _tap_missed_target(loop, ui, state, now):
+    """A tap that registered inside a menu but hit no item.
+
+    Left half goes back one level; right half closes the menu. The split
+    matches the swipe-left-to-go-back gesture, so the two agree instead of
+    being separate things to learn, and it needs no on-screen affordance --
+    which matters because menu text genuinely uses the space a BACK button
+    would want. Measured: "Install Update (v13)" reaches x=10 and "Game
+    Console" x=36, so any left column wide enough to hit reliably would
+    collide with real content. Reinterpreting a MISS costs nothing, because
+    by definition no target was there.
+
+    This also makes the three menus agree. They previously disagreed on what
+    a miss meant -- top closed, device went back, and a submenu closed all
+    the way out rather than stepping back one level, which was the actively
+    annoying one.
+
+    Note the reachable area shrinks as menus grow: item hit bands are 34px of
+    the 38px spacing, so the gaps BETWEEN items are only 4px and effectively
+    unhittable. The real miss zones are above the first item and below the
+    last -- generous at 3 items (y<65 / y>175), tight at 5 (y<27 / y>213).
+    Swipe-back remains the reliable route in a full menu.
+    """
+    if loop.touch_x < dial_ui.CX:
+        _swipe_back(loop, ui, state, now)
+        return
+    sound.click()
+    loop.mode = MODE_MAIN
+    dial_ui.exit_menu(ui)
+    dial_ui.draw_main(ui, state)
+
+
 def _tap_menu_top(loop, ui, state, now):
     top_items = _build_top_menu()
-    tapped = _menu_item_at_y(loop.touch_y, min(dial_ui.MENU_VISIBLE, len(top_items)))
+    tapped = _menu_item_at(ui, loop.touch_x, loop.touch_y, min(dial_ui.MENU_VISIBLE, len(top_items)))
     if not (0 <= tapped < len(top_items)):
-        sound.click()
-        loop.mode = MODE_MAIN
-        dial_ui.exit_menu(ui)
-        dial_ui.draw_main(ui, state)
+        _tap_missed_target(loop, ui, state, now)
         return
 
     sound.click()
@@ -962,11 +1059,9 @@ def _tap_menu_top(loop, ui, state, now):
 
 def _tap_menu_dev(loop, ui, state, now):
     dev_items = _build_dev_menu()
-    tapped = _menu_item_at_y(loop.touch_y, min(dial_ui.MENU_VISIBLE, len(dev_items)))
+    tapped = _menu_item_at(ui, loop.touch_x, loop.touch_y, min(dial_ui.MENU_VISIBLE, len(dev_items)))
     if not (0 <= tapped < len(dev_items)):
-        sound.click()
-        loop.mode = MODE_MENU_TOP
-        dial_ui.draw_menu(ui, "", _build_top_menu(), loop.menu_cursor, clear_bg=True)
+        _tap_missed_target(loop, ui, state, now)
         return
 
     sound.click()
@@ -984,7 +1079,7 @@ def _tap_menu_dev(loop, ui, state, now):
 def _tap_menu_sub(loop, ui, state, now):
     items = _build_sub_items(loop.sub_type, state, loop)
     vis_count = min(dial_ui.MENU_VISIBLE, len(items) - loop.sub_scroll)
-    tapped = _menu_item_at_y(loop.touch_y, vis_count)
+    tapped = _menu_item_at(ui, loop.touch_x, loop.touch_y, vis_count)
     stay_open = False
     if 0 <= tapped < vis_count:
         # Tap a visible item -> select + confirm it
@@ -993,7 +1088,8 @@ def _tap_menu_sub(loop, ui, state, now):
         loop.sub_cursor = loop.sub_scroll + tapped
         stay_open = _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui, loop, now)
     else:
-        sound.click()
+        _tap_missed_target(loop, ui, state, now)
+        return
     if stay_open:
         items = _build_sub_items(loop.sub_type, state, loop)
         loop.sub_cursor = 0
@@ -1065,13 +1161,12 @@ def _tap_toggle_mute(loop, ui, state, now):
     sound.click()
 
     def action():
-        loop.mute_cmd_at = now          # see _MUTE_SETTLE_S
         if state.muted:
             _denon.async_mute_off(now) if _denon is not None else driver.mute_off()
-            state.muted = False
+            _optimistic(loop, state, now, "muted", False)
         else:
             _denon.async_mute_on(now) if _denon is not None else driver.mute_on()
-            state.muted = True
+            _optimistic(loop, state, now, "muted", True)
             _start_mute_pulse(loop, now)
 
     if _try_action(loop, "mute", action):
@@ -1088,13 +1183,12 @@ def _tap_toggle_playback(loop, ui, state, now):
     sound.click()
 
     def action():
-        loop.media_cmd_at = now         # see _MEDIA_SETTLE_S
         if state.media_state == "playing":
             driver.media_pause()
-            state.media_state = "paused"
+            _optimistic(loop, state, now, "media_state", "paused")
         else:
             driver.media_play()
-            state.media_state = "playing"
+            _optimistic(loop, state, now, "media_state", "playing")
 
     if _try_action(loop, "media play/pause", action):
         dial_ui.draw_main(ui, state)
@@ -1185,10 +1279,10 @@ def _tap_main_screen(loop, ui, state, now):
 
     sound.click()
     try:
-        # Some backends (confirmed on MiniDSP: ~4-10s) block for real
-        # seconds applying a preset change -- paint a static "please wait"
-        # frame first since the loop can't animate meanwhile.
-        dial_ui.draw_busy(ui, state)
+        # The "please wait" frame belongs on the BLOCKING branches only --
+        # see the same note in _confirm_sub. Painting it unconditionally here
+        # made every Denon quick-preset tap flash grey for no reason, since
+        # the async path returns immediately.
         if idx == selected_idx:
             # Tapping the already-active slot toggles it in place instead of
             # switching slots -- keeps "which config is loaded" visible (see
@@ -1197,6 +1291,7 @@ def _tap_main_screen(loop, ui, state, now):
             if _denon is not None:
                 _denon.async_set_preset_enabled(new_enabled, now)
             else:
+                dial_ui.draw_busy(ui, state)
                 driver.set_preset_enabled(new_enabled)
             state.preset_enabled = new_enabled
         else:
@@ -1204,8 +1299,9 @@ def _tap_main_screen(loop, ui, state, now):
             if _denon is not None:
                 _denon.async_set_preset(val, now)
             else:
+                dial_ui.draw_busy(ui, state)
                 driver.set_preset(val)
-            state.preset = val
+            _optimistic(loop, state, now, "preset", val)
             # Only flip to enabled if this backend's set_preset() actually
             # does that itself (see CAPS["preset_select_enables"] in
             # driver.py) -- on MiniDSP, preset and Dirac on/off are
@@ -1348,32 +1444,20 @@ def _apply_poll_result(loop, ui, state, now, status):
         was_standby = state.power != "ON"
         was_on      = state.power == "ON"
         was_muted   = state.muted
-        prev_media  = state.media_state
         prev_power  = state.power
+        prev = {f: getattr(state, f, None) for f in _SETTLE_S}
         changed = state.apply_status(status)
 
-        # Don't let a poll that predates the device acting on our own power
-        # command undo it. apply_status() would otherwise write the stale
-        # pre-command state straight back over the optimistic one, flipping
-        # the UI back to the screen the user just left. See _POWER_SETTLE_S.
-        if (now - loop.power_cmd_at) < _POWER_SETTLE_S and state.power != prev_power:
-            state.power = prev_power
-
-        # Same guard for mute. Deliberately does NOT cover the power-on path's
-        # `state.muted = False`: that one clears stale mute on purpose and
-        # wants the poll to fill in the real value.
-        if (now - loop.mute_cmd_at) < _MUTE_SETTLE_S and state.muted != was_muted:
-            state.muted = was_muted
-
-        if (now - loop.media_cmd_at) < _MEDIA_SETTLE_S and state.media_state != prev_media:
-            state.media_state = prev_media
+        # Undo anything a poll reverted inside its settle window. Per-field,
+        # so a genuine external change to some other field still lands.
+        _settle_guard(loop, state, now, prev)
 
         # Both "changed externally" tests below compare our local power state
         # against what the device just reported. Right after a local power
         # command those legitimately disagree -- we applied it optimistically
         # and the device hasn't got there yet -- so the disagreement means
         # nothing until it settles. See _POWER_SETTLE_S.
-        settled = (now - loop.power_cmd_at) >= _POWER_SETTLE_S
+        settled = (now - loop.cmd_at.get("power", -1000.0)) >= _POWER_SETTLE_S
 
         if was_standby and state.power == "ON" and not loop.first_poll and settled:
             # AVR just powered on externally – show splash then normal UI.

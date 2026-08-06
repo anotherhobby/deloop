@@ -6,7 +6,15 @@ See [docs/hardware.md](hardware.md) for physical/flashing details, and
 [docs/device-drivers.md](device-drivers.md) for the pluggable backend architecture and each
 backend's protocol reference.
 
-Last updated: 2026-08-05 (v2.6 -- the gauge is composed from `vectorio` shapes instead of painted
+Last updated: 2026-08-06 (v2.7 -- interaction polish on top of v2.6's rendering rewrite. Device
+writes now go through one optimistic-write mechanism (`_SETTLE_S`/`_optimistic()`/`_settle_guard()`
+in `app.py`): assume the command worked, update the UI immediately, let polling true it up. Input
+switching uses it, and `draw_busy()` no longer flashes grey on backends whose writes return
+immediately. Menus gained a tap-to-go-back gesture and two-axis hit testing. An OTA Check Now that
+finds an update now arms the install from the boot screen instead of booting all the way back into
+deloop first -- see [docs/ota.md](ota.md).)
+
+Previously: 2026-08-05 (v2.6 -- the gauge is composed from `vectorio` shapes instead of painted
 into a 240x240 bitmap: 28,800 bytes of the displayio pool reclaimed, GC heap free roughly doubled,
 `draw_main` ~350ms -> ~92ms, and ~500 lines of raster primitives deleted. See
 [docs/rendering.md](rendering.md). That speedup unmasked three latent bugs -- two optimistic-write
@@ -177,6 +185,22 @@ deloop/
 | Touch tap (<0.5s) | Close menu |
 | 8s idle in menu | Auto-close menu |
 
+**Menu back gesture (2026-08-06).** A tap inside a menu that hits no item goes
+back one level if it lands on the left half, and closes the menu on the right.
+It reuses `_swipe_back`, so tap-back and swipe-back are one behaviour rather
+than two to learn, and it needs no on-screen affordance -- which matters
+because menu text genuinely uses the space a BACK button would want ("Install
+Update (v13)" reaches x=10). A drawn BACK strip was mocked in `dial_sim` and
+rejected for exactly that collision.
+
+Depends on `_menu_item_at()` testing **both** axes against each item's
+rendered `Label.bounding_box`. It previously tested y only, so an item's hit
+band spanned the full screen width and no left-side miss was reachable beside
+an item at all. Per-item width, not a fixed column: "PC" is 33px wide and
+"Install Update (v13)" is 221px, so no single column suits both.
+`_MENU_X_PAD` is the tuning knob -- larger widens every item's target and
+shrinks the back zone beside short labels.
+
 ## Architecture Notes
 
 ### Polling strategy
@@ -328,7 +352,7 @@ That model predicted every measurement taken that day to within ~30%. The practi
 blunt: **any per-frame rendering cost is multiplied into apparent network latency**, and shows up
 as "the network is flaky" while the network is provably fine (0 errors throughout the same runs).
 
-Numbers, measured on hardware with `tools/render_timing_check.py`:
+Numbers measured on hardware in the bitmap era, which is what made the effect so visible:
 
 | loop state | iters/sec | poll rate | poll latency |
 |---|---|---|---|
@@ -336,20 +360,22 @@ Numbers, measured on hardware with `tools/render_timing_check.py`:
 | labels only | ~133 | 29.5/s | ~14ms |
 | full gauge repaint (~350ms) | ~3 | 0.64/s | ~1100ms |
 
-Two things follow, and both are easy to get wrong:
+The general lesson survives and is easy to get wrong: **latency measured this way is measuring the
+loop, not the network.** Before assuming a network problem, check the loop rate.
 
-- **Latency metrics measured this way are measuring the loop, not the network.** Before assuming a
-  network problem, check the loop rate.
-- **`display.refresh()` cost scales with the dirty region, not with screen size.** The gauge bitmap
-  is 4-bit indexed, so displayio converts every dirty pixel to RGB565 in software: a full-screen
-  dirty region costs ~173ms, a labels-only frame ~5ms. Anything that calls `_clear()` therefore
-  pays twice -- once to redraw, once because it dirtied everything. This is why `draw_main()`'s
-  fast path exists.
+**The specific costs above are historical.** The gauge is no longer painted into a bitmap at all --
+it is composed from retained `vectorio` shapes, and a redraw is a visibility/colour toggle rather
+than a rasterisation pass (`draw_main` ~350ms -> ~92ms). That also retired the incremental
+fast-path/full-repaint split this section used to describe, along with the tooling built to police
+it (`render_timing_check.py`, `verify_draw_main.py`, `profile_arc.py`, all deleted). See
+[docs/rendering.md](rendering.md) for the landed design and `tools/render_verify.py` for the
+current on-device measurement.
 
-Regression protection: `tools/verify_draw_main.py` requires an **exact zero-pixel diff** between
-the incremental path and a clean full render across 17 scenarios (long volume sweeps, both
-extremes, every scene-change field, and resuming after each of the other bitmap-writing screens).
-Unlike `tools/profile_arc.py`, a nonzero diff there is a real failure, not rasterisation variance.
+Note the second-order effect, since it bit us: making the loop this much faster **unmasked three
+latent races** in which a poll issued before the device acted overwrote an optimistic UI update.
+They had always been there; the loop had simply been too slow to win. See the heap/boot-memory
+guardrails section below, which carries both the race pattern and the `_SETTLE_S` mechanism that
+now handles it.
 
 ## Configuration (settings.toml)
 
@@ -449,12 +475,25 @@ lasting rules that came out of it:
     - 2026-08-05, mute and play/pause: same shape, after composing the gauge took `draw_main`
       ~350ms -> ~92ms. Mute's root cause was sharper than "a poll landed" -- the breathing cycle
       starts *at* a trough and `_pulse_mute` polls at troughs, so muting armed a poll milliseconds
-      after its own command. Fixed at the source plus `_MUTE_SETTLE_S`/`_MEDIA_SETTLE_S` (1.5s).
+      after its own command. Fixed at the source plus 1.5s settle windows.
       Audited safe: `preset`/`preset_enabled` (never written by `apply_status()`) and `volume_db`
       (poll skipped while the encoder moves). See [docs/rendering.md](rendering.md).
     - Same speedup also unmasked a touch bug: any single untouched frame counted as a release, so
       one FocalTouch dropout mid-press dispatched two taps. Unreachable at ~3 iterations/sec.
   **Every optimistic write is a candidate. Re-audit them after anything gets faster.**
+- **Optimistic writes now go through one mechanism, not per-field constants.** `app.py`'s
+  `_SETTLE_S` dict holds the per-field window; `_optimistic()` applies the write and starts the
+  window; `_settle_guard()` reverts anything a poll changed inside it, per field, so a genuine
+  external change to a *different* field still lands. The old `_MUTE_SETTLE_S`/`_MEDIA_SETTLE_S`
+  constants are gone (`_POWER_SETTLE_S` survives as an alias for code that reads it directly).
+  Windows are per-field because devices differ enormously in how fast they report truth again --
+  too short and the flicker returns, too long and a change made from the device's own remote takes
+  that long to appear. **Tune them against real hardware, not reasoning.** Note `input` (5.0s)
+  exists because AVRs keep reporting the old source while HDMI re-handshakes, and `preset` (8.0s)
+  is currently inert: `apply_status()` never writes `preset`, so it is there for a future backend
+  that does. There is deliberately **no** timed "switching" transition state -- a backend slow
+  enough to need one blocks the loop outright, so the honest signal is a static frame painted
+  before the blocking call, not a timer laid over a frozen loop.
 - **Font glyph codepoint risk is documented in `Makefile`'s `fonts` target** -- read it before
   adding any character outside the existing ASCII 32-126 range.
 - **Before declaring anything "fixed" or "root cause found": check the cheapest available number

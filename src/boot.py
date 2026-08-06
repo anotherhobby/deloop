@@ -1,4 +1,7 @@
-# boot.py -- dev-only USB mass-storage toggle for testing Install Update.
+# boot.py -- USB mass-storage toggle. Hiding the drive is the RECOMMENDED
+# end state for any device that will use OTA, not just a dev convenience:
+# see README's "Last step: turn off the USB drive". It began as the latter,
+# hence the testing-focused rationale below, which still applies.
 #
 # storage.remount("/", readonly=False) (used by ota_boot.py's Install
 # Update path) fails with "Cannot remount path when visible via USB"
