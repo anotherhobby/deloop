@@ -23,6 +23,9 @@ volume changes from outside the Dial.
   correlated with resets, not the resets. See [docs/ota.md](../docs/ota.md).
 - **Never manually create a `vN` GitHub Release/tag for this repo** -- merging to `main` is the
   only version-numbering path (see [docs/ota.md](../docs/ota.md)).
+- **Never merge a PR.** Only the user merges, unless they explicitly say to in that instance.
+  "Ship it" means *open the PR and stop* -- merging to `main` cuts a real release that devices
+  pull, and that call is the user's alone. Commit, push, open/update the PR, then hand it over.
 - **`code.py` must stay tiny** (`import app; app.main()` only) -- it's the boot entry point and
   the one file that can't be `.mpy`-compiled.
 
