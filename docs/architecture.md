@@ -6,7 +6,15 @@ See [docs/hardware.md](hardware.md) for physical/flashing details, and
 [docs/device-drivers.md](device-drivers.md) for the pluggable backend architecture and each
 backend's protocol reference.
 
-Last updated: 2026-08-03 (v2.5 -- self-update (OTA) now fetches from a flat S3 layout: deloop can
+Last updated: 2026-08-05 (v2.6 -- the gauge is composed from `vectorio` shapes instead of painted
+into a 240x240 bitmap: 28,800 bytes of the displayio pool reclaimed, GC heap free roughly doubled,
+`draw_main` ~350ms -> ~92ms, and ~500 lines of raster primitives deleted. See
+[docs/rendering.md](rendering.md). That speedup unmasked three latent bugs -- two optimistic-write
+races and a touch double-dispatch -- all fixed. Separately, the long-running cold-boot networking
+failure stopped entirely once an overlapping AP was disabled; see the next-session prompt for why
+that does not contradict the earlier elimination.)
+
+Previously: 2026-08-03 (v2.5 -- self-update (OTA) now fetches from a flat S3 layout: deloop can
 pull app-file releases over Wi-Fi via a manual Update menu, live `storage.remount()` +
 `supervisor.reload()` only (never a hard reset -- see why below), with a fully automated "merge to
 main = new release" versioning workflow. Confirmed live, real hardware, full 16-file Install Update
@@ -239,24 +247,34 @@ on whichever frame first produces a real point, not necessarily the literal firs
 which is exactly why the symptom looked identical before and after the first fix alone. Not yet
 confirmed live.
 
-**Still broken, confirmed by real extended use (2026-08-02) -- both fixes above were NOT
-sufficient, and this is not up for debate: 100% reproducible for the user, predates this entire
-session, real.** Symptom as reported directly: opening the top-level menu itself routinely takes
-"tons of tries" before it registers at all, and tapping any item in a short (1-2 row) submenu --
-Update's "Check Now"/"Check Again" specifically named -- reliably fails to register and drops back
-to the main screen instead. This was initially, wrongly, attributed to `mpremote exec` calls
-interrupting `app.py` mid-session during live debugging in the same conversation that's the source
-of most of this doc's OTA-adjacent findings -- that theory does not hold: the user confirms this
-predates that debugging session entirely and is unrelated to it. **Do not re-open the question of
-whether this is real; it is confirmed, reproducible, and actively degrades the device day to day.**
-Not yet root-caused. Candidates not yet checked: whether a blocking call elsewhere in the main loop
-(an AVR poll taking longer than expected, `_auto_close_menu`, `_pulse_mute`, or something in the
-FocalTouch I2C read path) is stealing touch-poll frames often enough to feel like "tons of tries";
-whether the touch_y/touch_x_start fix above has its own remaining gap; or something else in
-`_handle_touch`/`_handle_touch_down`/`_dispatch_tap` not yet identified. This needs real,
-instrumented live investigation (prints on every touch-poll frame showing `touch_ok`/`is_touched`/
-`touch_y` over a real tap sequence), not another read-through of code that already looked correct
-once before and wasn't.
+**Root-caused and fixed 2026-08-04/05.** For the record, this was real, 100% reproducible, and
+predated the session that first documented it -- an early theory that `mpremote exec` was
+interrupting `app.py` was wrong and was correctly rejected by the user. Symptom as reported:
+opening the top-level menu took "tons of tries," and taps in short submenus reliably dropped back
+to the main screen. There were **two independent causes**, which is why earlier single-cause fixes
+kept coming up short:
+
+1. **Rendering was starving the cooperative main loop.** `draw_main()` repainted the entire gauge
+   on every call: ~330-380ms measured on hardware, of which `_arc_solid` was ~145ms and
+   `display.refresh()` ~173ms. The loop pumps the async status poll once per iteration, so a
+   ~350ms redraw dropped it to ~3 iterations/sec -- which drops touch frames *and* stretches each
+   poll to ~1000ms. The "flaky networking" and the dropped taps were the same bug. Fixed by
+   `_scene_signature()` (skip the static repaint when only the pointer moved) plus
+   `_arc_window_rows()` (bound the row scan to the window actually touched). Poll throughput went
+   0.66/s -> ~33/s with zero errors; redraws ~350ms -> ~48ms. See "Rendering cost is a networking
+   problem" below.
+2. **The quick-select buttons' hit target was far too small.** Drawn at 22px wide with 14px gaps --
+   about 3mm on this panel, well under the ~7-9mm a fingertip reliably lands on. Logging every tap
+   coordinate showed taps landing within ~20px of a button centre but outside the rect, so nothing
+   happened. `preset_button_at()` now picks the nearest button within tolerance instead of
+   requiring a rect hit, and caps `n` at `_DBTN_MAX` so the hit-test can't use a layout that was
+   never drawn.
+
+Methodological note worth keeping: the first cause was only found by *measuring each render stage
+on hardware* (`tools/render_timing_check.py`), after a Mac-side profile had suggested the arc fix
+was already sufficient. It wasn't -- the on-device numbers were ~50x the host's, and
+`display.refresh()` turned out to be the largest single stage, which no amount of reading the code
+would have revealed.
 
 ### Power-off screen flashing at boot (found + fixed 2026-08-01)
 User-reported: "it goes to the power off screen before the menu screen. it's not powered off."
@@ -268,6 +286,15 @@ was wrong and didn't hold up under actual investigation. Two independent, confir
    sentinel distinguishing "haven't polled yet" from "genuinely off." Any render that happens
    before the first real status poll lands will show the power-off screen, because that default
    is indistinguishable from a real reading.
+   **Fixed properly 2026-08-05: `AVRState.power_known`** is False until `apply_status()` has
+   actually heard from the device, and `draw_main()` refuses to render the standby ring without
+   it -- falling through to `dial_ui.draw_reconnecting()` instead. `app.py` clears the flag again
+   when a run of failed polls means contact is lost, so a stale "it was off last time we heard"
+   can't keep rendering as fact. The check lives inside `draw_main()` deliberately: there are a
+   dozen call sites and any of them could otherwise get it wrong. This mattered in practice --
+   during the 2026-08-05 session an unreachable device and a genuinely powered-off one were
+   indistinguishable on screen, and it misled both the user and the assistant for several rounds
+   of debugging.
 2. **`denon.py`'s `get_status()` used to silently convert any unparseable power reading into
    `"STANDBY"`** -- `raw_power = _tag(power_block, "zone1") or "STANDBY"`, then `if power not in
    ("ON", "OFF"): power = "STANDBY"` again. A missing `<zone1>` tag or a truncated/malformed
@@ -289,6 +316,40 @@ was wrong and didn't hold up under actual investigation. Two independent, confir
 
 All three landed together; #2 and #3 are independent triggers for the same underlying exposure (#1)
 and both needed fixing since either alone can cause the flash. Not yet confirmed live.
+
+### Rendering cost is a networking problem (2026-08-04)
+
+The main loop is cooperative and single-threaded. It pumps `denon.py`'s async status-poll state
+machine exactly once per iteration, so a poll's wall-clock time is roughly
+
+    poll time  ~=  (pumps needed per poll)  x  (loop iteration time)
+
+That model predicted every measurement taken that day to within ~30%. The practical consequence is
+blunt: **any per-frame rendering cost is multiplied into apparent network latency**, and shows up
+as "the network is flaky" while the network is provably fine (0 errors throughout the same runs).
+
+Numbers, measured on hardware with `tools/render_timing_check.py`:
+
+| loop state | iters/sec | poll rate | poll latency |
+|---|---|---|---|
+| no rendering at all | ~189 | 42/s | 13-25ms |
+| labels only | ~133 | 29.5/s | ~14ms |
+| full gauge repaint (~350ms) | ~3 | 0.64/s | ~1100ms |
+
+Two things follow, and both are easy to get wrong:
+
+- **Latency metrics measured this way are measuring the loop, not the network.** Before assuming a
+  network problem, check the loop rate.
+- **`display.refresh()` cost scales with the dirty region, not with screen size.** The gauge bitmap
+  is 4-bit indexed, so displayio converts every dirty pixel to RGB565 in software: a full-screen
+  dirty region costs ~173ms, a labels-only frame ~5ms. Anything that calls `_clear()` therefore
+  pays twice -- once to redraw, once because it dirtied everything. This is why `draw_main()`'s
+  fast path exists.
+
+Regression protection: `tools/verify_draw_main.py` requires an **exact zero-pixel diff** between
+the incremental path and a clean full render across 17 scenarios (long volume sweeps, both
+extremes, every scene-change field, and resuming after each of the other bitmap-writing screens).
+Unlike `tools/profile_arc.py`, a nonzero diff there is a real failure, not rasterisation variance.
 
 ## Configuration (settings.toml)
 
@@ -355,6 +416,45 @@ lasting rules that came out of it:
   allocation failing -- don't trust that number alone to declare a memory theory confirmed or
   refuted; a fragmentation problem can look identical to "no problem" until the one allocation that
   actually needs a big contiguous chunk hits it.
+- **`gc.mem_free()` is blind to `displayio` and to the WiFi driver entirely.** There are three
+  separate pools: CircuitPython's GC heap (what `gc.mem_free()` reports), displayio's allocations
+  (which survive soft reload -- that's the giveaway), and the ESP32 IDF heap the WiFi driver takes
+  its buffers from. Confirmed three times on 2026-08-04/05: `dial_ui.init()` allocating the ~28.8KB
+  gauge bitmap moved `gc.mem_free()` by only ~3.8KB; a standalone `displayio.Bitmap(240, 240, 16)`
+  reported a cost of **432 bytes**; and failing vs. succeeding boots showed *identical* free
+  memory. This invalidated three separate conclusions in one session. **Never use `gc.mem_free()`
+  as the metric for a displayio or WiFi memory question** -- it will report ~zero change no matter
+  what actually happened. **Use the pool probe instead**: allocate `displayio.Bitmap(120, 120, 16)`
+  in a loop until `MemoryError` and count them (`pool_probe()` in
+  `tools/vector_gauge_spike.py`). That priced the gauge bitmap at exactly 28,800 bytes on 2026-08-05
+  -- and showed the radio takes nothing measurable from that same pool, which kills the
+  "reclaim display RAM to help WiFi" theory outright.
+  See [docs/rendering.md](rendering.md).
+- **RESOLVED 2026-08-05: the fragile display allocation is gone.** This slot used to hold a
+  guardrail -- "do not fix boot by connecting WiFi first, the ~28.8KB gauge bitmap needs its
+  contiguous chunk before the radio claims anything, or `dial_ui.init()` raises `MemoryError` on
+  every boot." That was true, and it was tried and reverted the same day. It no longer applies:
+  the gauge is composed from `vectorio` shapes and there is no 28.8KB contiguous allocation left
+  to fail (see [docs/rendering.md](rendering.md)). The `show_splash()` -> `dial_ui.init()` ->
+  `connect()` order is retained because it is also the right *user-facing* order, not because
+  memory demands it. Kept here rather than deleted so the reasoning isn't rediscovered and
+  re-applied to a constraint that has since evaporated.
+- **Speeding up the main loop exposes latent races. This has now happened twice.** The pattern:
+  a local state change applied optimistically, then a poll issued *before* the device acted writes
+  the stale value straight back. These were always races; ~1000ms poll latency simply gave the
+  device time to settle before the answer arrived.
+    - 2026-08-04, power: the long-press applies optimistically and the confirming poll landed
+      first, so `_apply_poll_result` read the disagreement as "powered on externally" and played
+      the splash. Guarded by `_POWER_SETTLE_S` (10s).
+    - 2026-08-05, mute and play/pause: same shape, after composing the gauge took `draw_main`
+      ~350ms -> ~92ms. Mute's root cause was sharper than "a poll landed" -- the breathing cycle
+      starts *at* a trough and `_pulse_mute` polls at troughs, so muting armed a poll milliseconds
+      after its own command. Fixed at the source plus `_MUTE_SETTLE_S`/`_MEDIA_SETTLE_S` (1.5s).
+      Audited safe: `preset`/`preset_enabled` (never written by `apply_status()`) and `volume_db`
+      (poll skipped while the encoder moves). See [docs/rendering.md](rendering.md).
+    - Same speedup also unmasked a touch bug: any single untouched frame counted as a release, so
+      one FocalTouch dropout mid-press dispatched two taps. Unreachable at ~3 iterations/sec.
+  **Every optimistic write is a candidate. Re-audit them after anything gets faster.**
 - **Font glyph codepoint risk is documented in `Makefile`'s `fonts` target** -- read it before
   adding any character outside the existing ASCII 32-126 range.
 - **Before declaring anything "fixed" or "root cause found": check the cheapest available number
@@ -363,11 +463,49 @@ lasting rules that came out of it:
 
 ## Suggested Prompt For Next Session
 
+> **The cold-boot networking failure has not recurred since 2026-08-05.** For months, roughly half
+> of power-ons (50-90% across sessions) associated to WiFi, took a *correct* DHCP lease, and then
+> failed every subsequent request permanently until power was cut. On 2026-08-05 the user disabled
+> a second, poorly-placed AP that overlapped the primary in the same space. **Every boot since has
+> succeeded -- not one miss.**
+>
+> Read that carefully before concluding "it was the network, nothing to do with us," and before
+> concluding the opposite. Two things are true at once:
+>
+> - **This does not contradict the earlier "access-point choice" elimination.**
+>   `tools/wifi_pin_check.py` pinned association to the suspect BSSID and got 4/4 working TCP,
+>   which ruled out *which AP we associate with*. It could not rule out *co-channel interference
+>   between two overlapping APs* -- a different mechanism entirely, and one that a pinning test is
+>   structurally unable to see. The elimination was sound for what it tested; the conclusion drawn
+>   from it was broader than the evidence.
+> - **The resilience work was still worth doing.** The user's stance throughout was "even if it is
+>   the network, we need to be resilient," and the stack that came out of it is materially more
+>   reliable regardless of what the trigger was. Do not treat the AP fix as a reason to unwind any
+>   of it.
+>
+> The surviving technical lead, if it ever returns: **`EHOSTUNREACH` (errno 118) alongside
+> `ETIMEDOUT`** while DHCP succeeds. DHCP is broadcast; every failing peer is unicast, including
+> the gateway -- which points at **ARP resolution failing** for on-link addresses. Consistent with
+> an interference-driven cause: ARP is small, unacknowledged at the IP layer, and exactly what a
+> marginal RF environment loses first.
+>
+> `app.py` prints the full DHCP lease and the AP/BSSID it joined at every boot. Those three lines
+> were added for this investigation and are deliberately **permanent** -- they cost one print each
+> at startup, and they cannot be added retroactively to a boot that has already gone wrong. If the
+> fault returns, they are the first thing anyone will want. Do not delete them as leftover debug.
+>
+> Still eliminated with evidence, do not re-open without new data: socket/pool exhaustion,
+> CircuitPython heap pressure, boot ordering, BSSID pinning, and display memory pressure on the
+> radio (measured directly -- see [docs/rendering.md](rendering.md)).
+>
+> Note also that the device has **no network recovery at all**: once wedged, nothing ever
+> re-associates. Whatever the root cause turns out to be, a recovery path is worth having. A
+> gateway `ping()` cleanly distinguishes "our stack is broken" from "the target is switched off"
+> (remember `gc.collect()` first -- `ping()` raises `MemoryError` when the heap is tight).
+>
 > Read [docs/ota.md](ota.md) before touching `ota.py`/`ota_boot.py`'s Fetcher/session logic or
 > `app.py`'s Update-menu code. OTA is implemented and confirmed working end to end on real
-> hardware, fetching from S3 -- see that doc for the design. Separately (unrelated to OTA), the
-> real, 100%-reproducible touch/menu responsiveness bug documented below under "Still broken,
-> confirmed by real extended use" remains open and needs real, instrumented live investigation.
+> hardware, fetching from S3 -- see that doc for the design.
 >
 > Read "CircuitPython heap/boot-memory guardrails" above before touching boot-path code (`app.py`'s
 > `main()`), `.mpy` deploy tooling, or the `driver.py`/`ha_ui.py`/`wiim_ui.py` UI-extension split.

@@ -38,11 +38,7 @@ import terminalio
 from adafruit_display_text import label
 from adafruit_bitmap_font import bitmap_font
 
-try:
-    import bitmaptools as _bt
-    _BT = True
-except ImportError:
-    _BT = False
+import vectorio
 
 import config
 # driver is deliberately NOT imported at module level. Every function that
@@ -153,7 +149,7 @@ _DBTN_W    = 22    # button width
 _DBTN_GAP  = 14    # horizontal gap between buttons
 _DBTN_MAX  = 5     # pre-allocated label slots -- real devices use 2-4
 
-# ── Gauge bitmap palette (16-colour → 4-bit pixels, ~28 KB for 240×240) ───────
+# ── Shape palette (16 colours; every vectorio shape indexes into this one) ───
 # _PRR and _BTNSEL_FILTER are aliases, not separate slots: both used to be
 # their own shade of orange, but they're the same colour as _ORG now, so
 # they just point at it instead of duplicating the palette entry.
@@ -169,7 +165,7 @@ _BLUE  = 8   # muted arc fill
 _BTNSEL_OFF    = 9    # preset quick-select button: selected, but disabled
 _BTNSEL_MUTED  = 10   # preset quick-select button: selected preset, muted
 _GRAY  = 11  # busy arc fill -- see draw_busy()
-_TK_MENU = 12  # MENU-home frame -- see _draw_menu_home()
+_TK_MENU = 12  # MENU-home frame -- see _build_menu_home()
 _PRR            = _ORG   # power button ring / stem
 _BTNSEL_FILTER  = _ORG   # preset quick-select button: selected preset, enabled
 
@@ -258,12 +254,46 @@ def _preset_btn_rects(n):
     return rects
 
 
+# The quick-button HIT target is deliberately much larger than the drawn
+# button. The drawn square is _DBTN_W=22px -- about 3mm on this 240px 1.28"
+# panel, well under the ~7-9mm a fingertip reliably lands on. Confirmed live
+# 2026-08-04 by logging every tap's coordinate against the rects: aiming at
+# the first button (centre x=84) produced taps at x=63-69 and x=96-103, all
+# within ~20px of centre but all outside the 73-95 rect, so nothing happened
+# and the row read as "locked out" while volume and mute kept working.
+#
+# Widening is free here: app.py routes the whole PRESET_NAME_Y..MENU_TAP_Y
+# band (y 138-195) to this function and nothing else competes for it, so a
+# tap that misses every button currently does nothing at all.
+_DBTN_HIT_PAD_Y = 14                       # vertical slack around the drawn row
+_DBTN_HIT_MAX_DX = _DBTN_W + _DBTN_GAP // 2  # 29px: outward reach past the end buttons
+
+
 def preset_button_at(x, y, n):
-    """Return the tapped quick-select button index [0..n-1], or -1."""
-    for i, (x0, y0, x1, y1) in enumerate(_preset_btn_rects(n)):
-        if x0 <= x <= x1 and y0 <= y <= y1:
-            return i
-    return -1
+    """Return the tapped quick-select button index [0..n-1], or -1.
+
+    Nearest-button-within-tolerance rather than a strict rect test, so the
+    gaps between buttons aren't dead zones -- interior boundaries land on
+    the true midpoint between adjacent centres either way, while
+    _DBTN_HIT_MAX_DX additionally extends the reach past the outermost
+    buttons (see the note above for the measurements behind this).
+
+    n is capped at _DBTN_MAX because that's how many buttons are actually
+    drawn (_draw_preset_filter_buttons caps the same way). Without the cap a
+    longer preset list hit-tests against a layout that was never rendered --
+    the exact drawn-vs-tap-rect divergence driver.py's CAPS note warns about.
+    """
+    n = min(n, _DBTN_MAX)
+    if n <= 0:
+        return -1
+    if not (_DBTN_Y0 - _DBTN_HIT_PAD_Y <= y <= _DBTN_Y0 + _DBTN_H + _DBTN_HIT_PAD_Y):
+        return -1
+    best, best_dx = -1, None
+    for i, (x0, _y0, x1, _y1) in enumerate(_preset_btn_rects(n)):
+        dx = abs(x - (x0 + x1) // 2)
+        if best_dx is None or dx < best_dx:
+            best, best_dx = i, dx
+    return best if best_dx is not None and best_dx <= _DBTN_HIT_MAX_DX else -1
 
 
 # Play/pause status row -- shares the same text slot as the preset name
@@ -384,131 +414,93 @@ def _arc_color(angle):
     else:                     return _RED
 
 
-def _thick_tick(bmp, angle_deg, ix, iy, ox, oy, thickness, ci):
-    """Draw a radial tick with given pixel thickness by offsetting along the tangent."""
-    if thickness <= 1:
-        _line(bmp, ix, iy, ox, oy, ci)
-        return
-    rad = math.radians(angle_deg)
-    px = math.cos(rad)
-    py = math.sin(rad)
-    half = thickness // 2
-    for offset in range(-half, thickness - half):
-        dx = int(round(offset * px))
-        dy = int(round(offset * py))
-        _line(bmp, ix + dx, iy + dy, ox + dx, oy + dy, ci)
+# ── Shape geometry ────────────────────────────────────────────────────────────
+# These return point lists for vectorio.Polygon. Nothing here rasterises:
+# displayio composites the shapes in C during refresh(), which is the whole
+# reason this file no longer owns a 28.8KB bitmap. See docs/rendering.md.
+#
+# The one hazard, and both bugs found while proving this out were it:
+# THIN STROKES DO NOT SURVIVE INTEGER ROUNDING. A fractional offset that
+# rounds to the same integer on both sides gives a zero-area polygon, which
+# renders as nothing at all -- silently, with no error. Every helper below
+# that produces a 1px feature offsets by whole pixels for that reason.
 
+def _sector_points(a0, a1, r_in, r_out, step=6.0):
+    """Annular sector: out along the outer edge, back along the inner one.
 
-def _line(bmp, x0, y0, x1, y1, idx):
-    """1-pixel line; uses bitmaptools when available, Bresenham otherwise."""
-    if _BT:
-        x0 = max(0, min(_W - 1, x0)); y0 = max(0, min(_H - 1, y0))
-        x1 = max(0, min(_W - 1, x1)); y1 = max(0, min(_H - 1, y1))
-        _bt.draw_line(bmp, x0, y0, x1, y1, idx)
-        return
-    dx = abs(x1 - x0); dy = abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx - dy
-    while True:
-        if 0 <= x0 < _W and 0 <= y0 < _H:
-            bmp[x0, y0] = idx
-        if x0 == x1 and y0 == y1:
-            break
-        e2 = 2 * err
-        if e2 > -dy: err -= dy; x0 += sx
-        if e2 <  dx: err += dx; y0 += sy
-
-
-def _rect_outline(bmp, x0, y0, x1, y1, idx):
-    """1-pixel rectangle outline."""
-    _line(bmp, x0, y0, x1, y0, idx)
-    _line(bmp, x0, y1, x1, y1, idx)
-    _line(bmp, x0, y0, x0, y1, idx)
-    _line(bmp, x1, y0, x1, y1, idx)
-
-
-def _arc(bmp, a_start, a_end, r_in, r_out, color, step=1.0):
-    """Thick arc band.  color = palette index or callable(angle_deg)→index."""
-    a = a_start
-    while a <= a_end + step * 0.05:
-        rad = math.radians(a)
-        s = math.sin(rad); c = math.cos(rad)
-        ix = int(CX + r_in  * s + 0.5); iy = int(CY - r_in  * c + 0.5)
-        ox = int(CX + r_out * s + 0.5); oy = int(CY - r_out * c + 0.5)
-        ci = color(a) if callable(color) else color
-        _line(bmp, ix, iy, ox, oy, ci)
-        a += step
-
-
-def _arc_solid(bmp, a_start, a_end, r_in, r_out, color):
-    """Scanline arc-band fill: every pixel covered exactly once, no artifacts.
-
-    For each row in the bounding box, computes the annulus x-span, checks each
-    pixel's angle with atan2, and flushes same-color runs with fill_region.
-    Works for any arc range including those that cross the 0°/360° boundary.
+    step=6 degrees keeps the chord sagitta at r=102 under 0.6px, below where
+    a flat-shaded edge starts to read as faceted.
     """
-    r_out2  = r_out * r_out
-    r_in2   = r_in  * r_in
-    wraps   = a_end > 360.0
-    a_end2  = a_end - 360.0 if wraps else a_end
-    is_grad = callable(color)
-
-    for y in range(max(0, CY - r_out), min(_H, CY + r_out + 1)):
-        dy  = y - CY
-        dy2 = dy * dy
-        if dy2 >= r_out2:
-            continue
-        dx_out = int(math.sqrt(float(r_out2 - dy2)))
-        dx_in  = int(math.sqrt(float(max(0.0, r_in2 - dy2)))) if dy2 < r_in2 else 0
-
-        for xA, xB in ((CX - dx_out, CX - dx_in), (CX + dx_in, CX + dx_out)):
-            ci_run = -1
-            x_run  = xA
-            for x in range(max(0, xA), min(_W, xB + 1)):
-                dx = x - CX
-                a  = math.degrees(math.atan2(dx, -dy))
-                if a < 0.0:
-                    a += 360.0
-                ok = (a >= a_start or a <= a_end2) if wraps else (a_start <= a <= a_end2)
-                arc_a = a if a >= a_start else a + 360.0   # unwrap into arc space
-                ci = (color(arc_a) if is_grad else color) if ok else -1
-                if ci != ci_run:
-                    if ci_run >= 0:
-                        if _BT:
-                            _bt.fill_region(bmp, x_run, y, x, y + 1, ci_run)
-                        else:
-                            for xx in range(x_run, x):
-                                bmp[xx, y] = ci_run
-                    ci_run = ci
-                    x_run  = x
-            if ci_run >= 0:
-                xe = min(_W, xB + 1)
-                if _BT:
-                    _bt.fill_region(bmp, x_run, y, xe, y + 1, ci_run)
-                else:
-                    for xx in range(x_run, xe):
-                        bmp[xx, y] = ci_run
+    n = max(2, int((a1 - a0) / step + 0.999))
+    pts = []
+    for i in range(n + 1):
+        pts.append(_axy(r_out, a0 + (a1 - a0) * i / n))
+    for i in range(n, -1, -1):
+        pts.append(_axy(r_in, a0 + (a1 - a0) * i / n))
+    return pts
 
 
-def _tri(bmp, x0, y0, x1, y1, x2, y2, idx):
-    """Fill a triangle via scanline rasterisation."""
-    pts = sorted(((x0, y0), (x1, y1), (x2, y2)), key=lambda p: p[1])
-    (ax, ay), (bx, by), (cx, cy) = pts
+def _tick_quad(angle, r0, r1, thickness):
+    """Radial tick as a 4-point quad, offset along the tangent.
 
-    def _xi(y, p, q):
-        if q[1] == p[1]:
-            return float(p[0])
-        return p[0] + (q[0] - p[0]) * float(y - p[1]) / (q[1] - p[1])
+    Offsets are asymmetric (-t//2 and -t//2 + t) rather than +/- t/2:
+    rounding a symmetric half-width outward inflates the tick by a pixel on
+    each side, and rounding it inward collapses a 1px tick to zero area.
+    This lands the width on exactly `thickness`.
+    """
+    rad = math.radians(angle)
+    tx, ty = math.cos(rad), math.sin(rad)          # tangent unit vector
+    o0 = -(thickness // 2)
+    o1 = o0 + thickness
+    ix, iy = _axy(r0, angle)
+    ox, oy = _axy(r1, angle)
+    return [
+        (int(round(ix + tx * o0)), int(round(iy + ty * o0))),
+        (int(round(ox + tx * o0)), int(round(oy + ty * o0))),
+        (int(round(ox + tx * o1)), int(round(oy + ty * o1))),
+        (int(round(ix + tx * o1)), int(round(iy + ty * o1))),
+    ]
 
-    for y in range(max(0, ay), min(_H, cy + 1)):
-        if y <= by:
-            xa = _xi(y, (ax, ay), (bx, by)); xb = _xi(y, (ax, ay), (cx, cy))
-        else:
-            xa = _xi(y, (bx, by), (cx, cy)); xb = _xi(y, (ax, ay), (cx, cy))
-        x_lo = max(0, int(min(xa, xb))); x_hi = min(_W - 1, int(max(xa, xb)))
-        for x in range(x_lo, x_hi + 1):
-            bmp[x, y] = idx
+
+def _stroke_quad(x0, y0, x1, y1):
+    """A 1px line as a quad, offset a WHOLE pixel along the minor axis.
+
+    Not a unit normal: on a 45-degree segment that is (0.707, 0.707), and
+    truncating it to int lands both offset points back on the originals --
+    zero area, invisible. Stepping one pixel perpendicular to the dominant
+    axis also matches what a Bresenham line actually produces.
+    """
+    dx, dy = x1 - x0, y1 - y0
+    if abs(dx) >= abs(dy):
+        ox, oy = 0, 1
+    else:
+        ox, oy = 1, 0
+    return [(int(x0), int(y0)), (int(x1), int(y1)),
+            (int(x1 + ox), int(y1 + oy)), (int(x0 + ox), int(y0 + oy))]
+
+
+def _pointer_points(angle):
+    """Inward-pointing wedge: base spread at the display edge, tip at the arc."""
+    return [
+        _axy(_R_PTR_TIP,  angle),
+        _axy(_R_PTR_BASE, angle - _PTR_HALF),
+        _axy(_R_PTR_BASE, angle + _PTR_HALF),
+    ]
+
+
+def _colour_bands():
+    """(a0, a1, palette_index) per gradient band, from the same fractions
+    _arc_color() uses -- so the boundaries land exactly where they always
+    have rather than wherever a uniform subdivision happens to put them."""
+    out = []
+    edges = ((0.0, _FRAC_AMBER, _GRN), (_FRAC_AMBER, _FRAC_ORANGE, _AMB),
+             (_FRAC_ORANGE, _FRAC_RED, _ORG), (_FRAC_RED, 1.0, _RED))
+    for f0, f1, ci in edges:
+        if f1 > f0:
+            out.append((_ARC_START + f0 * _ARC_SWEEP,
+                        _ARC_START + f1 * _ARC_SWEEP, ci))
+    return out
+
 
 
 def _lerp_color(c0, c1, frac):
@@ -522,16 +514,6 @@ def _lerp_color(c0, c1, frac):
     return (r << 16) | (g << 8) | b
 
 
-def _clear(bmp):
-    if _BT:
-        _bt.fill_region(bmp, 0, 0, _W, _H, _BG)
-    else:
-        for y in range(_H):
-            for x in range(_W):
-                bmp[x, y] = _BG
-
-# ── Gauge scene rendering ─────────────────────────────────────────────────────
-
 def _tick_values():
     """dB values for tick marks, every 5 dB, anchored at 0 -- not at
     _VOL_MIN. Denon's -80..20 range is a multiple of 5 either way, but a
@@ -543,8 +525,42 @@ def _tick_values():
         yield i * 5.0
 
 
-def _draw_ticks(bmp):
+
+# ── Layer builders ────────────────────────────────────────────────────────────
+# Each returns a Group so a whole layer can be shown or hidden with one flag.
+# That is what replaces the old _clear()/full-repaint model: nothing is ever
+# erased, it is just not composited.
+
+# Arc sectors exist only to place the colour boundaries. Subdividing further
+# buys nothing -- measured 2026-08-05, 4 sectors 1.74ms vs 24 sectors 1.65ms
+# per frame, so the bounding-box culling this was once expected to need
+# turned out to be irrelevant.
+_ARC_SECTORS = 12
+
+
+def _build_arc(pal):
+    """The gradient arc band. Returns (group, shapes, colour_indices)."""
+    g = displayio.Group()
+    shapes, cis = [], []
+    for a0, a1, ci in _colour_bands():
+        share = max(1, int(round((a1 - a0) / _ARC_SWEEP * _ARC_SECTORS)))
+        for k in range(share):
+            s0 = a0 + (a1 - a0) * k / share
+            s1 = a0 + (a1 - a0) * (k + 1) / share
+            if k < share - 1 or a1 < _ARC_START + _ARC_SWEEP:
+                s1 += 0.4        # overlap the next piece; no seam shows through
+            s = vectorio.Polygon(pixel_shader=pal,
+                                 points=_sector_points(s0, s1, _R_IN, _R_OUT),
+                                 x=0, y=0, color_index=ci)
+            g.append(s)
+            shapes.append(s)
+            cis.append(ci)
+    return g, shapes, cis
+
+
+def _build_ticks(pal):
     """Tick marks just outside the arc band, every 5 dB."""
+    g = displayio.Group()
     for db in _tick_values():
         angle = _vol_to_angle(db)
         if _HAS_ZERO_REF and abs(db) < 0.01:
@@ -553,40 +569,10 @@ def _draw_ticks(bmp):
             r_out, ci, thick = _R_TK_MAJOR, _TK_L, 2
         else:
             r_out, ci, thick = _R_TK_MINOR, _TK_L, 1
-        ix, iy = _axy(_R_TK_BASE, angle)
-        ox, oy = _axy(r_out, angle)
-        _thick_tick(bmp, angle, ix, iy, ox, oy, thick, ci)
-
-
-def _draw_pointer(bmp, angle, idx):
-    """Inward-pointing wedge: base spread at display edge, tip aimed at outer arc."""
-    tx, ty = _axy(_R_PTR_TIP,  angle)
-    lx, ly = _axy(_R_PTR_BASE, angle - _PTR_HALF)
-    rx, ry = _axy(_R_PTR_BASE, angle + _PTR_HALF)
-    _tri(bmp, tx, ty, lx, ly, rx, ry, idx)
-
-
-def _draw_power_symbol(bmp):
-    """Classic power icon: scanline-filled ring + stem matched to ring stroke width."""
-    # Ring: scanline fill → no radial-line gap artifacts
-    _arc_solid(bmp, _PWR_GAP, 360.0 - _PWR_GAP, _PWR_R_IN, _PWR_R_OUT, _PRR)
-    # Stem: same horizontal width as the ring's radial stroke
-    stem_half = (_PWR_R_OUT - _PWR_R_IN) // 2   # 10 px each side = 20 px total
-    x0 = max(0, CX - stem_half)
-    x1 = min(_W, CX + stem_half)
-    for y in range(max(0, _PWR_STEM_TOP), min(_H, _PWR_STEM_BOT + 1)):
-        if _BT:
-            _bt.fill_region(bmp, x0, y, x1, y + 1, _PRR)
-        else:
-            for x in range(x0, x1):
-                bmp[x, y] = _PRR
-
-
-def _draw_preset_buttons(bmp, n, selected_idx, selected_ci):
-    """Outline the n quick-select buttons; selected_idx gets selected_ci."""
-    for i, (x0, y0, x1, y1) in enumerate(_preset_btn_rects(n)):
-        ci = selected_ci if i == selected_idx else _TK_L
-        _rect_outline(bmp, x0, y0, x1, y1, ci)
+        g.append(vectorio.Polygon(
+            pixel_shader=pal, points=_tick_quad(angle, _R_TK_BASE, r_out, thick),
+            x=0, y=0, color_index=ci))
+    return g
 
 
 # "Home" frame behind the MENU hint -- a roof line + two flared legs, no
@@ -606,132 +592,182 @@ _MENU_HOME_TOP_HW    = 28    # roof line half-width
 _MENU_HOME_LEG_HW    = 68    # leg half-width at the bottom
 
 
-def _draw_menu_home(bmp):
+def _build_menu_home(pal):
     tl = (CX - _MENU_HOME_TOP_HW, _MENU_HOME_TOP_Y)
     tr = (CX + _MENU_HOME_TOP_HW, _MENU_HOME_TOP_Y)
     br = (CX + _MENU_HOME_LEG_HW, _MENU_HOME_BOTTOM_Y)
     bl = (CX - _MENU_HOME_LEG_HW, _MENU_HOME_BOTTOM_Y)
-    _line(bmp, tl[0], tl[1], tr[0], tr[1], _TK_MENU)
-    _line(bmp, tr[0], tr[1], br[0], br[1], _TK_MENU)
-    _line(bmp, bl[0], bl[1], tl[0], tl[1], _TK_MENU)
+    g = displayio.Group()
+    for p0, p1 in ((tl, tr), (tr, br), (bl, tl)):
+        g.append(vectorio.Polygon(
+            pixel_shader=pal, points=_stroke_quad(p0[0], p0[1], p1[0], p1[1]),
+            x=0, y=0, color_index=_TK_MENU))
+    return g
 
 
-# Play/pause icon geometry -- drawn directly into the gauge bitmap with the
-# same _tri() primitive the volume pointer uses, rather than as a font
-# glyph. This sidesteps the font-encoding-table-bloat risk entirely (see
-# the note above _PLAY_CHAR/_PAUSE_CHAR): a codepoint far outside the base
-# ASCII range balloons every generated .pcf's encoding table regardless of
-# how good the glyph itself looks (confirmed: U+25B6, the "right-pointing
-# triangle" Unicode glyph, renders fine at this size but still isn't worth
-# that cost when a few filled shapes do the same job with zero font
-# involvement). Sized to roughly match the row's font-rendered text height
-# (~16px) without touching the row above -- the exact failure mode that
-# sank an earlier Unicode pause-bar attempt.
+def _build_power(pal):
+    """Classic power icon: ring with a gap at 12 o'clock, plus a stem.
+
+    The ring is one polygon rather than a scanline fill -- the gap makes it a
+    simple (non-self-intersecting) outline, so it needs no special handling.
+    """
+    g = displayio.Group()
+    g.append(vectorio.Polygon(
+        pixel_shader=pal,
+        points=_sector_points(_PWR_GAP, 360.0 - _PWR_GAP,
+                              _PWR_R_IN, _PWR_R_OUT, step=8.0),
+        x=0, y=0, color_index=_PRR))
+    stem_half = (_PWR_R_OUT - _PWR_R_IN) // 2   # 10 px each side = 20 px total
+    g.append(vectorio.Rectangle(
+        pixel_shader=pal, width=stem_half * 2,
+        height=_PWR_STEM_BOT - _PWR_STEM_TOP + 1,
+        x=CX - stem_half, y=_PWR_STEM_TOP, color_index=_PRR))
+    return g
+
+
+def _build_presets(pal):
+    """Pre-allocate _DBTN_MAX button outlines, two Rectangles each.
+
+    An outline is a filled rect with a background-coloured rect inset inside
+    it -- two shapes, versus four if each edge were its own. Positions and
+    colours are set per draw by _draw_preset_filter_buttons(); the row layout
+    depends on how many presets the backend actually reports.
+    """
+    g = displayio.Group()
+    pairs = []
+    for _i in range(_DBTN_MAX):
+        outer = vectorio.Rectangle(pixel_shader=pal, width=_DBTN_W,
+                                   height=_DBTN_H, x=0, y=_DBTN_Y0,
+                                   color_index=_TK_L)
+        inner = vectorio.Rectangle(pixel_shader=pal, width=_DBTN_W - 2,
+                                   height=_DBTN_H - 2, x=1, y=_DBTN_Y0 + 1,
+                                   color_index=_BG)
+        g.append(outer)
+        g.append(inner)
+        pairs.append((outer, inner))
+    return g, pairs
+
+
+# Play/pause icon geometry -- shapes rather than a font glyph. This sidesteps
+# the font-encoding-table-bloat risk entirely (see the note above
+# _PLAY_CHAR/_PAUSE_CHAR): a codepoint far outside the base ASCII range
+# balloons every generated .pcf's encoding table regardless of how good the
+# glyph itself looks (confirmed: U+25B6, the "right-pointing triangle" Unicode
+# glyph, renders fine at this size but still isn't worth that cost when a few
+# filled shapes do the same job with zero font involvement). Sized to roughly
+# match the row's font-rendered text height (~16px) without touching the row
+# above -- the exact failure mode that sank an earlier Unicode pause-bar
+# attempt.
 _ICON_HALF_H = 8    # half-height of both shapes
 _ICON_HALF_W = 7    # play triangle: tip-to-base half-width
 _ICON_BAR_W  = 4    # pause: width of each bar
 _ICON_GAP    = 4    # pause: gap between the two bars
 
 
-def draw_play_pause_icon(bmp, cx, cy, playing, ci):
-    """Draw a play triangle or pause bars centered at (cx, cy).
+def _build_icon(pal):
+    """Play triangle + two pause bars, all three hidden until asked for.
+
+    Returns (group, play_shape, (bar0, bar1)). Points are local to the
+    shape's own x/y so repositioning is two integer writes, not a rebuild.
+    """
+    g = displayio.Group()
+    play = vectorio.Polygon(
+        pixel_shader=pal,
+        points=[(-_ICON_HALF_W, -_ICON_HALF_H), (-_ICON_HALF_W, _ICON_HALF_H),
+                (_ICON_HALF_W, 0)],
+        x=CX, y=CY, color_index=_TK_L)
+    bars = []
+    for _i in range(2):
+        bars.append(vectorio.Rectangle(
+            pixel_shader=pal, width=_ICON_BAR_W, height=_ICON_HALF_H * 2,
+            x=CX, y=CY, color_index=_TK_L))
+    g.append(play)
+    g.append(bars[0])
+    g.append(bars[1])
+    g.hidden = True
+    return g, play, bars
+
+
+def draw_play_pause_icon(ui, cx, cy, playing, ci):
+    """Show a play triangle or pause bars centered at (cx, cy).
 
     playing=True draws pause bars, not a pause icon's opposite -- a
     play/pause control always shows the action a tap performs, not the
     current state (see dial_ui.py's _MEDIA_STATE_TEXT note, same
-    convention, formerly font text, now this).
+    convention, formerly font text, now these shapes).
+
+    Takes `ui`, not a bitmap: there is no bitmap any more. Callers are the
+    backend UI extensions (ha_ui.py, wiim_ui.py) -- see driver.py's
+    UI-extension contract. They only ever SHOW the icon; hiding it is
+    _draw_status_rows()'s job, which blanks it before delegating so a
+    backend that stops reporting media_state doesn't leave one stranded.
     """
+    play, bars = ui["icon_play"], ui["icon_bars"]
+    ui["l_icon"].hidden = False
+    play.color_index = ci
+    bars[0].color_index = ci
+    bars[1].color_index = ci
     if playing:
-        for x0 in (cx - _ICON_GAP // 2 - _ICON_BAR_W, cx + _ICON_GAP // 2):
-            xa, xb = max(0, x0), min(_W, x0 + _ICON_BAR_W)
-            ya, yb = max(0, cy - _ICON_HALF_H), min(_H, cy + _ICON_HALF_H)
-            if _BT:
-                _bt.fill_region(bmp, xa, ya, xb, yb, ci)
-            else:
-                for y in range(ya, yb):
-                    for x in range(xa, xb):
-                        bmp[x, y] = ci
+        play.hidden = True
+        for k, bx in enumerate((cx - _ICON_GAP // 2 - _ICON_BAR_W,
+                                cx + _ICON_GAP // 2)):
+            bars[k].hidden = False
+            bars[k].x = bx
+            bars[k].y = cy - _ICON_HALF_H
     else:
-        _tri(bmp, cx - _ICON_HALF_W, cy - _ICON_HALF_H,
-                   cx - _ICON_HALF_W, cy + _ICON_HALF_H,
-                   cx + _ICON_HALF_W, cy, ci)
+        play.hidden = False
+        play.x, play.y = cx, cy
+        bars[0].hidden = True
+        bars[1].hidden = True
 
 
-def _restore_region(bmp, angle, muted):
-    """Erase the pointer at `angle` by restoring the arc band and hollow.
-
-    Only redraws the small angular window around the pointer – the bitmap
-    dirty region stays tiny so the SPI transfer is near-instant.
-    """
-    # Clamped to the gauge's actual sweep -- angle ± the pointer's half-angle
-    # margin can overshoot _ARC_START/_ARC_START+_ARC_SWEEP when the pointer
-    # sits near either end (i.e. near min or max volume). _arc_solid() has no
-    # bounds-check of its own (it's a generic primitive that paints exactly
-    # the range it's given, including a wraparound past 360°), and
-    # _arc_color() still returns a real color for an out-of-range angle
-    # (clamped internally to green/red rather than "no color") -- so an
-    # unclamped window here was repainting extra colored pixels just past
-    # the true arc tip on every incremental encoder tick near an extreme,
-    # visibly extending the green/red end of the arc past its real boundary
-    # after repeated ticks (confirmed live: red visibly crept ~5% further
-    # around at max volume; the mirror bug exists at min volume with green,
-    # just less noticed). A full draw_main() repaints the exact bounds and
-    # masks this every time, which is why it only showed up during a live,
-    # sustained encoder spin -- confirmed by simulating one off-device
-    # (many draw_volume() calls in sequence) and diffing against a clean
-    # full render at the same final angle: identical after this clamp,
-    # divergent before it.
-    a0 = max(_ARC_START, angle - _PTR_HALF - 2)
-    a1 = min(_ARC_START + _ARC_SWEEP, angle + _PTR_HALF + 2)
-    arc_col = _BLUE if muted else _arc_color
-    # 1. Erase with a slightly-expanded black triangle – same algorithm as draw,
-    #    guarantees every pointer pixel is covered with no mismatched gaps.
-    tx, ty = _axy(_R_PTR_TIP  - 3,  angle)
-    lx, ly = _axy(_R_PTR_BASE + 2,  angle - _PTR_HALF - 1)
-    rx, ry = _axy(_R_PTR_BASE + 2,  angle + _PTR_HALF + 1)
-    _tri(bmp, tx, ty, lx, ly, rx, ry, _BG)
-    # 2. Restore arc band (gap-free concentric sweep)
-    _arc_solid(bmp, a0, a1, _R_IN, _R_OUT, arc_col)
-    # 3. Redraw any tick marks that fall inside the window
-    for db in _tick_values():
-        ta = _vol_to_angle(db)
-        if a0 <= ta <= a1:
-            if _HAS_ZERO_REF and abs(db) < 0.01:
-                r_out, ci, thick = _R_TK_ZERO, _TK_0, 3
-            elif round(db) % 10 == 0:  r_out, ci, thick = _R_TK_MAJOR, _TK_L, 2
-            else:                       r_out, ci, thick = _R_TK_MINOR, _TK_L, 1
-            ix, iy = _axy(_R_TK_BASE, ta)
-            ox, oy = _axy(r_out, ta)
-            _thick_tick(bmp, ta, ix, iy, ox, oy, thick, ci)
+def _hide_icon(ui):
+    ui["l_icon"].hidden = True
 
 
-def _render_gauge(bmp, vol_db, muted, power_off=False, busy=False):
-    """Full re-render: clear, draw static gradient arc + ticks, then pointer.
+# ── Gauge scene control ───────────────────────────────────────────────────────
+# What used to be _render_gauge()/_clear()/_restore_region(). No pixels are
+# produced here: these set visibility, colour indices and the pointer's three
+# points, and displayio does the rest during refresh().
 
-    The arc is always drawn at full gradient intensity (like a traditional
-    instrument scale). The pointer alone indicates the current level.
-    vol_db < _VOL_MIN (sentinel −81) = startup: no pointer drawn.
-    busy=True (see draw_busy()) takes precedence over muted -- flat gray
-    instead of flat blue, no animation (just one static frame; the main
-    loop can't animate while blocked on the device call this represents).
-    """
-    _clear(bmp)
+def _set_arc_mode(ui, muted, busy):
+    """Recolour the arc band. Gradient normally; flat blue muted; flat gray
+    busy (busy takes precedence -- see draw_busy). This is the whole cost of
+    a mute or busy transition: no repaint, no re-derived geometry."""
+    flat = _GRAY if busy else (_BLUE if muted else None)
+    for i, s in enumerate(ui["arc"]):
+        s.color_index = ui["arc_ci"][i] if flat is None else flat
 
-    if power_off:
-        _draw_power_symbol(bmp)
+
+def _set_pointer(ui, vol_db):
+    """Place the pointer, or hide it. vol_db < _VOL_MIN (sentinel -81) means
+    startup: no pointer. Returns the angle drawn, or None."""
+    if vol_db < _VOL_MIN:
+        ui["l_ptr"].hidden = True
         return None
+    angle = _vol_to_angle(vol_db)
+    ui["ptr"].points = _pointer_points(angle)
+    ui["l_ptr"].hidden = False
+    return angle
 
-    # Full gradient arc – concentric-sweep fill, gap-free
-    arc_col = _GRAY if busy else (_BLUE if muted else _arc_color)
-    _arc_solid(bmp, _ARC_START, _ARC_START + _ARC_SWEEP, _R_IN, _R_OUT, arc_col)
-    _draw_ticks(bmp)
 
-    # Pointer at current volume
-    if vol_db >= _VOL_MIN:
-        vol_angle = _vol_to_angle(vol_db)
-        _draw_pointer(bmp, vol_angle, _PTR)
-        return vol_angle
-    return None
+def _show_gauge(ui, arc=True, ticks=True, presets=False, menu_home=False,
+                power=False):
+    """Set which gauge layers are composited. Everything defaults off except
+    the arc and ticks, so each caller states exactly what its screen has."""
+    ui["l_arc"].hidden      = not arc
+    ui["l_ticks"].hidden    = not ticks
+    ui["l_presets"].hidden  = not presets
+    ui["l_home"].hidden     = not menu_home
+    ui["l_power"].hidden    = not power
+
+
+def _hide_gauge(ui):
+    """Blank the whole gauge -- the menu overlay's background clear."""
+    _show_gauge(ui, arc=False, ticks=False)
+    ui["l_ptr"].hidden = True
+    _hide_icon(ui)
+
 
 # ── Volume formatting ─────────────────────────────────────────────────────────
 
@@ -804,6 +840,11 @@ def _draw_status_rows(ui, state, dim_color):
     Playing/Paused below it) plus the skip icons; see that module for why.
     """
     import driver as _driver
+    # Blank the play/pause icon first. Extensions only ever SHOW it (see
+    # draw_play_pause_icon), and nothing repaints over it now that the scene
+    # is retained -- so a backend that stops reporting media_state would
+    # otherwise leave one stranded on screen forever.
+    _hide_icon(ui)
     if _driver.ui_impl is not None:
         _driver.ui_impl.draw_status_rows(ui, state, dim_color)
         return
@@ -872,8 +913,16 @@ def _draw_preset_filter_buttons(ui, state):
     else:
         sel_ci, sel_color = _BTNSEL_FILTER, _C_WARN
 
-    _draw_preset_buttons(ui["bmp"], n, selected, sel_ci)
     rects = _preset_btn_rects(n)
+    for i, (outer, inner) in enumerate(ui["presets"]):
+        if i < n:
+            x0, y0, x1, y1 = rects[i]
+            outer.hidden = inner.hidden = False
+            outer.x, outer.y = x0, y0
+            outer.color_index = sel_ci if i == selected else _TK_L
+            inner.x, inner.y = x0 + 1, y0 + 1
+        else:
+            outer.hidden = inner.hidden = True
     for i, fl in enumerate(ui["filters"]):
         if i < n:
             x0, y0, x1, y1 = rects[i]
@@ -893,11 +942,41 @@ def init():
     for i, c in enumerate(_PALETTE):
         palette[i] = c
 
-    # Full-screen gauge bitmap (4-bit pixels, ~28 KB)
-    bmp = displayio.Bitmap(_W, _H, 16)
-
     group = displayio.Group()
-    group.append(displayio.TileGrid(bmp, pixel_shader=palette))
+
+    # ── Gauge layers ──────────────────────────────────────────────────────────
+    # Retained vectorio shapes, not a bitmap. Appended back-to-front; each
+    # layer is its own Group so a screen can compose itself by setting
+    # `hidden` flags instead of repainting. See docs/rendering.md for the
+    # measurements behind this (28,800 bytes reclaimed, 29.2ms -> 1.7ms).
+    #
+    # displayio does not clear uncovered pixels, so the black background has
+    # to be a real shape -- one full-screen Rectangle, no pixel storage.
+    # (show_splash() has always done the same thing for the same reason.)
+    bg = vectorio.Rectangle(pixel_shader=palette, width=_W, height=_H,
+                            x=0, y=0, color_index=_BG)
+    group.append(bg)
+
+    l_arc, arc_shapes, arc_cis = _build_arc(palette)
+    l_ticks = _build_ticks(palette)
+    l_power = _build_power(palette)
+    l_presets, preset_pairs = _build_presets(palette)
+    l_home = _build_menu_home(palette)
+    l_icon, icon_play, icon_bars = _build_icon(palette)
+
+    # The pointer gets its own Group purely so it can be hidden as a unit.
+    l_ptr = displayio.Group()
+    ptr = vectorio.Polygon(pixel_shader=palette,
+                           points=_pointer_points(_ARC_START),
+                           x=0, y=0, color_index=_PTR)
+    l_ptr.append(ptr)
+    l_ptr.hidden = True
+
+    for layer in (l_arc, l_ticks, l_ptr, l_power, l_presets, l_home, l_icon):
+        group.append(layer)
+    l_power.hidden = True
+    l_presets.hidden = True
+    l_home.hidden = True
 
     # ── Volume number: large integer left-of-centre, small decimal right ──────
     # (or, when _SHOW_DECIMAL is False, just the integer dead-centered --
@@ -953,7 +1032,7 @@ def init():
     group.append(media_next_lbl)
     group.append(player_lbl)
 
-    # ── Preset quick-select buttons: numbered labels over the bitmap outlines ──
+    # ── Preset quick-select buttons: numbered labels over the shape outlines ──
     # Positioned dynamically each draw_main() call, since the row layout
     # depends on how many presets state.preset_quick_names actually has.
     filter_btns = []
@@ -995,7 +1074,23 @@ def init():
     return {
         "display":    display,
         "group":      group,      # main UI group; needed to restore after splash
-        "bmp":        bmp,
+        # Gauge layers. `arc`/`arc_ci` are handed back as a list rather than
+        # recovered by walking l_arc: the selected preset outline shares
+        # _ORG with the arc's orange band, so filtering shapes by colour
+        # would silently pick it up and recolour it on mute.
+        "l_arc":      l_arc,
+        "arc":        arc_shapes,
+        "arc_ci":     arc_cis,
+        "l_ticks":    l_ticks,
+        "l_ptr":      l_ptr,
+        "ptr":        ptr,
+        "l_power":    l_power,
+        "l_presets":  l_presets,
+        "presets":    preset_pairs,
+        "l_home":     l_home,
+        "l_icon":     l_icon,
+        "icon_play":  icon_play,
+        "icon_bars":  icon_bars,
         "vol_int":    vol_int,
         "vol_dec":    vol_dec,
         "input":      input_lbl,
@@ -1007,8 +1102,16 @@ def init():
         "menu":       menu_lbl,
         "items":      menu_items,
         "status":     status_lbl,
-        "_ptr_angle": None,   # last-drawn pointer angle; None = no pointer
     }
+
+
+# _scene_signature() used to live here, guarding a fast path that skipped
+# repainting the static arc and ticks when nothing but the volume had
+# changed. It was a real 5.8x win (2026-08-04) but it was a cache in front of
+# an expensive model. With the gauge composed rather than painted there is no
+# repaint to skip: a full draw_main() sets a handful of visibility flags,
+# colour indices and three pointer points. Removed 2026-08-05 -- see
+# docs/rendering.md.
 
 
 def draw_main(ui, state):
@@ -1018,10 +1121,21 @@ def draw_main(ui, state):
     for ml in ui["items"]:
         ml.text = ""
 
+    # Never claim the device is off on state we have not actually heard from
+    # it. state.power initialises to "STANDBY", so without this check a
+    # device we simply cannot reach renders the identical standby power ring
+    # -- indistinguishable from a real power-off, from every call site (see
+    # state.AVRState.power_known).
+    if not getattr(state, "power_known", True):
+        ui["display"].brightness = getattr(state, "brightness", BRIGHTNESS_ON)
+        draw_reconnecting(ui)
+        return
+
     if state.power != "ON":
         ui["display"].brightness = state.brightness * _STANDBY_BRIGHTNESS_FRAC
-        _render_gauge(ui["bmp"], 0, False, power_off=True)
-        ui["_ptr_angle"] = None
+        _show_gauge(ui, arc=False, ticks=False, power=True)
+        ui["l_ptr"].hidden = True
+        _hide_icon(ui)
         _hide_vol_and_status(ui)
         # Backends that can switch to a different target (CAPS["player_select"],
         # e.g. HA's Media Player list) get a way back into the menu from here --
@@ -1037,15 +1151,35 @@ def draw_main(ui, state):
         return
 
     ui["display"].brightness = getattr(state, "brightness", BRIGHTNESS_ON)
-    ptr = _render_gauge(ui["bmp"], state.volume_db, state.muted)
-    ui["_ptr_angle"] = ptr
+
+    # There is no fast path any more, because there is no slow one.
+    #
+    # Why that matters beyond redraw smoothness: the main loop is cooperative
+    # and pumps the async status poll once per iteration, so back when a full
+    # draw_main() cost ~350ms the whole loop ran at ~3 iterations/sec and each
+    # poll -- needing ~3 pumps -- stretched to ~1000ms. That reads as "flaky
+    # networking" while the network itself is perfectly healthy (0 errors
+    # throughout the measurement run that found it), and the dropped touch
+    # events had the identical cause. Keeping every frame cheap is a
+    # correctness property of this loop, not a nicety.
+    quick = _driver.CAPS["preset_quickbuttons"]
+    _show_gauge(ui, presets=quick, menu_home=True)
+    _set_arc_mode(ui, state.muted, False)
+    _set_pointer(ui, state.volume_db)
+    if quick:
+        _draw_preset_filter_buttons(ui, state)
+
     _set_vol_labels(ui, state.volume_db, state.muted)
     ui["input"].text  = _driver.friendly_input(state.input)
     ui["input"].color = _C_DIM
+    # Restore the preset label's normal row position before drawing into it.
+    # draw_error/draw_reconnecting recenter this label for their own layout
+    # and nothing ever put it back, so it stayed stranded mid-screen on the
+    # first main render afterwards (user-confirmed, seen twice). Set before
+    # _draw_status_rows so a UI extension with its own placement still wins.
+    ui["preset"].anchor_point      = (0.5, 0.5)
+    ui["preset"].anchored_position = (CX, PRESET_NAME_Y)
     _draw_status_rows(ui, state, _C_DIM)
-    if _driver.CAPS["preset_quickbuttons"]:
-        _draw_preset_filter_buttons(ui, state)
-    _draw_menu_home(ui["bmp"])
     ui["menu"].anchor_point      = _MENU_ANCHOR_MAIN
     ui["menu"].anchored_position = _MENU_POS_MAIN
     ui["menu"].text  = "MENU"
@@ -1067,8 +1201,9 @@ def draw_busy(ui, state):
     for ml in ui["items"]:
         ml.text = ""
 
-    ptr = _render_gauge(ui["bmp"], state.volume_db, False, busy=True)
-    ui["_ptr_angle"] = ptr
+    _show_gauge(ui)
+    _set_arc_mode(ui, False, True)
+    _set_pointer(ui, state.volume_db)
     _set_vol_labels(ui, state.volume_db, busy=True)
     ui["input"].text   = _driver.friendly_input(state.input)
     ui["input"].color  = _C_BUSY
@@ -1084,16 +1219,7 @@ def draw_volume(ui, state):
 
     Only the ~20-pixel pointer region becomes dirty → near-instant SPI transfer.
     """
-    bmp = ui["bmp"]
-    old = ui["_ptr_angle"]
-    if old is not None:
-        _restore_region(bmp, old, state.muted)
-    if state.volume_db >= _VOL_MIN:
-        new = _vol_to_angle(state.volume_db)
-        _draw_pointer(bmp, new, _PTR)
-        ui["_ptr_angle"] = new
-    else:
-        ui["_ptr_angle"] = None
+    _set_pointer(ui, state.volume_db)
     _set_vol_labels(ui, state.volume_db, state.muted)
     ui["display"].refresh()
 
@@ -1131,8 +1257,10 @@ def draw_status(ui, msg):
     _SHOW_DECIMAL) and a progress message where the input line would be,
     per the design spec.
     """
-    _render_gauge(ui["bmp"], _SENTINEL, False)   # arc + ticks, no pointer
-    ui["_ptr_angle"]    = None
+    _show_gauge(ui)                 # arc + ticks, no pointer
+    _set_arc_mode(ui, False, False)
+    _set_pointer(ui, _SENTINEL)
+    _hide_icon(ui)
     ui["vol_int"].text  = "--"; ui["vol_int"].color = _C_DIM
     ui["vol_dec"].text  = ".-" if _SHOW_DECIMAL else ""
     ui["vol_dec"].color = _C_TEXT
@@ -1161,8 +1289,10 @@ def draw_error(ui, msg):
     reset elsewhere -- see its own label comment -- so repositioning it
     here would leak into the next draw_main()).
     """
-    _render_gauge(ui["bmp"], _SENTINEL, False)
-    ui["_ptr_angle"] = None
+    _show_gauge(ui)
+    _set_arc_mode(ui, False, False)
+    _set_pointer(ui, _SENTINEL)
+    _hide_icon(ui)
     _hide_vol_and_status(ui)
     for ml in ui["items"]:
         ml.text = ""
@@ -1178,10 +1308,44 @@ def draw_error(ui, msg):
     ui["display"].refresh()
 
 
+def draw_reconnecting(ui):
+    """Connection-lost state: two centered lines, nothing to tap.
+
+    Distinct from draw_error(): that one is for fatal boot-time problems the
+    user must act on, and offers a restart. This is a transient state the
+    device is expected to come out of on its own, so it deliberately offers
+    no affordance -- it is a status report, not a prompt.
+
+    Wording is backend-neutral on purpose: the thing that went quiet may be
+    a Denon, a MiniDSP, a WiiM, a CamillaDSP host or a Home Assistant
+    entity, so naming any one of them would be wrong for most users.
+    """
+    _show_gauge(ui)
+    _set_arc_mode(ui, False, False)
+    _set_pointer(ui, _SENTINEL)
+    _hide_icon(ui)
+    _hide_vol_and_status(ui)
+    for ml in ui["items"]:
+        ml.text = ""
+    ui["status"].text = ""
+    ui["preset"].anchor_point      = (0.5, 0.5)
+    ui["preset"].anchored_position = (CX, CY - 12)
+    ui["preset"].text  = "lost connection"
+    ui["preset"].color = _C_DIM
+    ui["menu"].anchor_point      = (0.5, 0.5)
+    ui["menu"].anchored_position = (CX, CY + 12)
+    ui["menu"].text  = "reconnecting..."
+    ui["menu"].color = _C_DIM
+    ui["display"].refresh()
+
+
 def render_gauge_bg(ui, vol_db, muted):
-    """Re-render the gauge into the bitmap without refreshing.
+    """Show the gauge behind a menu without refreshing.
     Call before draw_menu when the brightness screen needs the gauge background."""
-    _render_gauge(ui["bmp"], vol_db, muted)
+    _show_gauge(ui)          # arc + ticks only, no preset row or menu-home
+    _set_arc_mode(ui, muted, False)
+    _set_pointer(ui, vol_db)
+    _hide_icon(ui)
 
 
 def draw_menu(ui, title, items, cursor, clear_bg=False, version_text=""):
@@ -1194,7 +1358,13 @@ def draw_menu(ui, title, items, cursor, clear_bg=False, version_text=""):
     dim "input" label rather than a bright title."""
     global MENU_ITEM_Y0
     if clear_bg:
-        _clear(ui["bmp"])
+        _hide_gauge(ui)
+    else:
+        # Keep whatever render_gauge_bg() left showing, but never the preset
+        # row or menu-home frame -- their labels are blanked just below, and
+        # an outline with no number in it reads as a rendering fault.
+        ui["l_presets"].hidden = True
+        ui["l_home"].hidden = True
     ui["status"].text  = version_text
     ui["status"].color = _C_DIM
     ui["vol_int"].text = ""

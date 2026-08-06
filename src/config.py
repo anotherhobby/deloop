@@ -54,6 +54,16 @@ AVR_PORT_UI = 11080  # web UI port (inputs/sources, Dirac Live)
 AVR_SCHEME = "http"
 AVR_TIMEOUT_MS = 1000  # 1 s -- keep low so a slow AVR does not block the UI
 
+# Bounded connect-only timeout for denon.py's non-blocking status-poll
+# engine (_AsyncRequest) -- see docs/architecture.md's touch-drop
+# investigation. A literal settimeout(0) before connect() doesn't give a
+# resumable non-blocking result on this CircuitPython build (raises
+# ETIMEDOUT immediately instead), so connect() gets one short bounded
+# blocking slice instead of being pumped tick-by-tick like send()/recv().
+# 75ms is generous for a LAN round-trip to a literal-IP host but still far
+# below the 1-3s stalls this engine exists to eliminate.
+AVR_CONNECT_TIMEOUT_MS = 75
+
 # minidsp-rs daemon settings
 MINIDSP_HOST          = os.getenv("MINIDSP_HOST", "192.168.1.101")
 MINIDSP_PORT          = int(os.getenv("MINIDSP_PORT", "5380"))

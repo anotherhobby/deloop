@@ -17,6 +17,12 @@ chrome: no backend-specific code anywhere in this feature.
 isn't actively host-mounted -- the one real dependency this feature has, surfaced to the user as
 the Update menu's `Eject drive first` result rather than failing silently.
 
+**Confirmed live 2026-08-05**, incidentally rather than deliberately: a v10 -> v11 update was
+attempted with the drive still mounted, the guard fired, the screen said so, and ejecting and
+retrying succeeded with no further intervention. Worth noting because this path had been designed
+and reasoned about but never actually exercised until it triggered by accident -- if it regresses,
+it will regress silently, because the happy path never touches it.
+
 **Hard rule: never call `microcontroller.reset()` anywhere in the OTA flow, including for test
 setup.** A genuine hardware reset breaks the first post-handshake TLS `send()` on the very next
 boot's first network attempt -- confirmed via raw-socket diagnostics that TCP connect and the TLS
@@ -88,6 +94,43 @@ committed back), compiles every module in `MPY_MODULES` with a pinned, version-m
 `tools/build_release_manifest.py` (an explicit file allowlist, kept in sync by hand with the
 Makefile's `MPY_MODULES`).
 
+### Why local builds have no version, and why it stays that way
+
+`src/version.py` holds `CURRENT_VERSION = 0` in git. The workflow overwrites it in its own working
+copy only, so **every `make deploy` is version 0** -- including a clone checked out at the exact
+release tag. `check_latest_version()` then returns `(N, 0)`, a fresh install always sees an update
+available, and installing it pulls the real number in `version.mpy`.
+
+The Update screen shows **nothing** for version 0 rather than "v0" (see `app.py`'s
+`_ota_version_text()`): a local build is implied by the absence of a release version, and "v0"
+reads as a bug on a new user's first screen.
+
+Two rejected alternatives, both of which break the same invariant -- **a build must never claim to
+be a release it isn't**:
+
+- **Stamp the version from the git tag at `make deploy` time.** A tree with local edits, or main a
+  few commits past the tag, would report `vN` while running something else. Worse, it fails
+  dangerously: `check_latest_version()` compares `N < N`, which is false, so the update prompt is
+  *suppressed*. A device running unreleased code, convinced it is current. `0` means "no release
+  provenance" -- true, and self-healing after one update.
+- **Have the release workflow commit `version.py` back to main.** Same defect, since most people
+  clone main's HEAD rather than a tag, so the committed number is stale for everyone who arrives
+  after the next merge. It also recurses: `src/**` is in the workflow's trigger paths, so the
+  commit-back would mint another release, forever. Tags already make the repo self-describing.
+
+The forced first OTA is a feature, not a wart, for two reasons. It replaces whatever the local
+`mpy-cross` produced with the CI-built, manifest-verified assets. And it means **every release is
+validated by its own author**: cutting a release makes the maintainer's device the first to
+attempt the upgrade, so the OTA path is exercised end to end on every single version. Which path
+gets exercised depends on what that device last did -- after an OTA it genuinely reports `vN` and
+tests the real `vN -> vN+1` upgrade a user would take; after a `make deploy` it is back to 0 and
+tests `fresh -> latest` instead. Both are worth having; know which one you ran.
+
+Note that OTA covers the app files only (`_MPY_MODULES` + `code.py`). Fonts, sounds and
+`splash_logo.bmp` are deliberately excluded from the manifest, so a device cannot be bootstrapped
+from OTA alone -- `make deploy` is always the first step, and "fresh install, then update" is the
+intended path.
+
 ## Where releases are published
 
 Two places, for two different audiences:
@@ -146,3 +189,29 @@ rebuilds once per real operation, plus on a retry.
 - `make build-manifest` -- builds `manifest.json` locally from whatever `make deploy` last
   compiled into `local/build/`, for sanity-checking `tools/build_release_manifest.py` before it
   runs for real in CI.
+
+### The release ritual: validate the real upgrade path, not the fresh-install one
+
+Cutting a release already forces the author to be the first to attempt the upgrade (see "Why local
+builds have no version" above). Sequencing it deliberately makes that a much better test:
+
+1. **Finish testing the change** the normal way -- `make deploy`, exercise it on hardware. The
+   device is now version 0.
+2. **Run Check Now / Install Update before merging.** From 0 the only thing installable is current
+   latest, i.e. the *previous* release `vN`. The device is now genuinely on `vN`.
+3. **Merge to main.** CI cuts `vN+1`.
+4. **Run Check Now / Install Update again.** This exercises the real `vN -> vN+1` upgrade a user
+   would take, rather than the `fresh -> latest` path a dev machine normally tests.
+5. **Check the version row reads `vN+1`.** This is the only step that confirms `version.mpy`
+   itself shipped correctly -- everything else would pass just as well with a stale one.
+
+Two caveats worth holding:
+
+- Between steps 2 and 4 the device runs the *previous* release, not the code you just tested. Do
+  all hands-on validation before step 2.
+- The artifact you end up running was compiled by CI's `mpy-cross`, not the local one in
+  `local/mpy-cross`. They are pinned to the same CircuitPython version (`CIRCUITPYTHON_VERSION` in
+  `release.yml`, and the Makefile's own comment) but that pinning is maintained by hand -- if they
+  ever drift, step 4 is the first place it would show up, which is another reason to run it.
+- If a release is broken badly enough to prevent OTA, there is no OTA path back. `make deploy`
+  over USB is always the recovery.

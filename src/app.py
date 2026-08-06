@@ -41,6 +41,52 @@ from state import AVRState
 
 _MAX_ERRORS = 5
 
+# How long after a locally-issued power command to stop trusting the polled
+# power state for external-change detection.
+#
+# Power commands are applied optimistically (state.power is set immediately,
+# see _handle_touch_power) but the device takes seconds to actually get
+# there, so polls in between report the OLD state. That makes the local
+# write and the poll disagree in exactly the shape _apply_poll_result's
+# "powered on/off externally" tests look for -- a local power-OFF reads as
+# "was standby, now reports ON", i.e. someone just turned it on.
+#
+# It was always a race; it became reliable when the 2026-08-04 rendering fix
+# took poll latency from ~1000ms to ~20ms and the loop from 3 to ~240
+# iterations/sec, so the confirming poll now lands well before the device
+# settles. Confirmed live: a long-press power-off played the power-on splash
+# and bounced straight back to the volume screen.
+_POWER_SETTLE_S = 10.0
+
+# The same race, on mute. Tapping mute applies state.muted optimistically, and
+# a poll issued before the AVR acted reports the old value -- apply_status()
+# writes that straight back, so the display goes blue, snaps back to full
+# colour, then goes blue again a poll later. User-confirmed 2026-08-05, once
+# composing the gauge (docs/rendering.md) made the loop fast enough for the
+# poll to beat the AVR.
+#
+# Far shorter than _POWER_SETTLE_S: a mute command lands in well under a
+# second (a power-on takes seconds of real boot time), and every second of
+# this window is a second in which a mute from the AVR's own remote is
+# ignored. Long enough to cover the in-flight poll, short enough that
+# external mutes still feel immediate.
+_MUTE_SETTLE_S = 1.5
+
+# And again for play/pause. _tap_toggle_playback applies state.media_state
+# optimistically and apply_status() overwrites it, so this is the identical
+# bug -- it just needs a backend that reports media_state (ha, wiim) to be
+# visible at all, which is why it has never been reported. Same 1.5s
+# reasoning as mute: transport commands land fast, and the window is time
+# in which a play/pause from another controller is ignored.
+_MEDIA_SETTLE_S = 1.5
+
+# Bound to the denon module only for a DEVICE_DRIVER=="denon" build (set in
+# main(), see its init_transport branch) -- lets _poll_avr/_pulse_mute route
+# the background status poll through denon.py's non-blocking engine instead
+# of _poll_now()'s blocking driver.get_status(), without every other backend
+# paying to import denon.py at all. None for every other backend.
+_denon = None
+
 # How often to retry driver.get_presets() after it failed at boot (AVR
 # unreachable, timeout, etc) -- much shorter than the normal 5s/30s adaptive
 # poll interval, since a missing preset/Dirac list is a visibly broken UI
@@ -76,6 +122,21 @@ ENC_DEBOUNCE_S = 0.15
 # Touch long-press / tap thresholds
 TOUCH_POWER_S   = 1.5
 TOUCH_MIN_S     = 0.05  # minimum tap duration; filters electrical noise
+
+# Release debounce + post-tap lockout. Both exist because the FocalTouch chip
+# has no queue and can report touched=0 for a single frame in the MIDDLE of a
+# real press. _handle_touch samples at TOUCH_FRAME_S (~60Hz) and used to treat
+# any untouched frame as a release: dispatch the tap, reset, done. One dropout
+# therefore split one press into two taps -- two mute toggles from one finger.
+#
+# This was latent for as long as the code existed and only became reachable
+# 2026-08-05, when composing the gauge (docs/rendering.md) took draw_main from
+# ~350ms to ~90ms. At ~3 loop iterations/sec a press got sampled once or twice
+# and a mid-press dropout landed in a gap nobody looked at; sampling it at the
+# real 60Hz exposes it. Same shape as the _POWER_SETTLE_S race the last
+# rendering speedup surfaced -- assume more of these are waiting.
+TOUCH_RELEASE_S = 0.05  # untouched must persist this long to count as a release
+TAP_RELOCK_S    = 0.25  # ignore new touch-downs this long after dispatching a tap
 MENU_TAP_Y      = 195   # pixels from top: taps below this open the menu
 SWIPE_THRESHOLD = 50    # pixels; horizontal delta to register a swipe
 
@@ -92,6 +153,28 @@ PULSE_FRAME_S = 1.0 / 30   # ~30 fps
 # allocates a fresh touches list on every call for no benefit. Gate it like
 # the pulse frame rate above.
 TOUCH_FRAME_S = 1.0 / 60   # ~60 fps
+
+# --- Loop-stall detector -----------------------------------------------
+# The FocalTouch chip has no queue -- it only reports whatever is touched
+# *right now*. The main loop has no sleep (see TOUCH_FRAME_S's comment
+# above), so if any single iteration runs long (a blocking AVR/network
+# poll is the prime suspect), every touch-poll frame that would have
+# landed during that stall is simply never taken -- a tap that begins and
+# ends entirely inside the gap leaves no trace anywhere, in state or in
+# the FocalTouch chip itself. Prints a per-stage breakdown of any
+# iteration slower than STALL_THRESHOLD_S.
+#
+# The per-touch and per-tap prints that used to accompany this were removed
+# 2026-08-05. One of them fired on every touch-poll frame -- ~60/sec while a
+# finger was down -- and a blocking USB CDC write at that rate is a credible
+# cause of the very dropouts it was added to investigate.
+#
+# Threshold raised 0.03 -> 0.12 the same day. 30ms was ~2 frames back when a
+# draw_main() cost ~350ms and any draw tripped it anyway; now that composing
+# the gauge (docs/rendering.md) took that to ~90ms, 30ms would fire on every
+# single frame that draws. 120ms sits above a normal draw and below anything
+# that could swallow a tap.
+STALL_THRESHOLD_S = 0.12
 
 
 def _load_brightness():
@@ -175,6 +258,28 @@ def _connect_wifi(ui):
     except Exception as e:
         print("power_management NONE failed:", type(e), e)
     wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
+    # PERMANENT boot diagnostics -- three prints once per boot, deliberately
+    # kept. Added 2026-08-04 for the cold-boot AVR-unreachable fault: the
+    # device associated, took a lease, then every AVR request ETIMEDOUTed
+    # while a Mac on the same flat /23 reached it in 3-7ms. The full lease
+    # checks mask/gateway (a /24 lease on a /23 makes AVR_HOST look
+    # off-subnet); the AP/BSSID identifies which radio it joined, since a
+    # roam to an isolated AP looks identical from here. That fault stopped
+    # after an overlapping AP was disabled, but that removed the trigger,
+    # not the mechanism -- see docs/architecture.md before deleting these.
+    try:
+        r = wifi.radio
+        ap = r.ap_info
+        print("wifi lease: ip=%s subnet=%s gw=%s dns=%s" % (
+            r.ipv4_address, r.ipv4_subnet, r.ipv4_gateway, r.ipv4_dns))
+        if ap is not None:
+            print("wifi ap: ssid=%s rssi=%s ch=%s bssid=%s" % (
+                ap.ssid, ap.rssi, ap.channel,
+                "".join("%02x" % b for b in ap.bssid)))
+        print("wifi target: AVR_HOST=%s port=%s port_ui=%s" % (
+            config.AVR_HOST, config.AVR_PORT, config.AVR_PORT_UI))
+    except Exception as e:
+        print("wifi lease print failed:", e)
 
 
 def _top_menu_entries():
@@ -218,7 +323,23 @@ def _ota_version_text():
     "input" label (dim gray) rather than a bright title. Separate from
     _ota_menu_title() because draw_menu()'s title parameter is never
     actually rendered (see its own comment: "no title; context comes from
-    the items themselves") -- version_text is a real, distinct label."""
+    the items themselves") -- version_text is a real, distinct label.
+
+    Returns "" for a local build. version.CURRENT_VERSION is 0 in git and
+    only ever gets a real number baked in by the release workflow, in its
+    own working copy -- so every `make deploy` is 0 (see src/version.py and
+    docs/ota.md). Showing "v0" reads as a bug on a new user's very first
+    screen; showing nothing reads as what it is, since a local build is
+    implied by the absence of a release version. The row simply isn't there
+    and "Check Now" stands alone.
+
+    Deliberately not "the version from the git tag": that would let a build
+    made from a modified or post-tag tree claim to be release vN, and since
+    check_latest_version() compares N < N, it would then SUPPRESS the update
+    prompt -- a device running unreleased code, convinced it is current.
+    0 means "no release provenance," which is both true and self-healing."""
+    if version.CURRENT_VERSION == 0:
+        return ""
     return "v{}".format(version.CURRENT_VERSION)
 
 
@@ -298,7 +419,7 @@ def _enter_dev_sub(item, state, ui, sound_mod, loop):
     return None, 0
 
 
-def _confirm_sub(sub_type, sub_cursor, state, ui, loop):
+def _confirm_sub(sub_type, sub_cursor, state, ui, loop, now):
     """Apply sub-menu selection (side-effects only).
 
     Returns a truthy value to mean "stay open, refresh items" instead of
@@ -313,7 +434,7 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop):
     if sub_type == "input":
         index, _ = state.input_names[sub_cursor]
         try:
-            driver.set_input(index)
+            _denon.async_set_input(index, now) if _denon is not None else driver.set_input(index)
             state.input_index = index
         except Exception as e:
             print("set_input:", e)
@@ -324,7 +445,7 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop):
             # seconds applying a preset change -- paint a static "please
             # wait" frame first since the loop can't animate meanwhile.
             dial_ui.draw_busy(ui, state)
-            driver.set_preset(val)
+            _denon.async_set_preset(val, now) if _denon is not None else driver.set_preset(val)
             # Optimistic, like volume/mute elsewhere -- some backends (Denon)
             # take several seconds to actually apply a preset change, so an
             # immediate re-query would just read back stale state.
@@ -443,15 +564,33 @@ class _Loop:
         self.enc_last_tick = 0.0
 
         self.touch_start       = 0.0
+        self.touch_up_at       = 0.0   # provisional release time; 0 = none pending
+        self.tap_relock_until  = 0.0   # touch-downs ignored until this time
         self.touch_x           = 0   # coordinates captured at touch-down
         self.touch_y           = 0
         self.touch_x_start     = 0   # x at touch-down (for swipe detection)
         self.touch_power_fired = False
+
+        # monotonic time of the last locally-issued power command. Polls for
+        # the next _POWER_SETTLE_S report the pre-command state, which looks
+        # identical to the device being changed from its own remote -- see
+        # _POWER_SETTLE_S.
+        self.power_cmd_at = -1000.0
+        # Same, for mute and play/pause -- see _MUTE_SETTLE_S.
+        self.mute_cmd_at  = -1000.0
+        self.media_cmd_at = -1000.0
         self.last_touch_poll   = 0.0   # throttles touch reads -- see TOUCH_FRAME_S
 
         self.last_poll   = time.monotonic() + 2.0
         self.error_count = 0
         self.first_poll  = True
+        # Set by _poll_avr right before kicking off an async poll (denon
+        # only -- see _denon/_pump_denon_poll), so _apply_poll_result can
+        # still do the "AVR powered on externally, reschedule sooner"
+        # rescheduling once the poll resolves, several ticks later, the
+        # same way _poll_now's synchronous return value lets it do today
+        # for every other backend.
+        self.pending_poll_interval = None
 
         # 0.0, not now() -- fires on the very first main-loop pass if
         # get_presets() failed at boot, rather than waiting a full interval.
@@ -540,7 +679,7 @@ def _handle_encoder_button(loop, ui, state, btn, now):
     if loop.mode == MODE_MENU_SUB:
         stay_open = False
         if loop.sub_cursor >= 0:
-            stay_open = _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui, loop)
+            stay_open = _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui, loop, now)
         # sub_cursor < 0: no item selected yet — button press closes without applying
         if stay_open:
             items = _build_sub_items(loop.sub_type, state, loop)
@@ -644,15 +783,27 @@ def _send_volume_debounced(loop, ui, state, now):
 
     loop.enc_last_move = 0.0
     was_muted = state.muted
-    try:
+    if _denon is not None:
+        # Async kickoff never raises for a routine network hiccup (only a
+        # local problem like socket allocation would) -- the real
+        # success/failure lands a tick or two later via
+        # _pump_denon_command, same error_count bookkeeping either way.
         if was_muted:
-            driver.mute_off()
+            _denon.async_mute_off(now)
+            loop.mute_cmd_at = now      # see _MUTE_SETTLE_S
             state.muted = False
-        driver.set_volume(state.volume_db)
-        loop.error_count = 0
-    except Exception as e:
-        print("volume debounce send:", e)
-        loop.error_count += 1
+        _denon.async_set_volume(state.volume_db, now)
+    else:
+        try:
+            if was_muted:
+                driver.mute_off()
+                loop.mute_cmd_at = now  # see _MUTE_SETTLE_S
+                state.muted = False
+            driver.set_volume(state.volume_db)
+            loop.error_count = 0
+        except Exception as e:
+            print("volume debounce send:", e)
+            loop.error_count += 1
     if was_muted and not state.muted:
         dial_ui.draw_main(ui, state)
     loop.last_poll = time.monotonic()
@@ -725,16 +876,19 @@ def _handle_touch_down(loop, ui, state, touch, now):
     # (this is the only way to wake the AVR from standby).
     loop.touch_power_fired = True
     sound.click_heavy()
+    # Both branches below apply the new power state optimistically; polls for
+    # the next _POWER_SETTLE_S will still report the old one.
+    loop.power_cmd_at = now
     try:
         if state.power == "ON":
-            driver.power_standby()
+            _denon.async_power_standby(now) if _denon is not None else driver.power_standby()
             state.power = "STANDBY"
             # Ease brightness down instead of an instant cut; _fade_power_off
             # swaps in the power icon once dark and hands off to its pulse.
             loop.power_fade_from  = state.brightness
             loop.power_fade_start = now
         else:
-            driver.power_on()
+            _denon.async_power_on(now) if _denon is not None else driver.power_on()
             state.power = "ON"
             # Clear stale mute/volume so the display is clean
             # while the AVR boots. Poll will fill in real values.
@@ -826,7 +980,7 @@ def _tap_menu_sub(loop, ui, state, now):
         sound.click()
         loop.menu_idle = now
         loop.sub_cursor = loop.sub_scroll + tapped
-        stay_open = _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui, loop)
+        stay_open = _confirm_sub(loop.sub_type, loop.sub_cursor, state, ui, loop, now)
     else:
         sound.click()
     if stay_open:
@@ -853,7 +1007,19 @@ def _tap_open_menu(loop, ui, now):
 
 def _start_mute_pulse(loop, now):
     loop.mute_phase_origin  = now
-    loop.mute_trough_polled = False
+    # NOT False. _pulse_mute polls the AVR at the trough of the breathing
+    # cycle, and frac = 0.5*(1 - cos(2*pi*t/8)) is 0 at t=0 -- so the cycle
+    # STARTS at a trough. Arming the poll here fires one on the very next
+    # pulse frame, milliseconds after we sent the mute command, and it comes
+    # back reporting the pre-command state: the display goes blue, snaps back
+    # to full colour, then blue again at the real trough 8s later.
+    #
+    # Survivable until 2026-08-05 only by accident -- poll latency was ~1000ms,
+    # which gave the AVR time to actually apply the mute before the answer
+    # arrived. At ~20ms the poll now wins the race. Skipping this one trough
+    # costs nothing: it immediately follows our own command, so it can only
+    # ever confirm what we just did or report staleness.
+    loop.mute_trough_polled = True
 
 
 def _try_action(loop, label, action):
@@ -888,11 +1054,12 @@ def _tap_toggle_mute(loop, ui, state, now):
     sound.click()
 
     def action():
+        loop.mute_cmd_at = now          # see _MUTE_SETTLE_S
         if state.muted:
-            driver.mute_off()
+            _denon.async_mute_off(now) if _denon is not None else driver.mute_off()
             state.muted = False
         else:
-            driver.mute_on()
+            _denon.async_mute_on(now) if _denon is not None else driver.mute_on()
             state.muted = True
             _start_mute_pulse(loop, now)
 
@@ -910,6 +1077,7 @@ def _tap_toggle_playback(loop, ui, state, now):
     sound.click()
 
     def action():
+        loop.media_cmd_at = now         # see _MEDIA_SETTLE_S
         if state.media_state == "playing":
             driver.media_pause()
             state.media_state = "paused"
@@ -1015,11 +1183,17 @@ def _tap_main_screen(loop, ui, state, now):
             # switching slots -- keeps "which config is loaded" visible (see
             # dial_ui.py's button coloring) even while disabled.
             new_enabled = not state.preset_enabled
-            driver.set_preset_enabled(new_enabled)
+            if _denon is not None:
+                _denon.async_set_preset_enabled(new_enabled, now)
+            else:
+                driver.set_preset_enabled(new_enabled)
             state.preset_enabled = new_enabled
         else:
             val, _name = state.preset_quick_names[idx]
-            driver.set_preset(val)
+            if _denon is not None:
+                _denon.async_set_preset(val, now)
+            else:
+                driver.set_preset(val)
             state.preset = val
             # Only flip to enabled if this backend's set_preset() actually
             # does that itself (see CAPS["preset_select_enables"] in
@@ -1044,8 +1218,13 @@ def _tap_main_screen(loop, ui, state, now):
 def _dispatch_tap(loop, ui, state, now):
     """Route a completed tap by current mode and touch zone."""
     if loop.mode == MODE_ERROR:
-        # Error screen: any tap restarts the device
-        microcontroller.reset()
+        # Connection-lost screen: deliberately inert. This used to restart
+        # the device on any tap, which was worse than useless -- a reset
+        # never cleared the states we actually hit (only pulling power did),
+        # and .claude/CLAUDE.md documents microcontroller.reset() leaving the
+        # next boot's networking broken, so tapping could turn a recoverable
+        # blip into a failed boot. Polling continues regardless and
+        # _apply_poll_result clears MODE_ERROR the moment one succeeds.
         return
 
     if state.power != "ON" and loop.mode == MODE_MAIN:
@@ -1083,8 +1262,12 @@ def _handle_touch_released(loop, ui, state, now):
     held = (now - loop.touch_start) if loop.touch_start > 0.0 else 0.0
     if held >= TOUCH_MIN_S and not loop.touch_power_fired:
         _dispatch_tap(loop, ui, state, now)
+        # Re-arm only after TAP_RELOCK_S. A tap that ends in a bounce would
+        # otherwise start a fresh gesture on the very next frame.
+        loop.tap_relock_until = now + TAP_RELOCK_S
 
     loop.touch_start       = 0.0
+    loop.touch_up_at       = 0.0
     loop.touch_x           = 0
     loop.touch_y           = 0
     loop.touch_x_start     = 0
@@ -1102,39 +1285,84 @@ def _handle_touch(loop, ui, state, touch, touch_ok, now):
         is_touched = False
 
     if is_touched:
+        if now < loop.tap_relock_until:
+            return                      # post-tap lockout; ignore the bounce
+        # A touched frame cancels any pending release: the untouched frame
+        # that started it was a dropout, not the finger leaving the glass.
+        loop.touch_up_at = 0.0
         _handle_touch_down(loop, ui, state, touch, now)
-    else:
-        _handle_touch_released(loop, ui, state, now)
+        return
+
+    if loop.touch_start == 0.0:
+        return                          # no gesture in progress
+    if loop.touch_up_at == 0.0:
+        loop.touch_up_at = now          # provisional -- wait for confirmation
+        return
+    if (now - loop.touch_up_at) < TOUCH_RELEASE_S:
+        return                          # not yet confirmed
+    _handle_touch_released(loop, ui, state, now)
 
 
 # ---------------------------------------------------------------------------
 # Periodic AVR poll
 # ---------------------------------------------------------------------------
 
-def _poll_now(loop, ui, state, now):
-    """Fetch AVR ground truth and reconcile local state.
+def _apply_poll_result(loop, ui, state, now, status):
+    """Reconcile local state against a fresh AVR status dict, however it
+    was obtained -- _poll_now()'s blocking driver.get_status() for every
+    backend except denon, or denon.py's non-blocking poll engine (see
+    _pump_denon_poll()) for denon. Returns True if the AVR was just
+    detected powering on externally, so a timer-driven caller can
+    reschedule its next poll sooner.
 
-    Shared by the adaptive timer poll (_poll_avr) and the mute-pulse trough
-    poll (_pulse_mute) -- only the trigger condition differs between them.
-    Returns True if the AVR was just detected powering on externally, so a
-    timer-driven caller can reschedule its next poll sooner.
+    Wraps the whole diffing/render body in the same try/except the
+    original inline _poll_now() used to have around this same code (not
+    just around the network call) -- state.apply_status()/dial_ui calls
+    are unlikely to raise given a well-formed status dict, but preserving
+    the original protection here means both callers (_poll_now and
+    _pump_denon_poll) get it for free rather than one of them silently
+    losing it.
     """
-    powered_on_externally = False
     try:
+        powered_on_externally = False
         was_standby = state.power != "ON"
         was_on      = state.power == "ON"
         was_muted   = state.muted
-        status = driver.get_status()
+        prev_media  = state.media_state
+        prev_power  = state.power
         changed = state.apply_status(status)
 
-        if was_standby and state.power == "ON" and not loop.first_poll:
+        # Don't let a poll that predates the device acting on our own power
+        # command undo it. apply_status() would otherwise write the stale
+        # pre-command state straight back over the optimistic one, flipping
+        # the UI back to the screen the user just left. See _POWER_SETTLE_S.
+        if (now - loop.power_cmd_at) < _POWER_SETTLE_S and state.power != prev_power:
+            state.power = prev_power
+
+        # Same guard for mute. Deliberately does NOT cover the power-on path's
+        # `state.muted = False`: that one clears stale mute on purpose and
+        # wants the poll to fill in the real value.
+        if (now - loop.mute_cmd_at) < _MUTE_SETTLE_S and state.muted != was_muted:
+            state.muted = was_muted
+
+        if (now - loop.media_cmd_at) < _MEDIA_SETTLE_S and state.media_state != prev_media:
+            state.media_state = prev_media
+
+        # Both "changed externally" tests below compare our local power state
+        # against what the device just reported. Right after a local power
+        # command those legitimately disagree -- we applied it optimistically
+        # and the device hasn't got there yet -- so the disagreement means
+        # nothing until it settles. See _POWER_SETTLE_S.
+        settled = (now - loop.power_cmd_at) >= _POWER_SETTLE_S
+
+        if was_standby and state.power == "ON" and not loop.first_poll and settled:
             # AVR just powered on externally – show splash then normal UI.
             state.volume_db = config.VOLUME_MIN
             changed = True
             dial_ui.flash_power_on(ui)
             powered_on_externally = True
 
-        if was_on and state.power != "ON" and not loop.first_poll:
+        if was_on and state.power != "ON" and not loop.first_poll and settled:
             # AVR went to standby from its own remote/panel -- same fade as
             # the local long-press, so the transition feels the same either way.
             loop.power_fade_from  = state.brightness
@@ -1155,13 +1383,91 @@ def _poll_now(loop, ui, state, now):
         if changed:
             dial_ui.draw_main(ui, state)
         loop.error_count = 0
+
+        # Async-poll callers (denon) stash the interval that was in effect
+        # at kickoff time here, since they can't use this function's
+        # return value synchronously the way _poll_now()'s callers do --
+        # see _poll_avr.
+        if powered_on_externally and loop.pending_poll_interval is not None:
+            loop.last_poll = now - loop.pending_poll_interval + 1.0
+        loop.pending_poll_interval = None
+
+        return powered_on_externally
     except Exception as e:
-        print("poll:", e)
-        loop.error_count += 1
-        if loop.error_count >= _MAX_ERRORS and loop.mode != MODE_ERROR:
-            loop.mode = MODE_ERROR
-            dial_ui.draw_error(ui, "Reconnecting...")
-    return powered_on_externally
+        _apply_poll_error(loop, ui, state, e)
+        return False
+
+
+def _apply_poll_error(loop, ui, state, e):
+    """Failure half of _apply_poll_result -- same error_count/MODE_ERROR
+    bookkeeping regardless of whether the poll came from _poll_now()'s
+    blocking call or denon.py's non-blocking engine."""
+    print("poll:", e)
+    loop.error_count += 1
+    if loop.error_count >= _MAX_ERRORS and loop.mode != MODE_ERROR:
+        loop.mode = MODE_ERROR
+        # Contact lost: whatever power state we last saw is now stale, and
+        # continuing to render it would show a standby ring for a device we
+        # simply cannot reach. Clearing this makes every draw_main() call
+        # site fall through to the connection-lost screen until a poll
+        # succeeds again (see state.AVRState.power_known).
+        state.power_known = False
+        dial_ui.draw_reconnecting(ui)
+    loop.pending_poll_interval = None
+
+
+def _poll_now(loop, ui, state, now):
+    """Fetch AVR ground truth and reconcile local state via a blocking
+    driver.get_status() call -- used directly by every backend except
+    denon (which routes the background poll through denon.py's non-
+    blocking engine instead, see _pump_denon_poll()).
+
+    Shared by the adaptive timer poll (_poll_avr) and the mute-pulse trough
+    poll (_pulse_mute) -- only the trigger condition differs between them.
+    Returns True if the AVR was just detected powering on externally, so a
+    timer-driven caller can reschedule its next poll sooner.
+    """
+    try:
+        status = driver.get_status()
+    except Exception as e:
+        _apply_poll_error(loop, ui, state, e)
+        return False
+    return _apply_poll_result(loop, ui, state, now, status)
+
+
+def _pump_denon_poll(loop, ui, state, now):
+    """Advance denon.py's non-blocking status-poll engine by one tick.
+    No-op unless denon is the active backend and a poll is in flight --
+    see _denon/start_status_poll()/_poll_avr()/_pulse_mute()."""
+    if _denon is None:
+        return
+    kind, payload = _denon.pump_status_poll(now)
+    if kind == "done":
+        _apply_poll_result(loop, ui, state, now, payload)
+    elif kind == "error":
+        _apply_poll_error(loop, ui, state, payload)
+
+
+def _pump_denon_command(loop, ui, state, now):
+    """Advance denon.py's non-blocking control-command engine (volume/
+    mute/power/input/preset) by one tick. No-op unless denon is the active
+    backend and a command is in flight -- see _denon/start_command() and
+    each hot-path tap/encoder handler's _denon-is-not-None branch.
+
+    Unlike _pump_denon_poll, success doesn't carry a status dict to
+    reconcile -- just the same error_count/last_poll reset every hot-path
+    call site already did inline on success before this conversion.
+    Failure reuses _apply_poll_error() so a broken connection drives the
+    same error_count/MODE_ERROR bookkeeping regardless of whether the
+    poll or a control command noticed it first."""
+    if _denon is None:
+        return
+    kind, payload = _denon.pump_command(now)
+    if kind == "done":
+        loop.error_count = 0
+        loop.last_poll = now
+    elif kind == "error":
+        _apply_poll_error(loop, ui, state, payload)
 
 
 def _poll_avr(loop, ui, state, now):
@@ -1196,7 +1502,16 @@ def _poll_avr(loop, ui, state, now):
     # compact, so this is a cheap hedge against the kind of heap fragmentation
     # that broke the Dirac filter fetch at boot.
     gc.collect()
-    if _poll_now(loop, ui, state, now):
+
+    if _denon is not None:
+        # Kick off the non-blocking poll and return immediately -- the
+        # result lands later, over however many ticks it takes, via
+        # _pump_denon_poll() (called every main-loop iteration). Stash the
+        # interval here since _apply_poll_result can't get it from a
+        # synchronous return value the way _poll_now()'s callers do.
+        loop.pending_poll_interval = poll_interval
+        _denon.start_status_poll(now)
+    elif _poll_now(loop, ui, state, now):
         loop.last_poll = now - poll_interval + 1.0
 
 
@@ -1264,12 +1579,21 @@ def _pulse_mute(loop, ui, state, now):
     if dial_ui.mute_pulse_at_trough(elapsed):
         if not loop.mute_trough_polled:
             loop.mute_trough_polled = True
-            _poll_now(loop, ui, state, now)   # may redraw; the render below always wins
+            if _denon is not None:
+                # Kicked off, not awaited -- resolves later via
+                # _pump_denon_poll(), which runs earlier in the main-loop
+                # step order than this function, so the same "render below
+                # always wins" guarantee still holds on whichever tick it
+                # actually completes on.
+                _denon.start_status_poll(now)
+            else:
+                _poll_now(loop, ui, state, now)   # may redraw; the render below always wins
     else:
         loop.mute_trough_polled = False
 
     # Render last: guarantees this frame's color is what's actually on
-    # screen even if _poll_now() just ran a full draw_main().
+    # screen even if _poll_now()/_pump_denon_poll() just ran a full
+    # draw_main().
     dial_ui.pulse_mute(ui, now - loop.mute_phase_origin)
 
 
@@ -1392,6 +1716,17 @@ def main():
         # real hardware, same as wiim's.
         import camilladsp
         camilladsp.init_transport(pool)
+    elif config.DEVICE_DRIVER == "denon":
+        # Unlike wiim/camilladsp above, denon.py does NOT replace the
+        # shared session -- control commands and boot-time loaders still
+        # go through it via the normal driver.init(session) contract
+        # below. Only the background status poll (the one call site
+        # confirmed to freeze the touch-polling main loop for 1-3s on a
+        # slow/failed request) gets its own raw, non-blocking socket path
+        # -- see denon.py's "Non-blocking status poll" section.
+        global _denon
+        import denon as _denon
+        _denon.init_transport(pool)
     driver.init(session)
 
     # Fetch input friendly names and source list (for menu) once at boot.
@@ -1488,14 +1823,45 @@ def main():
 
     # --- Main loop ---
     while True:
-        now = time.monotonic()
+        t0 = time.monotonic()
+        now = t0
 
         _handle_encoder_button(loop, ui, state, btn, now)
+        t1 = time.monotonic()
         _handle_encoder_rotation(loop, ui, state, encoder, now)
+        t2 = time.monotonic()
         _send_volume_debounced(loop, ui, state, now)
+        t3 = time.monotonic()
         _auto_close_menu(loop, ui, state, now)
+        t4 = time.monotonic()
         _handle_touch(loop, ui, state, touch, touch_ok, now)
+        t5 = time.monotonic()
+        # Placed before _pulse_mute (not next to _poll_avr, which kicks the
+        # async poll off but never resolves it) so that if a poll resolves
+        # on this tick, _pulse_mute's render afterward still "wins" the
+        # frame -- see its own comment for why that ordering matters.
+        _pump_denon_poll(loop, ui, state, now)
+        t5a = time.monotonic()
+        _pump_denon_command(loop, ui, state, now)
+        t5b = time.monotonic()
         _pulse_mute(loop, ui, state, now)
+        t6 = time.monotonic()
         _fade_power_off(loop, ui, state, now)
+        t7 = time.monotonic()
         _poll_avr(loop, ui, state, now)
+        t8 = time.monotonic()
         _retry_presets(loop, ui, state, now)
+        t9 = time.monotonic()
+
+        if (t9 - t0) >= STALL_THRESHOLD_S:
+            print(
+                "STALL %dms enc_btn=%d enc_rot=%d vol=%d autoclose=%d "
+                "touch=%d denon=%d cmd=%d mute=%d fade=%d avr=%d presets=%d" % (
+                    (t9 - t0) * 1000,
+                    (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000,
+                    (t4 - t3) * 1000, (t5 - t4) * 1000, (t5a - t5) * 1000,
+                    (t5b - t5a) * 1000,
+                    (t6 - t5b) * 1000, (t7 - t6) * 1000, (t8 - t7) * 1000,
+                    (t9 - t8) * 1000,
+                )
+            )
