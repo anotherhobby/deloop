@@ -489,6 +489,11 @@ lasting rules that came out of it:
 > an interference-driven cause: ARP is small, unacknowledged at the IP layer, and exactly what a
 > marginal RF environment loses first.
 >
+> `app.py` prints the full DHCP lease and the AP/BSSID it joined at every boot. Those three lines
+> were added for this investigation and are deliberately **permanent** -- they cost one print each
+> at startup, and they cannot be added retroactively to a boot that has already gone wrong. If the
+> fault returns, they are the first thing anyone will want. Do not delete them as leftover debug.
+>
 > Still eliminated with evidence, do not re-open without new data: socket/pool exhaustion,
 > CircuitPython heap pressure, boot ordering, BSSID pinning, and display memory pressure on the
 > radio (measured directly -- see [docs/rendering.md](rendering.md)).

@@ -258,15 +258,15 @@ def _connect_wifi(ui):
     except Exception as e:
         print("power_management NONE failed:", type(e), e)
     wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
-    # TEMPORARY: AVR-unreachable investigation 2026-08-04. Confirmed live
-    # that a fresh power cycle associates and gets a DHCP lease, then every
-    # AVR request ETIMEDOUTs immediately -- while a Mac on the same flat /23
-    # reaches the AVR in 3-7ms. Printing the full lease (not just the
-    # address, which is all the title bar shows) to check the mask/gateway:
-    # a /24 lease on a /23 network would make AVR_HOST look off-subnet and
-    # route via a gateway that shouldn't be involved, timing out exactly
-    # like this. The AP/BSSID identifies which radio it actually joined,
-    # since a roam to an isolated AP would look identical from here.
+    # PERMANENT boot diagnostics -- three prints once per boot, deliberately
+    # kept. Added 2026-08-04 for the cold-boot AVR-unreachable fault: the
+    # device associated, took a lease, then every AVR request ETIMEDOUTed
+    # while a Mac on the same flat /23 reached it in 3-7ms. The full lease
+    # checks mask/gateway (a /24 lease on a /23 makes AVR_HOST look
+    # off-subnet); the AP/BSSID identifies which radio it joined, since a
+    # roam to an isolated AP looks identical from here. That fault stopped
+    # after an overlapping AP was disabled, but that removed the trigger,
+    # not the mechanism -- see docs/architecture.md before deleting these.
     try:
         r = wifi.radio
         ap = r.ap_info
