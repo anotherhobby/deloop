@@ -483,6 +483,22 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop, now):
     instead (see that branch's comment for why); "Cancel" clears the
     pending action and closes normally.
     """
+    # Every list-backed branch below indexes its list directly, and did so
+    # OUTSIDE its own try -- so an empty list (or a cursor left over from a
+    # longer one) raised IndexError straight out of this function rather than
+    # being caught and logged like a failed device call. A list here is empty
+    # whenever its boot-time fetch failed: ha.py's _source_list is the live
+    # example -- one failed _refresh_entity() at boot leaves the Source menu
+    # empty for the whole session, and confirming an entry in it then threw.
+    _LIST_FOR = {"input": state.input_names,
+                 "preset": state.preset_names,
+                 "player": state.player_names}
+    _items = _LIST_FOR.get(sub_type)
+    if _items is not None and not (0 <= sub_cursor < len(_items)):
+        print("menu:", sub_type, "has no entry at", sub_cursor,
+              "-- list is", len(_items), "long; ignoring tap")
+        return
+
     if sub_type == "input":
         index, name = state.input_names[sub_cursor]
         try:
