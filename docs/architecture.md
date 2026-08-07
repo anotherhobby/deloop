@@ -16,7 +16,12 @@ clamped the name list and is gone. Two settings that never did anything were del
 (`ACCEL_SAFETY_CAP`, never read by anything; `HA_MEDIA_CONTROLS`, made redundant by the
 `media_state` design). An HA Source menu that silently failed at boot is fixed -- see the HA
 paragraph below. `settings.toml.template` was rewritten for a first-time reader.
-**All five backends need a hardware pass before this ships.**)
+**All five backends re-verified on real hardware after these changes** (2026-08-07): denon,
+minidsp, ha and wiim exercised directly, including WiiM's media controls with `WIIM_PRESET_BUTTONS`
+unset -- the default path where play/pause and skip replace the button row. MiniDSP reported
+"functional and snappy". CamillaDSP is unchanged by this pass and still carries its one standing
+gap: preset-switch timing against a real production config, rather than the trivial synthetic ones
+in `local/camilladsp/`.)
 
 Previously: 2026-08-06 (v2.7 -- interaction polish on top of v2.6's rendering rewrite. Device
 writes now go through one optimistic-write mechanism (`_SETTLE_S`/`_optimistic()`/`_settle_guard()`
