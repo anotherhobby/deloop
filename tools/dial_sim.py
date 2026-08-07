@@ -174,21 +174,71 @@ class _FakeDisplay:
 # Font shim -- maps on-device .pcf paths to the source Inter TTF
 # ---------------------------------------------------------------------------
 
+class _FakeGlyph:
+    __slots__ = ("shift_x",)
+
+    def __init__(self, shift_x):
+        self.shift_x = shift_x
+
+
 class _FakeFont:
-    def __init__(self, pil_font):
+    def __init__(self, pil_font, metrics):
         self.pil_font = pil_font
+        self._metrics = metrics
 
     def load_glyphs(self, glyphs):
         pass   # TTFs don't need glyph pre-caching
+
+    def get_glyph(self, codepoint):
+        """Advance width only, from the REAL .pcf -- see _pcf_metrics().
+
+        dial_ui.fit_text() calls this to decide where to truncate a too-long
+        name. Drawing here is Pillow/TTF and only approximates the device, but
+        truncation must not: a one-character difference between sim and device
+        would make every render a misleading check of the thing it's being used
+        to check. So this returns .pcf advances, not TTF ones.
+        """
+        w = self._metrics.get(codepoint)
+        return _FakeGlyph(w) if w is not None else None
 
 
 _PCF_SIZE_RE = re.compile(r"_(\d+)\.pcf$")
 
 
+def _pcf_metrics():
+    """{point size: {codepoint: shift_x}} read from the real src/fonts/*.pcf.
+
+    Built at import time, BEFORE _install_shims() replaces displayio -- the
+    adafruit_bitmap_font PCF reader needs the genuine displayio.Bitmap and
+    silently explodes against the shim (_FakeBitmap has no _bits_per_value).
+    Same collision tools/font_fit.py hits, solved there by a subprocess; here
+    import order is enough, since nothing has been faked yet.
+    """
+    from adafruit_bitmap_font import bitmap_font
+
+    out = {}
+    for pcf in sorted((SRC / "fonts").glob("Inter_Medium_*.pcf")):
+        m = _PCF_SIZE_RE.search(pcf.name)
+        if not m:
+            continue
+        font = bitmap_font.load_font(str(pcf))
+        widths = {}
+        for cp in range(32, 127):          # the whole set these fonts carry
+            g = font.get_glyph(cp)
+            if g is not None:
+                widths[cp] = g.shift_x
+        out[int(m.group(1))] = widths
+    return out
+
+
+_PCF_WIDTHS = _pcf_metrics()
+
+
 def _load_font_shim(path):
     m = _PCF_SIZE_RE.search(path)
     size = int(m.group(1)) if m else 20
-    return _FakeFont(ImageFont.truetype(str(TTF_PATH), size))
+    return _FakeFont(ImageFont.truetype(str(TTF_PATH), size),
+                     _PCF_WIDTHS.get(size, {}))
 
 
 # ---------------------------------------------------------------------------

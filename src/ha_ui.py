@@ -52,12 +52,15 @@ def draw_status_rows(ui, state, dim_color):
     equivalent of Dirac Live/config slots, see driver.py's contract) would
     still use the text label.
     """
-    ui["preset"].text  = _player_name(state)
+    # Fitted: an HA friendly_name is whatever the user called it in HA, with no
+    # length limit -- "Dining Room Speakers" is 215px against this row's 172px
+    # and ran under the arc on both sides before this (found live 2026-08-07).
+    ui["preset"].text  = _ui._fit_preset(_player_name(state))
     ui["preset"].color = _ui._C_DIM   # match the input row's brightness,
                                        # not the near-invisible MENU-hint dim
 
     name = _ui._preset_name(state)
-    ui["player"].text  = name
+    ui["player"].text  = _ui._fit_player(name)
     ui["player"].color = dim_color
     if not name and state.media_state in _ui._MEDIA_STATE_TEXT:
         ci = _ui._GRAY if dim_color == _ui._C_BUSY else _ui._TK_L

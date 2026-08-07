@@ -124,6 +124,10 @@ MENU_VISIBLE  = 5     # max items shown at once
 # Exported so code.py can split the main screen's tap zones: mute above this
 # line, quick-select buttons (and nothing else) at or below it.
 PRESET_NAME_Y = CY + 18
+# Input/source name row, above the volume number -- halfway between it and the
+# arc gap. Named rather than inlined at its label so _row_budget() and
+# tools/font_fit.py can both refer to the same number.
+_INPUT_NAME_Y = 62
 # Second text row, just below PRESET_NAME_Y. Which content lands in which
 # row depends on the backend -- see _draw_status_rows(): normally
 # PRESET_NAME_Y holds the preset/status text and this row is unused, but
@@ -147,7 +151,13 @@ _MENU_POS_MAIN       = (CX, 222)
 _DBTN_H    = 22    # button height
 _DBTN_W    = 22    # button width
 _DBTN_GAP  = 14    # horizontal gap between buttons
-_DBTN_MAX  = 5     # pre-allocated label slots -- real devices use 2-4
+_DBTN_MAX  = 5     # pre-allocated label slots -- NOT how many actually fit.
+                   # Four is the real ceiling: at this row the gauge arc's
+                   # inner edge leaves 138px clear, and 4 buttons span 130px
+                   # while 5 span 166px and draw over the band (measured
+                   # 2026-08-06). Backends cap themselves at 4 accordingly
+                   # (config.py's _DBTN_BUTTON_CAP, _parse_camilladsp_quick_
+                   # presets); this stays 5 as the allocation/clamp bound.
 
 # ── Shape palette (16 colours; every vectorio shape indexes into this one) ───
 # _PRR and _BTNSEL_FILTER are aliases, not separate slots: both used to be
@@ -793,6 +803,102 @@ def _split_vol(db):
     return s[:dot], s[dot:]
 
 
+# ── Text fitting ──────────────────────────────────────────────────────────────
+# The screen is a 240px CIRCLE, so a text row's usable width depends on how far
+# it sits from the centre, and the gauge arc (inner radius _R_IN) eats into it
+# further. Names that come from the user's own gear -- an HA entity's friendly
+# name, a renamed Denon input, a config-supplied preset name -- have no length
+# limit, so any of them can run under the arc band and then get clipped by the
+# display circle. Found live 2026-08-07 with the HA entity "Dining Room
+# Speakers" (215px into a 172px row); the same class of bug hit wiim.py's
+# "TIDAL Connect" the day before, but that one was fixable at the source
+# because the names were ours. These aren't.
+#
+# tools/font_fit.py measures any string against these same budgets off-device.
+
+_ELLIPSIS = "..."   # ASCII only, deliberately. The .pcf fonts carry codepoints
+                    # 32-126 and nothing else: a single out-of-range glyph
+                    # (U+2026 would be one) forces PCF's encoding table to span
+                    # the whole gap and takes every font from ~8KB to ~20KB --
+                    # see the Makefile's `fonts` target, where exactly that once
+                    # ate enough heap at boot to take WiFi down.
+
+
+def _row_budget(y, half_h=8):
+    """Usable width (px) for a centred text row at `y`, clear of the arc band.
+
+    The row's glyphs span y +/- half_h, so the binding constraint is whichever
+    edge sits furthest from the centre -- that's where the circle is narrowest.
+    """
+    dy = max(abs(CY - (y - half_h)), abs(CY - (y + half_h)))
+    if dy >= _R_IN:
+        return 0
+    return int(2 * math.sqrt(_R_IN * _R_IN - dy * dy))
+
+
+# Derived once at import from this module's own geometry, rather than written
+# down as literals -- the rows move (PRESET_NAME_Y is CY-relative) and a stale
+# copied number is exactly how tools/font_fit.py first shipped wrong.
+# Currently: input 122px, preset 172px, player 150px.
+_BUDGET_INPUT  = _row_budget(_INPUT_NAME_Y)
+_BUDGET_PRESET = _row_budget(PRESET_NAME_Y)
+_BUDGET_PLAYER = _row_budget(_PLAYER_NAME_Y)
+
+
+def _text_width(font, s):
+    """Advance width of `s`, matching how label.Label lays out one line."""
+    w = 0
+    for ch in s:
+        g = font.get_glyph(ord(ch))
+        if g is not None:
+            w += g.shift_x
+    return w
+
+
+def fit_text(font, s, max_px):
+    """Return `s`, shortened with an ellipsis if it would exceed `max_px`.
+
+    Cuts mid-word rather than at a word boundary: HA names in particular are
+    distinguished by their tails ("Dining Room Speakers" vs "Dining Room TV"),
+    so keeping as many characters as fit preserves more of what tells two
+    devices apart than falling back to the last space would.
+    """
+    if not s:
+        return s
+    if _text_width(font, s) <= max_px:
+        return s
+    avail = max_px - _text_width(font, _ELLIPSIS)
+    if avail <= 0:
+        return _ELLIPSIS
+    w, cut = 0, 0
+    for i in range(len(s)):
+        g = font.get_glyph(ord(s[i]))
+        adv = g.shift_x if g is not None else 0
+        if w + adv > avail:
+            break
+        w += adv
+        cut = i + 1
+    out = s[:cut]
+    # Drop any trailing space so the result reads "Dining Room..." rather than
+    # "Dining Room ...". Done by hand rather than with rstrip() -- CircuitPython's
+    # str is not desktop Python's, and this is one character of work either way.
+    while out and out[-1] == " ":
+        out = out[:-1]
+    return out + _ELLIPSIS
+
+
+def _fit_input(s):
+    return fit_text(_F_SM, s, _BUDGET_INPUT)
+
+
+def _fit_preset(s):
+    return fit_text(_F_SM, s, _BUDGET_PRESET)
+
+
+def _fit_player(s):
+    return fit_text(_F_SM, s, _BUDGET_PLAYER)
+
+
 def _preset_name(state):
     for val, name in state.preset_names:
         if val == state.preset:
@@ -848,7 +954,7 @@ def _draw_status_rows(ui, state, dim_color):
     if _driver.ui_impl is not None:
         _driver.ui_impl.draw_status_rows(ui, state, dim_color)
         return
-    ui["preset"].text  = _status_line(state)
+    ui["preset"].text  = _fit_preset(_status_line(state))
     ui["preset"].color = dim_color
     ui["player"].text  = ""
     ui["player"].color = _C_MENU
@@ -1003,7 +1109,7 @@ def init():
     # Input sits above the volume number, halfway between it and the arc gap.
     input_lbl = label.Label(
         _F_SM, text="", color=_C_DIM,
-        anchor_point=(0.5, 0.5), anchored_position=(CX, 62),
+        anchor_point=(0.5, 0.5), anchored_position=(CX, _INPUT_NAME_Y),
     )
     # Preset name sits below volume
     preset_lbl = label.Label(
@@ -1170,7 +1276,7 @@ def draw_main(ui, state):
         _draw_preset_filter_buttons(ui, state)
 
     _set_vol_labels(ui, state.volume_db, state.muted)
-    ui["input"].text  = _driver.friendly_input(state.input)
+    ui["input"].text  = _fit_input(_driver.friendly_input(state.input))
     ui["input"].color = _C_DIM
     # Restore the preset label's normal row position before drawing into it.
     # draw_error/draw_reconnecting recenter this label for their own layout
@@ -1205,7 +1311,7 @@ def draw_busy(ui, state):
     _set_arc_mode(ui, False, True)
     _set_pointer(ui, state.volume_db)
     _set_vol_labels(ui, state.volume_db, busy=True)
-    ui["input"].text   = _driver.friendly_input(state.input)
+    ui["input"].text   = _fit_input(_driver.friendly_input(state.input))
     ui["input"].color  = _C_BUSY
     _draw_status_rows(ui, state, _C_BUSY)
     for fl in ui["filters"]:
@@ -1299,7 +1405,10 @@ def draw_error(ui, msg):
     ui["status"].text = ""
     ui["preset"].anchor_point      = (0.5, 0.5)
     ui["preset"].anchored_position = (CX, CY - 20)
-    ui["preset"].text  = msg[:24]
+    # Budget computed for THIS row, not _BUDGET_PRESET -- the label is moved to
+    # CY-20 here, not its usual PRESET_NAME_Y. (The two happen to land within a
+    # pixel of each other, which is exactly why it's worth being explicit.)
+    ui["preset"].text  = fit_text(_F_SM, msg, _row_budget(CY - 20))
     ui["preset"].color = _C_DIM
     ui["menu"].anchor_point      = (0.5, 0.5)
     ui["menu"].anchored_position = (CX, CY + 20)
