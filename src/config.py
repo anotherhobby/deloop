@@ -101,12 +101,12 @@ HA_PORT       = int(os.getenv("HA_PORT", "8123"))
 HA_TOKEN      = os.getenv("HA_TOKEN", "")
 HA_ENTITY_ID  = os.getenv("HA_ENTITY_ID", "media_player.office")
 HA_TIMEOUT_MS = int(os.getenv("HA_TIMEOUT", "2000"))
-# Play/pause status text + tap-to-toggle (see ha.py's get_status()) -- off by
-# default. media_player playback state/control is a rougher fit than
-# volume/mute/power/source: it depends on whatever source is currently
-# selected (e.g. no-op on a plain analog input) and isn't tested as
-# thoroughly. Opt in once you've confirmed it behaves well with your setup.
-HA_MEDIA_CONTROLS = _get_bool("HA_MEDIA_CONTROLS", False)
+# An HA_MEDIA_CONTROLS opt-in flag lived here until 2026-08-06, defaulting to
+# off. It predated the media_state design and was made redundant by it: the
+# play/pause row already renders only while the entity reports the literal
+# state "playing"/"paused", so a source with nothing to pause (a plain analog
+# input reports "on") never draws the controls in the first place. The flag
+# was a second gate on top of a check that already did the job.
 
 # WiiM/LinkPlay streamer settings
 WIIM_HOST       = os.getenv("WIIM_HOST", "")
@@ -125,12 +125,97 @@ WIIM_INPUTS = [s.strip() for s in
 # back reliably over the plain HTTP API -- getPresetInfo's preset_list stays
 # empty even with Favorites configured; real names require the much heavier
 # UPnP/SOAP interface (GetKeyMapping), not implemented here. Same fallback
-# minidsp.py already uses for its own API-can't-report-names gap: set the
-# count you've actually configured and optionally name them.
-WIIM_PRESET_COUNT = int(os.getenv("WIIM_PRESET_COUNT", "0"))
+# minidsp.py already uses for its own API-can't-report-names gap: name the
+# Favorites you've actually configured, in order.
+#
+# WIIM_PRESET_NAMES IS the preset list -- its length is how many presets
+# exist. There is deliberately no separate count setting: the names are the
+# slots, so a count could only ever agree with len() or silently contradict
+# it. (It did contradict it: a WIIM_PRESET_COUNT setting used to clamp this
+# list, so naming 3 Favorites with a count of 2 silently hid the third. See
+# docs/device-drivers.md.)
 WIIM_PRESET_NAMES = [n.strip() for n in
                       os.getenv("WIIM_PRESET_NAMES", "").split(",")
                       if n.strip()]
+# Which of those presets get a main-screen quick-select button, by NAME,
+# comma-separated, in the order you want them drawn ("Night,Movie" draws
+# Night first). Names must appear in WIIM_PRESET_NAMES.
+#
+# By name, not by position, to match CAMILLADSP_QUICK_PRESETS -- these two
+# settings look parallel in settings.toml.template and should behave the
+# same. WiiM did take positions briefly (a position here is also the WiiM
+# Favorite number, since get_presets() numbers slots 1..N and that is what
+# MCUKeyShortClick:<n> takes), which was defensible for WiiM alone but read
+# as an inconsistency next to CamillaDSP. Names also survive reordering the
+# list, and a rename breaks loudly with the boot print below rather than
+# silently pointing at whatever preset moved into that slot.
+#
+# LEAVE THIS UNSET TO KEEP THE MEDIA CONTROLS. Buttons and the play/pause +
+# skip row cannot share the screen -- they want the same band of pixels, and
+# the media row wins every overlapping tap -- so this setting chooses between
+# them: unset means media controls (the default), and naming any preset
+# trades them for a button row laid out like denon/minidsp. See
+# wiim_ui.py's _media_row_active() for the geometry, and
+# docs/device-drivers.md for why WiiM is the first backend to have to choose.
+#
+# Names that aren't in WIIM_PRESET_NAMES, or are repeated, are dropped with a
+# boot print rather than failing the boot.
+#
+# Four, NOT dial_ui._DBTN_MAX (which is 5). _DBTN_MAX is how many label slots
+# are pre-allocated, not how many fit: measured 2026-08-06, five buttons span
+# 166px across a row that has only 138px clear of the gauge arc's inner edge,
+# so the outer two draw on top of the arc band. Four spans 130px and fits.
+# CAMILLADSP_QUICK_PRESETS already caps at 4 for the same reason.
+#
+# Duplicated rather than imported because config.py is imported by every
+# backend at boot and must not pull in the whole display stack to read one
+# integer -- dial_ui.py independently clamps drawing and hit-testing to its
+# own _DBTN_MAX, so that clamp is the safety net; this is the one that keeps
+# the row inside the arc.
+_DBTN_BUTTON_CAP = 4
+
+
+def _parse_wiim_preset_buttons(raw, presets):
+    """Resolve WIIM_PRESET_BUTTONS names to 1-based positions into `presets`.
+
+    Returns positions rather than names because the position IS the WiiM
+    Favorite number MCUKeyShortClick:<n> takes -- the name is the config
+    surface, the number is the protocol value. Same resolve-at-import shape
+    as _parse_camilladsp_quick_presets(), so wiim.py's get_quick_presets()
+    stays a pure lookup with no validation of its own.
+
+    Empty/unset returns nothing, which is what keeps the media controls --
+    see the note above. There is deliberately no separate "off" value (an
+    earlier draft took "0"/"none"): unset already means off, so a second
+    spelling of the default would be config surface that can never change
+    any behavior.
+    """
+    raw = raw.strip()
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        name = part.strip()
+        if not name:
+            continue
+        if name not in presets:
+            print("WIIM_PRESET_BUTTONS: name {!r} not in WIIM_PRESET_NAMES "
+                  "-- ignoring".format(name))
+            continue
+        pos = presets.index(name) + 1
+        if pos in out:
+            print("WIIM_PRESET_BUTTONS: duplicate name {!r} -- ignoring".format(name))
+            continue
+        out.append(pos)
+    if len(out) > _DBTN_BUTTON_CAP:
+        print("WIIM_PRESET_BUTTONS: only", _DBTN_BUTTON_CAP, "buttons fit, dropping",
+              [presets[p - 1] for p in out[_DBTN_BUTTON_CAP:]])
+        out = out[:_DBTN_BUTTON_CAP]
+    return out
+
+
+WIIM_PRESET_BUTTONS = _parse_wiim_preset_buttons(
+    os.getenv("WIIM_PRESET_BUTTONS", ""), WIIM_PRESET_NAMES)
 
 # CamillaDSP settings
 CAMILLADSP_HOST       = os.getenv("CAMILLADSP_HOST", "")
@@ -302,9 +387,13 @@ else:
 # Inter-tick interval (ms) below which fast mode kicks in.
 # 50ms = ~20 ticks/sec = ~1.3 revolutions/sec -- feels like a deliberate quick sweep.
 ACCEL_THRESHOLD_MS = int(os.getenv("ACCEL_THRESHOLD", "100"))
-# When spinning fast and increasing volume, stop here. Prevents accidental blasting.
-# Slow down to push past it intentionally.
-ACCEL_SAFETY_CAP = float(os.getenv("ACCEL_SAFETY_CAP", "-15.0"))
+# An ACCEL_SAFETY_CAP lived here until 2026-08-06 -- a ceiling a fast upward
+# spin couldn't cross without slowing down, meant to prevent accidental
+# blasting. Nothing ever read it: apply_volume_delta() clamps to VOLUME_MIN/
+# VOLUME_MAX and nothing else, and it had been inert since the first POC
+# snapshot. Removed rather than implemented, on the maintainer's call that the
+# protection isn't needed now that the render loop is fast enough for a quick
+# spin to stay controllable (see docs/rendering.md's 2026-08-05 rewrite).
 
 # Standby/off screen brightness, as a fraction of the user's own brightness
 # setting (not a fixed value) -- dim room, dim standby indicator; bright

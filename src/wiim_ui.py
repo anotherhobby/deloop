@@ -71,11 +71,40 @@ def _preset_slot_text(state):
     return ""
 
 
+def _media_row_active():
+    """False when quick-select buttons own the space the media row needs.
+
+    Preset buttons and the media row cannot coexist: the button row occupies
+    y=156..178 (dial_ui._DBTN_Y0 + _DBTN_H) and _icon_row_y() puts the
+    play/pause icon at 164..180, with the "<<"/">>" labels taller still. The
+    18px left between the buttons and the MENU roof (y=196) does not fit a
+    20px font row, so there is no "move it down" that works -- and the two
+    tap zones would overlap regardless, with _dispatch_tap checking media
+    first and silently swallowing button taps.
+
+    So it is either/or, and the media row is the default: leave
+    WIIM_PRESET_BUTTONS unset and WiiM keeps play/pause and skip, exactly as
+    it behaved before quick buttons existed; name any position in it and
+    WiiM lays out like denon/minidsp instead (preset name over a button row),
+    giving up the media row for it. WiiM is the first backend to want both --
+    ha.py has media controls but no presets, and denon/minidsp/camilladsp
+    have presets but no media row -- which is why nothing before this had to
+    choose.
+    """
+    return not _driver.CAPS["preset_quickbuttons"]
+
+
 def draw_status_rows(ui, state, dim_color):
-    ui["preset"].text  = _preset_slot_text(state)
+    ui["preset"].text  = _ui._fit_preset(_preset_slot_text(state))
     ui["preset"].color = dim_color
     ui["player"].text  = ""
     ui["player"].color = _ui._C_MENU
+
+    if not _media_row_active():
+        # dial_ui._draw_status_rows() already blanked the play/pause icon
+        # before delegating here, so leaving it undrawn is the whole job.
+        ui["media_prev"].text = ui["media_next"].text = ""
+        return
 
     if state.media_state in _ui._MEDIA_STATE_TEXT:
         ci = _ui._GRAY if dim_color == _ui._C_BUSY else _ui._TK_L
@@ -95,10 +124,18 @@ def draw_status_rows(ui, state, dim_color):
 
 def media_status_tap(x, y):
     """True if (x, y) falls within the play/pause icon row (_icon_row_y())."""
+    if not _media_row_active():
+        return False
     return (_icon_row_y() - _STATUS_TAP_HALF_H) <= y <= (_icon_row_y() + _STATUS_TAP_HALF_H)
 
 
 def _media_side_tap(x, y, center_x):
+    # Must match draw_status_rows(): app.py's _dispatch_tap checks the media
+    # taps BEFORE the quick-button row, so claiming this zone while the
+    # buttons are drawn would eat every button tap (the two zones overlap --
+    # see _media_row_active()).
+    if not _media_row_active():
+        return False
     if not ((_icon_row_y() - _STATUS_TAP_HALF_H) <= y <= (_icon_row_y() + _STATUS_TAP_HALF_H)):
         return False
     return abs(x - center_x) <= _MEDIA_SIDE_HALF_W

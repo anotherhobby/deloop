@@ -1,132 +1,154 @@
 # deloop device settings
 # Copy to src/settings.toml and fill in your values.
 # settings.toml is deployed to /CIRCUITPY/ and read by CircuitPython at boot.
-# All values are read as strings via os.getenv(); config.py converts types.
+# If you replace settings.toml on the device while deloop is running, it will
+# reboot using the updated file immediately.
+#
+# Quote every value, including the numbers. Decimals especially: CircuitPython
+# reads settings.toml as text.
 
 # WiFi credentials (required)
+# 2.4GHz only. The ESP32-S3 in the Dial has no 5GHz radio, so if your network
+# has both bands under one name, it will still find the 2.4GHz one.
 WIFI_SSID = "your_wifi_ssid"
 WIFI_PASS = "your_wifi_password"
 
-# Which device backend to use: "denon" (default), "minidsp", "ha", "wiim",
-# or "camilladsp". See README.md "Device backends" for what each one supports.
+# For DEVICE_DRIVER deloop currently supports:
+#  "denon" (default), "minidsp", "ha", "wiim", or "camilladsp".
+# See README.md "Device backends" for what each one supports.
 # DEVICE_DRIVER = "denon"
 
+# Fill in the one device section below that matches your DEVICE_DRIVER. 
+# Every address here is an IP on your own network -- if you don't
+# know it or know how to get it, your router's client list is once place to 
+# find it. A static lease or DHCP reservation is worth setting up: deloop 
+# reads the address from this settings file at boot, so if it changes, deloop 
+# can't find your gear.
+
 # --- Denon/Marantz AVR (required if DEVICE_DRIVER = "denon") ---
+# Your receiver's IP. If everything works except powering the receiver on
+# from standby, look for a network standby setting in the AVR's own network
+# menu. You may also need to enable network access/administration on it.
 AVR_HOST = "192.168.1.100"
+# Leave the port alone unless deloop can't reach the receiver at all. 8080 is
+# right for 2016-and-newer Denon/Marantz models. Older receivers serve the
+# same API on plain port 80 -- try "80" if 8080 gets you nothing.
 # AVR_PORT          = "8080"
 
 # --- minidsp-rs daemon (required if DEVICE_DRIVER = "minidsp") ---
-# Host running minidsp-rs with the MiniDSP attached over USB -- NOT the
-# DSP's own address. Running it with no --config at all already binds the
-# HTTP API to 0.0.0.0:5380 (all interfaces) by default, so it may already
-# be reachable over the LAN with zero extra setup. If you do use a config
-# file, make sure its [http_server] bind_address isn't left at the
-# restrictive "127.0.0.1:5380" the docs' example ships with -- that's
-# localhost-only. A config file only takes effect if you pass it explicitly
-# via `--config /path/to/file.toml` on the daemon's command line; there's no
-# default path it looks for.
+# This is the IP of the computer running minidsp-rs -- the Pi or PC with the
+# MiniDSP plugged into it over USB -- NOT the DSP's own address. deloop talks
+# to the daemon, and the daemon talks to the hardware.
 # MINIDSP_HOST          = "192.168.1.101"
 # MINIDSP_PORT          = "5380"
+# Started with no --config at all, minidsp-rs already listens on
+# 0.0.0.0:5380 (all interfaces), so it may be reachable from deloop with no
+# extra setup. If you do use a config file, check that [http_server]
+# bind_address isn't left at "127.0.0.1:5380" -- that's the value the
+# official example ships with, and it accepts local connections only. Also
+# note a config file is only read if you pass it explicitly with
+# `--config /path/to/file.toml`; there's no default location it checks.
 # MINIDSP_DEVICE_INDEX  = "0"
-# MINIDSP_PRESET_COUNT  = "4"    # set to your unit's actual config slot count
-# Human-readable names for config slots 0..N-1, comma-separated and in
-# order. Any slot left unnamed (including all of them, if this is unset)
-# falls back to "Preset 1", "Preset 2", etc.
+# How many config slots your unit has. There's no way to ask it, so this has
+# to match reality -- set it too high and you'll get buttons that do nothing.
+# MINIDSP_PRESET_COUNT  = "4"
+# Names for those slots, in order. Any slot you don't name falls back to
+# "Preset 1", "Preset 2", and so on.
 # MINIDSP_PRESET_NAMES  = "Movie,Music,Night,Flat"
-# Switching config slots/presets is a full DSP reconfiguration -- minidsp-rs's
-# POST doesn't return until it's actually applied, measured ~4s on a real
-# Flex. Raise this if yours is slower; too short and the request silently
-# times out client-side before the display ever updates (and an abandoned
-# in-flight request seems able to crash minidsp-rs itself).
+# Switching slots reconfigures the whole DSP, and minidsp-rs doesn't answer
+# until it's finished -- about 4 seconds on a real Flex. If yours is slower,
+# raise this. Set it too low and the switch appears to do nothing (deloop
+# gives up before the display can update), and an abandoned request seems
+# able to crash minidsp-rs itself.
 # MINIDSP_PRESET_TIMEOUT = "10000"
-# Only needed if more than one MiniDSP unit is ever attached to that host at
-# once: /devices' array order depends on USB enumeration order, which isn't
-# stable across reconnects/reboots. Setting this pins to a specific unit by
-# serial number instead of index -- see "version.serial" in `make probe-minidsp`.
+# Only needed if more than one MiniDSP is ever plugged into that host at
+# once. The device list is ordered by USB enumeration, which can shuffle
+# across reboots -- setting a serial pins deloop to a specific unit instead.
+# `make probe-minidsp` prints it as "version.serial".
 # MINIDSP_SERIAL        = ""
 
 # --- Home Assistant media_player entity (required if DEVICE_DRIVER = "ha") ---
-# Any entity in the media_player domain -- volume/mute/power/source only;
-# no preset/filter support (see README.md "Device backends").
+# Point deloop at any one media_player entity and it becomes that device's
+# volume knob. Volume, mute, power and source only -- no presets or filters.
 # HA_HOST      = "192.168.1.102"
 # HA_PORT      = "8123"
+# Create the token in Home Assistant under your user profile, at the bottom
+# of the Security tab ("Long-lived access tokens"). It's shown once, so copy
+# it before closing the dialog.
 # HA_TOKEN     = "your_long_lived_access_token"
+# The entity you want to control. Developer Tools > States lists them all.
 # HA_ENTITY_ID = "media_player.office"
-# Play/pause status text + tap-to-toggle -- off by default. This is a rougher
-# fit than volume/mute/power/source: whether it actually does anything
-# depends on the currently selected source (e.g. no-op on a plain analog
-# input), so it's opt-in rather than on by default.
-# HA_MEDIA_CONTROLS = "true"
 
 # --- WiiM / LinkPlay streamer (required if DEVICE_DRIVER = "wiim") ---
-# The streamer's own IP -- deloop talks straight to it, no bridge/daemon and
-# no token or auth of any kind (unlike Home Assistant). Its API is HTTPS-only
-# with a self-signed certificate, which deloop already knows about and trusts
-# (LinkPlay ships the same cert on every unit) -- nothing to configure.
+# The WiiM streamer's own IP. Can be found in WiiM app.
 # WIIM_HOST = "192.168.1.103"
-# Sources to offer in the Source menu, comma-separated, in menu order. The
-# default below was confirmed working on a WiiM Pro; other WiiM/LinkPlay
-# models expose a different physical set and there's no API that reports
-# which, so adjust to match your unit. Recognized keys: wifi, bluetooth,
+# Which sources appear in the Source menu, in the order you want them. The
+# list below was confirmed on a WiiM Pro; other models have a different set
+# of physical inputs and there's no way to ask the unit which it has, so
+# trim or extend this to match yours. Recognized keys: wifi, bluetooth,
 # line-in, optical, co-axial, udisk, hdmi, phono, pcusb.
 # WIIM_INPUTS = "wifi,bluetooth,line-in,optical"
-# WIIM_TIMEOUT = "2000"
-# WiiM-app Favorites can't be listed back reliably over the plain HTTP API
-# (confirmed live: getPresetInfo stays empty even with real Favorites
-# configured) -- set how many you've actually set up (1-12) to show a Preset
-# menu at all, and optionally name them, comma-separated in order. Any slot
-# left unnamed falls back to "Preset N". See src/wiim.py's module docstring.
-# WIIM_PRESET_COUNT = "2"
-# WIIM_PRESET_NAMES = "Morning Radio,Jazz Station"
+# Your WiiM-app Favorites, named in the same order as on the device. deloop 
+# can't read these from the unit (the API incorrectly reports them as empty),
+# so this list is how it knows they exist -- name as many as you've actually
+# configured, up to 12. Position matters: the first name is Favorite 1.
+# WIIM_PRESET_NAMES = "Movie,Music,BassBoost"
+# Optionally promote a few of those to one-tap buttons on the main screen,
+# named exactly as above, in the order you want them. Max 4.
+# The catch: buttons and the play/pause + skip controls occupy the same part
+# of the screen, so you get one or the other. Leave this unset to keep the
+# media controls -- your Favorites are still reachable from the Preset menu
+# either way.
+# WIIM_PRESET_BUTTONS = "Movie,Music"
 
 # --- CamillaDSP (required if DEVICE_DRIVER = "camilladsp") ---
-# Confirmed working end to end on real M5 Dial hardware (2026-07-30) -- run
-# `make probe-camilladsp` first regardless, to confirm your own instance
-# behaves as expected before flashing.
-# Host running CamillaDSP -- NOT anything about the audio devices it's
-# processing, just where its own websocket control server is reachable.
-# Same "must already be running, must be LAN-reachable" topology as minidsp,
-# except CamillaDSP's control API is websocket-only, no HTTP option -- see
-# src/camilladsp.py.
+# The IP of the machine running CamillaDSP -- where its control server is
+# reachable. 
 # CAMILLADSP_HOST = "192.168.1.104"
-# CAMILLADSP_PORT = "1234"   # whatever port CamillaDSP was started with -p
-# CAMILLADSP_TIMEOUT = "2000"
-# Presets -- CamillaDSP config files to offer, as "Name:/path/to/config.yml"
-# pairs, comma-separated, in menu order. Path must be absolute and resolvable
-# by the CamillaDSP process itself (not this device). Leave unset for no
-# Preset menu at all. Reachable through the scrollable Preset menu regardless
-# of size -- CAMILLADSP_QUICK_PRESETS below is a separate, smaller list for
-# main-screen buttons.
+# CAMILLADSP_PORT = "1234"   # whatever port you started CamillaDSP with (-p)
+# The config files you want to switch between, as "Name:/path" pairs in menu
+# order. Paths are absolute, and have to make sense to the machine running
+# CamillaDSP -- not to the Dial. Leave unset for no Preset menu at all.
 # CAMILLADSP_PRESETS = "Movie:/home/user/configs/movie.yml,Music:/home/user/configs/music.yml"
-# Up to 4 names from CAMILLADSP_PRESETS (must match exactly) to also show as
-# main-screen quick-select buttons, comma-separated. Leave unset for no quick
-# buttons at all (submenu-only). Unlike minidsp/denon, CAMILLADSP_PRESETS
-# itself has no size limit, so this is a deliberately separate, capped list
-# rather than "show buttons for everything" -- see src/camilladsp.py.
+# Up to 4 of those names to also show as one-tap buttons on the main screen.
+# Names must match CAMILLADSP_PRESETS exactly. Unset means the Preset menu
+# only, which is the sensible default if you have more than a handful.
 # CAMILLADSP_QUICK_PRESETS = "Movie,Music"
-# Switching presets triggers a full filter-pipeline reload -- raise this if
-# your config is slow to reload. Measured ~1-3ms against a trivial test
-# config (no FIR/convolution files to load) -- a real production config
-# could be much slower; not yet measured for that case.
+# Switching presets reloads the whole filter pipeline. The default is
+# generous: a trivial config reloads in milliseconds, but a real one with
+# convolution files to read could take much longer. Raise it if switching
+# seems to do nothing.
 # CAMILLADSP_PRESET_TIMEOUT = "10000"
 
+# Optional overrides (safe to leave commented out)
+# deloop already picks a volume range and step size to suit whichever device
+# you chose above -- dB for an AVR or DSP, 0-100 percent for Home Assistant
+# and WiiM -- so you only need these if you want something different from
+# what you get.
+# VOLUME_MIN        = "-80.0"  # bottom of the dial
+# VOLUME_MAX        = "18.0"   # top of the dial
+# VOLUME_STEP       = "0.5"    # change per click of the knob
+# VOLUME_STEP_FAST  = "2.0"    # change per click when you spin it quickly
+# ACCEL_THRESHOLD   = "100"    # ms between clicks that counts as "quickly"
+# How often deloop re-checks the device, in seconds. The display updates the
+# instant you turn the knob regardless -- this is only how quickly it notices
+# a change made somewhere else, like a phone app or the physical remote.
+# POLL_INTERVAL     = "30.0"
+# Screen brightness when the device is off, as a fraction of your normal
+# brightness rather than a fixed value -- so a dim room stays dim. 0.0-1.0.
+# STANDBY_BRIGHTNESS_FRAC = "0.25"
+# The slow "breathing" fade while muted. On by default; set false for a
+# steady screen.
+# MUTE_PULSE        = "false"
+
 # --- Self-update (optional) ---
-# Pulls new deloop app-file releases from a flat S3 layout -- NOT
-# CircuitPython firmware. Manual only: opens via the "Update" menu, nothing
-# runs in the background. See README.md "Updating deloop" and docs/ota.md.
+# Lets deloop update itself over WiFi from the "Update" menu. Nothing happens
+# in the background and nothing is checked unless you ask it to -- and this
+# updates deloop only, never CircuitPython itself. See README.md "Updating
+# deloop". This is enabled by default, and the values shared here for transparency.
+# You can disable the abitilty to run OTAs if you wish.
 # OTA_ENABLED = "true"
 # OTA_S3_BASE = "https://deloop.s3.us-east-1.amazonaws.com"
-# OTA_REPO = "anotherhobby/deloop"  # CI-side GitHub Release only (changelog/history) -- device never reads this
+# OTA_REPO = "anotherhobby/deloop"  # used when publishing releases; the device never reads it
 # OTA_CHECK_TIMEOUT = "10000"
 # OTA_INSTALL_TIMEOUT = "60000"
-
-# Optional overrides (safe to leave commented out)
-# VOLUME_MIN        = "-80.0"  # per-driver default set in config.py (dB, or 0-100
-# VOLUME_MAX        = "18.0"   # percent for DEVICE_DRIVER = "ha" / "wiim")
-# VOLUME_STEP       = "0.5"    # per tick at normal speed (dB or percent)
-# VOLUME_STEP_FAST  = "2.0"    # per tick when spinning fast (dB or percent)
-# ACCEL_THRESHOLD   = "100"     # ms between ticks that triggers fast mode
-# ACCEL_SAFETY_CAP  = "-15.0"  # max volume (dB) allowed during fast upward spin
-# POLL_INTERVAL     = "30.0"
-# STANDBY_BRIGHTNESS_FRAC = "0.25"  # standby/off brightness, as a fraction (0.0-1.0) of your own
-# MUTE_PULSE        = "false"  # mute "breathing" animation -- on by default, set false to disable
