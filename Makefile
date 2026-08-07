@@ -189,13 +189,13 @@ ui-renders:
 	  $(PYTHON) tools/render_ui_screenshots.py --backend denon
 	DEVICE_DRIVER=minidsp VOLUME_MIN=-50.0 VOLUME_MAX=0.0 \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend minidsp
-	DEVICE_DRIVER=wiim WIIM_PRESET_COUNT=3 WIIM_PRESET_NAMES="Bass +8,Preset 1,Preset 2" \
+	DEVICE_DRIVER=wiim WIIM_PRESET_NAMES="Bass +8,Night,Vocal" \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend wiim
 	DEVICE_DRIVER=camilladsp \
 	  CAMILLADSP_PRESETS="Flat:/path/to/flat.yml,Quiet:/path/to/quiet.yml,Muffled:/path/to/muffled.yml" \
 	  CAMILLADSP_QUICK_PRESETS="Flat,Quiet,Muffled" \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend camilladsp
-	DEVICE_DRIVER=ha VOLUME_MIN=0.0 VOLUME_MAX=100.0 HA_MEDIA_CONTROLS=true \
+	DEVICE_DRIVER=ha VOLUME_MIN=0.0 VOLUME_MAX=100.0 \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend ha
 	$(PYTHON) tools/render_ui_grid.py
 

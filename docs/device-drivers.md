@@ -452,8 +452,8 @@ indexing rather than mixing in `.get(..., False)` for just this one key.
 Skip controls (`media_previous()`/`media_next()` -> `media_player.media_previous_track`/
 `media_next_track`, confirmed real service names via live `GET /api/services`) render as plain
 `<`/`>` text flanking the Playing/Paused label (`dial_ui.py`'s `_media_side_text()`), gated by the
-exact same condition as that label already was (`state.media_state in ("playing", "paused")`, in
-turn gated by `HA_MEDIA_CONTROLS`) -- no new setting. Tap zones for the two icons are checked
+exact same condition as that label already was (`state.media_state in ("playing", "paused")`)
+-- no new setting. Tap zones for the two icons are checked
 *before* the existing full-row `media_status_tap()` play/pause zone in `app.py`'s
 `_tap_main_screen()`, so the original zone's generous "anywhere in the row" target isn't narrowed,
 skip is just reachable from two specific flanking positions on top of it.
@@ -520,9 +520,9 @@ see `tools/probe_wiim.py`. Requested by the user explicitly as "direct support,"
 `client.py`/`device.py`/`const.py` supplied the confirmed command set and mode-code tables below).
 
 Scope, confirmed with the user up front via a clarifying question before implementation: volume/
-mute, always-on play/pause/skip (no opt-in flag like `HA_MEDIA_CONTROLS` -- a streaming source
-either is or isn't currently playing, none of `ha`'s "rougher fit" caveat applies), input/source
-selection, and presets -- but explicitly *not* device discovery/switching like `ha`'s Media Player
+mute, always-on play/pause/skip (no opt-in flag -- a streaming source either is or isn't currently
+playing; `ha` briefly had an `HA_MEDIA_CONTROLS` flag for this, removed 2026-08-06 as redundant
+with the same state check both backends already use), input/source selection, and presets -- but explicitly *not* device discovery/switching like `ha`'s Media Player
 menu (`CAPS["player_select"]` is `False`; WiiM only ever controls itself).
 
 ### HTTPS-only API with a self-signed cert -- the first backend needing TLS at all, and the first
@@ -632,6 +632,32 @@ override for other WiiM/LinkPlay models (Amp, Ultra, Pro Plus) that may expose a
 physical set -- same escape-hatch role `MINIDSP_PRESET_NAMES` already plays for a similarly
 per-unit list that the API can't enumerate.
 
+### Mode names must fit the round screen (2026-08-06)
+
+`_MODE_NAME` (the mode-code -> "what's playing" table behind `friendly_input()`, ported wholesale
+from the reference's `PLAYBACK_MODE_MAP`) carried three names too wide for the display: rendered in
+`Inter_Medium_20`, "TIDAL Connect" is 144px, "Spotify Connect" 156px and "External Storage" 158px.
+`dial_ui.py`'s input label sits at y=62 on a 240px **circle**, where the gauge arc's inner radius
+(90) leaves only **~122px** clear -- so those three drew under the arc band and were then clipped by
+the display circle. Shortened in place to "TIDAL", "Spotify" and "Storage"; all 16 entries now fit
+with margin (widest is "Voice Mail" at 99px). These are display-only strings -- nothing on the wire
+uses them -- so shortening them costs nothing, which is why this was fixed at the source rather than
+by adding truncation to `dial_ui.py`.
+
+The general lesson, not WiiM-specific: **available width is a function of the row's distance from
+the screen centre**, and it is a pixel budget, not a character count (Inter's advances run 5px for
+"i" to 20px for "W", so "10 characters" is anywhere from 50px to 200px). `tools/font_fit.py`
+measures any string against the real `.pcf` the device loads -- `--list` prints every label row's
+budget, `--table src/wiim.py:_MODE_NAME` checks a whole table at once. Run it before adding or
+renaming any backend's `friendly_input()` or preset names.
+
+Still unbounded by construction, and not solvable this way: `denon.py`'s `_input_names` is populated
+live from the AVR's own renamed sources, and HA source names come from the user's HA config. Any
+name long enough will overflow the same way. `friendly_input()`'s `"Unknown"` fallback (91px) means
+an *unrecognized* WiiM mode code is always safe, but a recognized-but-renamed Denon input is not.
+If that ever bites, the fix is a width-aware fallback in `dial_ui.py` that every backend inherits,
+not another per-backend table edit.
+
 ### Presets: config-driven count/names, not auto-discovered -- quick-select buttons deliberately skipped
 
 First implementation tried the same runtime-discovery pattern as `minidsp.py`'s
@@ -653,9 +679,16 @@ Given a straight choice between implementing UPnP/SOAP (real names, zero setting
 a new protocol/complexity class on a memory-constrained device, untested against this unit's
 actual UPnP service layout) and falling back to config, the user chose config. `wiim.py` now
 mirrors `minidsp.py`'s own established answer to an analogous "API can't report names" gap exactly:
-`CAPS["presets"] = config.WIIM_PRESET_COUNT > 0` (set once, at import time, not runtime-discovered
-at all now), and `get_presets()` returns `("", [(str(i), name) for i in 1..COUNT])` with names from
-`WIIM_PRESET_NAMES` falling back to `"Preset N"` -- same shape, same reasoning, different backend.
+`CAPS["presets"] = len(config.WIIM_PRESET_NAMES) > 0` (set once, at import time, not
+runtime-discovered at all now), and `get_presets()` returns `("", [(str(i), name)])` over that
+list -- same shape, same reasoning, different backend.
+
+**`WIIM_PRESET_NAMES` is the preset set; its length is the count.** This originally had a separate
+`WIIM_PRESET_COUNT` alongside it, which clamped the name list -- so naming 3 Favorites with a count
+of 2 silently hid the third. Corrected 2026-08-06 (see "Quick-select buttons" below for where that
+count actually belonged). A count can only ever agree with `len()` or contradict it, and there is
+nothing it can express that the list doesn't, because for WiiM the names *are* the slots: a name's
+position in the list is the Favorite number `MCUKeyShortClick:<n>` takes.
 
 The user's own framing, when asked what capabilities to add, was to make WiiM's presets "work like
 the HA device selection" -- meaning reachable only through a scrollable list menu, not a fixed
@@ -674,6 +707,81 @@ changes to handle a 12-entry list correctly -- this is the same "device-behavior
 CAPS flag, not a driver-name check" principle as every capability flag before it (hard lesson #6
 in the Denon->MiniDSP section above), just applied to *how many* of something exists rather than
 *whether* it exists at all.
+
+### Quick-select buttons: a configured subset, not all-or-nothing (corrected 2026-08-06)
+
+`wiim.py` hardcoded `CAPS["preset_quickbuttons"] = False` on the reasoning above: 12 favorites
+against a 5-slot row, so show none. **That reasoning was already overturned during the CamillaDSP
+work and the back-port was missed.** CamillaDSP's rejected-design (2) -- recorded in
+`camilladsp.py`'s docstring, and it names `wiim.py` explicitly -- was "always submenu-only,
+matching wiim.py exactly", rejected by the user on the grounds that the row has room for a few
+buttons and there's no reason to surrender that shortcut just because the *full* list can be long.
+CamillaDSP got `CAMILLADSP_QUICK_PRESETS`; WiiM was left on the design that had just been rejected,
+while its own docstring went on arguing for it. A row with fewer slots than the list is an argument
+for showing a **subset**, not for showing none.
+
+`WIIM_PRESET_BUTTONS` is the fix, and it's where the old `WIIM_PRESET_COUNT` belonged all along --
+the count was originally meant as "how many buttons do you want", and got wired to the menu list
+instead, which is how it became a clamp. It takes **names from `WIIM_PRESET_NAMES`**, in draw
+order, so `"Night,Movie"` draws Night first. Validation lives in `config.py`
+(`_parse_wiim_preset_buttons`): unknown and repeated names are dropped with a boot print rather
+than failing the boot, and the survivors are resolved to 1-based positions there, so
+`wiim.py`'s `get_quick_presets()` is a pure lookup with no validation of its own.
+
+**Four buttons is the ceiling, not five.** This first shipped capped at 5, reading `dial_ui.py`'s
+`_DBTN_MAX = 5` as a usable maximum. It isn't -- it's the pre-allocated label-slot count. Measured
+2026-08-06: at the button row (y=156..178) the gauge arc's inner edge leaves 138px clear, 4 buttons
+span 130px and fit, 5 span 166px and draw over the arc band. `camilladsp.py` already capped its own
+quick list at 4 and called it "the practical limit" without recording why; that reason is the arc,
+and it's now measured rather than folklore. Both caps live in `config.py`
+(`_DBTN_BUTTON_CAP`, `_parse_camilladsp_quick_presets`); `_DBTN_MAX` stays 5 as the allocation and
+clamp bound, which is what makes an over-long list truncate safely instead of crashing.
+
+**Buttons and media controls are mutually exclusive, and media controls are the default.** WiiM is
+the first backend to want both -- `ha.py` has media controls but no presets;
+`denon`/`minidsp`/`camilladsp` have presets but no media row -- so nothing before this had to
+choose. They cannot coexist: the button row occupies y=156..178 (`_DBTN_Y0` + `_DBTN_H`) and
+`wiim_ui._icon_row_y()` puts the play/pause icon at 164..180, with the `"<<"`/`">>"` labels taller
+still. The 18px left between the buttons and the MENU roof (y=196) cannot fit a 20px font row, so
+there is no "move it down" that works -- and the tap zones would overlap regardless, with
+`_dispatch_tap` checking media first and silently swallowing every button tap.
+
+So `WIIM_PRESET_BUTTONS` selects between the two layouts: unset keeps play/pause and skip (the
+behavior WiiM always had), and naming any preset trades them for a denon/minidsp-style button
+row. `wiim_ui.py`'s `_media_row_active()` is the single predicate, consulted by both
+`draw_status_rows()` and all three media tap handlers -- if those ever disagree, the drawn UI and
+the tap map diverge, which is the same class of bug `CAPS["preset_quickbuttons"]` was introduced
+to fix in the first place.
+
+### Quick presets are configured by name on every backend that has them (settled 2026-08-06)
+
+`WIIM_PRESET_BUTTONS` first shipped taking **positions**, deliberately, against
+`CAMILLADSP_QUICK_PRESETS`'s names. The argument was that a WiiM position is not an arbitrary
+index: `get_presets()` numbers slots 1..N, that number is exactly what `MCUKeyShortClick:<n>`
+sends, and the same digits appear in the WiiM app -- so positions introduced no second numbering,
+where names would. CamillaDSP presets, by contrast, are config-file paths whose order is
+incidental, so a position there means nothing.
+
+That reasoning is sound about the *implementations* and wrong about the *settings*. The maintainer
+hit it immediately: the two settings sit in adjacent blocks of `settings.toml.template` and look
+parallel, so any difference in how they're written reads as inconsistency, whatever justifies it
+underneath. **Both are names now.**
+
+The position argument didn't lose anything, because it was never about the config surface -- the
+name is what the user writes, and `config.py` resolves it to the Favorite number at import, so the
+protocol value is still a position by the time `wiim.py` sees it. Names additionally survive
+reordering `WIIM_PRESET_NAMES`, and a rename fails *loudly* (the "not in WIIM_PRESET_NAMES" boot
+print, then a fall back to media controls) where a position list would have silently pointed at
+whatever preset moved into that slot.
+
+One real limitation of matching by name: two Favorites sharing a name are indistinguishable, and
+only the first is reachable as a button (`presets.index(name)`). Positions could address both.
+That's an accepted trade -- duplicate Favorite names are a user-side problem, and the loud-failure
+property is worth more than addressing an ambiguous list.
+
+The general rule for a sixth backend: **quick-preset subsets are configured by name.** If a
+backend's presets have real numbering worth exposing, expose it in the *full* list's config (as
+`WIIM_PRESET_NAMES`'s order does), not in the quick-subset setting.
 
 ### Media controls needed their own minimal UI extension, not just `state.media_state`
 
@@ -1033,8 +1141,8 @@ tools/render_ui_screenshots.py --backend X` subprocess per backend, each with it
    `CAPS` is itself config-derived -- the environment has to actually reflect a real config too.
 
 **Realism review, same session:** the user caught two more things on sight that weren't bugs, just
-unrepresentative choices. WiiM's fixture originally left `WIIM_PRESET_COUNT`/`WIIM_PRESET_NAMES`
-unset, which produced a real (not broken) but visually sparse screenshot -- an empty gap where
+unrepresentative choices. WiiM's fixture originally left its preset config (then
+`WIIM_PRESET_COUNT`/`WIIM_PRESET_NAMES`, now just `WIIM_PRESET_NAMES`) unset, which produced a real (not broken) but visually sparse screenshot -- an empty gap where
 `wiim_ui.py`'s `"(Set Preset)"` placeholder normally sits, since that placeholder only renders when
 `CAPS["presets"]` is true. Fixed by setting representative values in the Makefile's `wiim` line,
 matching the shape of the user's real `settings.toml.wiim`. Separately, the fixture's input was
@@ -1043,6 +1151,18 @@ raw mode `"10"`, which `wiim.py`'s `_MODE_NAME` table really does map to the lit
 swapped to mode `"1"` ("AirPlay", equally confirmed live) purely for recognizability. Neither
 required a code change, both are in `_fixture_wiim()`'s comments -- worth remembering that "is it
 technically accurate" and "is it a good illustration" are different bars for this particular tool.
+
+**Silent rot, found 2026-08-06:** every screenshot this tool produced between 2026-08-05 and
+2026-08-06 was the "lost connection / reconnecting..." screen, for all five backends. `25e601c`
+added `state.power_known` (`draw_main()` refuses to render device state it hasn't heard from the
+device), and `dial_sim._base_state()` sets it -- but `render_ui_screenshots.py`'s `_fixture_*`
+functions build `AVRState()` directly and bypass that helper entirely, so none of them had it. The
+committed PNGs were fine only because nobody re-ran `make ui-renders` in that window. Two things
+made it invisible: the failure mode is a *plausible screen* rather than a crash or a blank, and
+nothing runs this tool automatically. `power_known` is now set once in `main()` rather than
+per-fixture, so a new fixture can't reintroduce it -- but the general hazard stands for any state
+field `draw_main()` gates on: **the fixtures duplicate `_base_state()`'s setup instead of building
+on it**, and the next such field will break them the same way.
 
 ## Gauge arc overshoot at min/max volume -- all backends (found + fixed 2026-07-30)
 

@@ -6,7 +6,19 @@ See [docs/hardware.md](hardware.md) for physical/flashing details, and
 [docs/device-drivers.md](device-drivers.md) for the pluggable backend architecture and each
 backend's protocol reference.
 
-Last updated: 2026-08-06 (v2.7 -- interaction polish on top of v2.6's rendering rewrite. Device
+Last updated: 2026-08-07 (config and text-fitting pass, not yet released. Names that come from the
+user's own gear -- an HA entity's friendly name, a renamed Denon input -- are now measured against
+the round screen and truncated to fit (`dial_ui.fit_text()`, `tools/font_fit.py`), after "Dining
+Room Speakers" and WiiM's "TIDAL Connect" both ran under the gauge arc. WiiM presets were reworked:
+`WIIM_PRESET_NAMES` IS the preset set and `WIIM_PRESET_BUTTONS` picks which get main-screen
+buttons, by name, matching `CAMILLADSP_QUICK_PRESETS`; the old `WIIM_PRESET_COUNT` silently
+clamped the name list and is gone. Two settings that never did anything were deleted
+(`ACCEL_SAFETY_CAP`, never read by anything; `HA_MEDIA_CONTROLS`, made redundant by the
+`media_state` design). An HA Source menu that silently failed at boot is fixed -- see the HA
+paragraph below. `settings.toml.template` was rewritten for a first-time reader.
+**All five backends need a hardware pass before this ships.**)
+
+Previously: 2026-08-06 (v2.7 -- interaction polish on top of v2.6's rendering rewrite. Device
 writes now go through one optimistic-write mechanism (`_SETTLE_S`/`_optimistic()`/`_settle_guard()`
 in `app.py`): assume the command worked, update the UI immediately, let polling true it up. Input
 switching uses it, and `draw_busy()` no longer flashes grey on backends whose writes return
@@ -419,14 +431,30 @@ Original v1.0 key list (historical, Denon-only, some now removed):
 | `VOLUME_STEP` | `0.5` | dB/tick at normal speed |
 | `VOLUME_STEP_FAST` | `2.0` | dB/tick at fast speed |
 | `ACCEL_THRESHOLD` | `100` | ms between ticks for fast mode |
-| `ACCEL_SAFETY_CAP` | `-15.0` | Max volume during fast upward spin |
+| `ACCEL_SAFETY_CAP` | `-15.0` | **removed 2026-08-06** -- a ceiling on fast upward spins that nothing ever read (inert since the first POC snapshot). Not reimplemented: the 2026-08-05 render rewrite made a fast spin controllable enough that the protection isn't wanted |
 | `POLL_INTERVAL` | `30.0` | Seconds between polls when recently active |
 
-As of v2.2, `config.py` also has: `DEVICE_DRIVER` (`"denon"`, `"minidsp"`, `"ha"`, or `"wiim"`),
-per-driver `VOLUME_MIN`/`VOLUME_MAX` defaults, the `MINIDSP_*` keys (`HOST`, `PORT`,
-`DEVICE_INDEX`, `SERIAL`, `PRESET_COUNT`, `TIMEOUT`, `PRESET_TIMEOUT`), the `HA_*` keys (`HOST`,
-`PORT`, `TOKEN`, `ENTITY_ID`, `TIMEOUT`), and the `WIIM_*` keys (`HOST`, `TIMEOUT`, `INPUTS`) --
-see `settings.toml.template` for current defaults and comments on each.
+`config.py` also has: `DEVICE_DRIVER` (`"denon"`, `"minidsp"`, `"ha"`, `"wiim"`, or
+`"camilladsp"`), per-driver `VOLUME_MIN`/`VOLUME_MAX` defaults, the `MINIDSP_*` keys (`HOST`,
+`PORT`, `DEVICE_INDEX`, `SERIAL`, `PRESET_COUNT`, `PRESET_NAMES`, `TIMEOUT`, `PRESET_TIMEOUT`),
+the `HA_*` keys (`HOST`, `PORT`, `TOKEN`, `ENTITY_ID`, `TIMEOUT`), the `WIIM_*` keys (`HOST`,
+`TIMEOUT`, `INPUTS`, `PRESET_NAMES`, `PRESET_BUTTONS`), and the `CAMILLADSP_*` keys (`HOST`,
+`PORT`, `TIMEOUT`, `PRESETS`, `QUICK_PRESETS`, `PRESET_TIMEOUT`) -- see
+`settings.toml.template` for current defaults and comments on each.
+
+Two conventions worth knowing before adding a key, both settled the hard way (2026-08-06/07, see
+[docs/device-drivers.md](device-drivers.md)):
+
+- **A name list IS its own count.** `WIIM_PRESET_NAMES` has no companion count setting, because
+  the one it used to have (`WIIM_PRESET_COUNT`) could only ever agree with `len()` or silently
+  contradict it -- and it contradicted it, clamping the list so a third named Favorite just
+  vanished. `MINIDSP_PRESET_COUNT` still exists and is legitimate: there, the slots are physical
+  and exist whether or not you name them.
+- **Quick-preset subsets are configured by name**, never by position -- `WIIM_PRESET_BUTTONS` and
+  `CAMILLADSP_QUICK_PRESETS` both. Positions were briefly used for WiiM (a position there really
+  is the Favorite number `MCUKeyShortClick:<n>` takes) but two settings that look parallel in
+  `settings.toml.template` should be written the same way, whatever justifies the difference
+  underneath.
 
 `config.py` also has `OTA_ENABLED`/`OTA_S3_BASE`/`OTA_REPO`/`OTA_CHECK_TIMEOUT_MS`/
 `OTA_INSTALL_TIMEOUT_MS`, orthogonal to `DEVICE_DRIVER` -- see [docs/ota.md](ota.md).
@@ -608,12 +636,23 @@ pluggable-driver contract; Denon and MiniDSP are verified against real hardware 
 MiniDSP 2x4HD, MiniDSP Flex). HA `media_player` (discovery/switching, skip controls, the
 standby-screen menu access fix, and the row/glyph/spacing polish) has had real on-device use --
 that's how the standby MENU tap-zone bug, the oversized pause glyph, and the font-size regression
-all got caught, even though that last one turned out not to be the WiFi bug itself. Other than the
-WiFi outage, still outstanding: a live `select_source` check (never exercised live, only the
-identical-shaped `_call_service` path other calls already confirmed working), and confirming the
-`<<`/`>>` skip icons plus the centered-integer volume display look right on the actual physical
-screen (renders via `tools/dial_sim.py` and direct `.pcf` bitmap dumps both look correct, but
-neither is the real GC9A01 display).
+all got caught, even though that last one turned out not to be the WiFi bug itself. The WiFi
+outage is closed (see the next-session prompt). Still outstanding: confirming the `<<`/`>>` skip
+icons plus the centered-integer volume display look right on the actual physical screen (renders
+via `tools/dial_sim.py` and direct `.pcf` bitmap dumps both look correct, but neither is the real
+GC9A01 display).
+
+The Source menu itself was broken until 2026-08-07 and is worth knowing about, because the failure
+was invisible: `ha.py`'s `_refresh_entity()` is the only thing that ever populates `_source_list`,
+and it swallowed every exception silently. One failed call at boot left the Source submenu empty
+for the whole session -- indistinguishable from "this entity has no sources" -- and confirming an
+entry in that empty menu threw `IndexError` out of `app.py`'s `_confirm_sub()`, which read
+on-screen as the menu flipping straight back to the main screen. Switching media player called
+`_refresh_entity()` again and fixed it for the rest of the session, which is what made it look
+like a first-boot-only quirk. Both halves are fixed: `_refresh_entity()` now prints on failure, on
+a 404 (which returns valid JSON and so never hit the `except` at all), and on success with the
+feature bits and source count; and `_confirm_sub()` range-checks every list-backed branch instead
+of indexing outside its own `try`. Confirmed fixed on real hardware by the maintainer.
 
 `wiim` is implemented, and its TLS transport was a real find: the first implementation (a shared
 `adafruit_requests.Session` with `check_hostname = False`) reliably failed to boot -- see
@@ -621,12 +660,11 @@ docs/device-drivers.md's "HTTPS-only API with a self-signed cert" section for th
 trail -- and the fix (a raw-socket transport with a hardcoded SNI hostname, bypassing
 `adafruit_requests` for this backend only) is confirmed working end-to-end via live REPL testing
 against the real M5 Dial and a real WiiM Pro (full HTTP/1.0 response -- status line, headers, JSON
-body -- received correctly over the fixed path). What's still outstanding: the *rewritten*
-`wiim.py`/`app.py` haven't been redeployed and booted fresh yet with the fix in place -- the fix
-was validated via ad-hoc snippets typed directly into the live REPL, not yet the actual shipped
-module code end to end, so that's the next concrete step, not a re-litigation of whether the
-approach works. Also still unverified: the `getPresetInfo` `preset_list` entry field names (no
-favorites were configured on the test unit yet).
+body -- received correctly over the fixed path). The rewritten `wiim.py`/`app.py` have since run
+as shipped module code against a real WiiM, not just the ad-hoc REPL snippets the approach was
+proven with -- that was the last open item here and it is closed. Also still unverified: the
+`getPresetInfo` `preset_list` entry field names (no favorites were configured on the test unit
+yet).
 
 `camilladsp` is implemented and confirmed working end-to-end on real M5 Dial hardware against a
 real `camilladsp` 4.1.3 process -- volume, mute, and touch all functioning -- see
