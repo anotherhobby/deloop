@@ -158,7 +158,7 @@ deloop/
     dump_denonavr.py
     dial_sim.py        # renders dial_ui.py off-device to PNGs (make renders)
     render_ui_screenshots.py    # renders README's per-backend screenshots (make ui-renders)
-    make_splash.py, gen_click.py
+    make_splash.py     # regenerates the splash BMP (make splash)
   .github/
     workflows/release.yml   # builds + publishes a new OTA release on every push to main
   Makefile

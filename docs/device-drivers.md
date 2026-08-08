@@ -86,37 +86,6 @@ No special headers required.
 Switching speaker preset changes available Dirac filters -- always reload
 `get_dirac_filters()` after `set_speaker_preset()`.
 
-## POC Status (v1.0 -- COMPLETE as of 2026-07-24)
-
-*Historical -- this was "done" before the driver split and MiniDSP support existed. See
-[Device Driver Architecture](#device-driver-architecture-v20) below and
-[Current Recommendation](architecture.md#current-recommendation) in docs/architecture.md for the
-actual current status.*
-
-All originally requested features are working on hardware.
-
-### Implemented and working
-1. CircuitPython 10.2.1 on M5 Dial, `make deploy` via USB drive.
-2. Volume display with FreeMonoBold 36pt font (monospaced, always fixed width).
-3. Rotary encoder controls AVR volume: optimistic display update on every tick,
-   single `set_volume` HTTP call 150ms after spin stops (debounced).
-4. Encoder acceleration: ticks faster than 50ms apart use 2dB/tick. Safety cap
-   at -15dB during fast upward spin (configurable via settings.toml).
-5. Adaptive polling: 5s while idle or in standby, 30s while recently active.
-   Poll never fires while encoder is spinning.
-6. Touch long-press 0.5s = mute toggle.
-7. Touch long-press 1.5s = power toggle (suppresses mute at same press).
-8. All commands reset the poll timer to prevent back-to-back HTTP blocking.
-9. Standby state: backlight dims to 5%, display shows "OFF" in white.
-10. Power-on transition: shows "---.-" briefly, polls in 1s for real volume.
-11. Friendly input names loaded at boot via GetRenameSource ("Desk" not "SAT/CBL").
-12. Encoder press opens menu: Dirac Live, Speaker Preset, Brightness.
-13. Dirac Live filter selection (custom names from AVR, Off always last).
-14. Speaker preset selection (display names via SPEAKER_PRESET_1/2 in settings.toml).
-15. Brightness adjustment (live preview in menu, saved to nvm on confirm).
-16. Switching speaker preset auto-reloads Dirac filter list (they are tied).
-17. Config via settings.toml (WiFi, AVR host, all tunable params).
-
 ## Device Driver Architecture (v2.0)
 
 Added 2026-07-28 when the user wanted minidsp-rs (https://github.com/mrene/minidsp-rs) support
@@ -1021,16 +990,15 @@ been reconfirmed byte-for-byte live via `tools/probe_camilladsp.py` against a re
   one connection). First version combined channel count into the same string
   (`"<channels>ch - <rate>khz"`) -- confirmed live on real hardware to be visibly too wide, so
   channel count was pulled back out into its own thing (see next bullet) and the display is rate-only.
-- **Channel count is a separate, generic contract key now, not folded into any one backend's display
-  string.** `get_status()`'s optional `"channels"` key (`driver.py`, same no-CAPS-flag shape as
-  `"media_state"`) is a `state.channels` field with no UI consumer yet -- the user wants it
-  displayed somewhere else, not decided as of this writing. `camilladsp.py`'s own
-  `_fetch_channels()`/`_channels` cache (from `GetConfigJson`'s `devices.capture.channels` -- the
-  only way to get it, since no dedicated command reports it and `GetChannelLabels` is unreliable,
-  labels being optional in the config) was kept exactly as built, just wired into this new key
-  instead of the status string. Fetched once and cached, not every poll, since it's static per
-  loaded config; `set_preset()` invalidates the cache since a different config can have a different
-  channel count.
+- **Channel count was built, then removed as unused.** It briefly lived as a generic
+  `get_status()` `"channels"` key plus a `state.channels` field and a `camilladsp.py`
+  `_fetch_channels()` cache. Nothing ever displayed it -- no row on a 240px round screen was free
+  -- so the whole path was carrying weight for a feature that never landed, and it was pulled out
+  in the 2026-08-07 cleanup. If it comes back, the source is `GetConfigJson`'s
+  `devices.capture.channels` (the only way to get it: no dedicated command reports it, and
+  `GetChannelLabels` is unreliable since labels are optional in the config). Cache it rather than
+  polling -- it is static per loaded config -- and invalidate on `set_preset()`, since a different
+  config can have a different channel count. **Decide where it renders before rebuilding it.**
 - **Checked whether the other four backends could fill in "channels" too -- none currently can**,
   each for a different confirmed reason (see `driver.py`'s contract comment for the full writeup,
   not repeated here): `denon.py` has no known API command for it, and this is unresolved even in
@@ -1093,9 +1061,9 @@ regeneration" right below for the full writeup.
   mock capture/data source chosen for testing convenience can fail to exercise a real backend's
   full behavior in ways that only show up as "looks like a bug" until traced to source -- the
   fastest way through was reading the vendor's actual Rust source, not guessing from the symptom.
-- The *rate-only* status string and the new generic `"channels"`/`state.channels` contract key
-  (both post-date the "Starting" investigation above) haven't been redeployed/reconfirmed on the
-  Dial yet -- the width fix and the contract generalization are host-side-verified only.
+- The *rate-only* status string post-dates the "Starting" investigation above. The `"channels"`
+  contract key that briefly accompanied it was removed again in the 2026-08-07 cleanup as unused
+  (see the bullet further up); the rate-only string stayed.
 
 ## ui/ screenshot regeneration -- `tools/render_ui_screenshots.py` / `make ui-renders` (added 2026-07-30)
 

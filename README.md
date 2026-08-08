@@ -1,6 +1,6 @@
 # deloop
 
-deloop is an open-source applciation for the [M5 Dial](https://shop.m5stack.com/products/m5stack-dial-v1-1) that turns it into a focused remote and volume knob and config switcher with support for the following devices/platforms:
+deloop is an open-source application for the [M5 Dial](https://shop.m5stack.com/products/m5stack-dial-v1-1) that turns it into a focused remote and volume knob and config switcher with support for the following devices/platforms:
 
 *  Denon/Marantz AVRs (2016+, Presets only on Dirac Live licensed AVRs)
 *  minidsp-rs
@@ -8,17 +8,17 @@ deloop is an open-source applciation for the [M5 Dial](https://shop.m5stack.com/
 *  WiiM/LinkPlay streamers
 *  Home Assistant media player entities
 
-As a package, it is wired, compact, and generally intended for desktop use. You rotate the encoder to adjust volume, and tap the upper half of the screen to mute. Input switching thru the menu is suppored on all devices. For devices that support DSP presets, up to 4 touch buttons can display on the sceen, with a menu to access more if needed. Home Assistant media players and WiiM streamers that support media controls will also get basic play/pause/skip buttons.
+As a package, it is wired, compact, and generally intended for desktop use. You rotate the encoder to adjust volume, and tap the upper half of the screen to mute. Input switching through the menu is supported on all devices. For devices that support DSP presets, up to 4 touch buttons can display on the screen, with a menu to access more if needed. Home Assistant media players and WiiM streamers that support media controls will also get basic play/pause/skip buttons.
 
-deloop is not a replacement for a full remote, an app or config interface for these devices, and is quite limited in its control scope to keep it focused as a simple volume, preset, and input contoller and display for daily use.
+deloop is not a replacement for a full remote, an app or config interface for these devices, and is quite limited in its control scope to keep it focused as a simple volume, preset, and input controller and display for daily use.
 
-The M5Dial is a panel mount device that mounts thru a 45mm hole. It can be mounted all sorts of ways, but does not stand well on it's own, so you'll need to sort out some kind of plan. Below it's shown mounted in a $6 wood phone stand off Amazon that I drilled a 45mm hole thru. 
+The M5Dial is a panel mount device that mounts through a 45mm hole. It can be mounted all sorts of ways, but does not stand well on its own, so you'll need to sort out some kind of plan. Below it's shown mounted in a $6 wood phone stand off Amazon that I drilled a 45mm hole through. 
 
 ![device](ui/wood-stand.jpeg)
 
 ## How was AI used in developing deloop?
 
-This project is step-by-step agentically assisted/written/maintained by Claude and an experienced engineer who has been building hobby projects on ESP32 since shortly after release. This repo contains a [CLAUDE.md](.claude/CLAUDE.md) file that carries a huge amount of project context. Claude is directed continuously to update this file as the project evolves, and it is intended to be human readable if you are curious what kind of reasoning went into this project. My deveopment process treats all AI output as unverified until tested on real hardware and proven, so every back end was developed and tested against the real thing.
+This project is step-by-step agentically assisted/written/maintained by Claude and an experienced engineer who has been building hobby projects on ESP32 since shortly after release. This repo contains a [CLAUDE.md](.claude/CLAUDE.md) file that carries a huge amount of project context. Claude is directed continuously to update this file as the project evolves, and it is intended to be human readable if you are curious what kind of reasoning went into this project. My development process treats all AI output as unverified until tested on real hardware and proven, so every back end was developed and tested against the real thing.
 
 If you decide you want to modify/extend the deloop code, this file will make Claude very good at working with this project, including things like how to use the tools for things like rendering screen mockups, probing devices, and performing tests on the device.
 
@@ -29,24 +29,28 @@ If you decide you want to modify/extend the deloop code, this file will make Cla
 - Live circular color gauge display of volume (dB) with a moving indicator
 - Main screen tap controls: mute, preset selection, dirac toggle, menu, power (long press, Denon & HA media players only)
 - Tap the already-active preset to disable it in place (e.g. Dirac Live off) without losing which one is loaded -- it stays highlighted, just in gray instead of orange
-- Screen grays out while a preset change is slowly appling (confirmed several seconds on MiniDSP config-slot switches), then returns to color once it's done.
+- Screen grays out while a preset change is slowly applying (confirmed several seconds on MiniDSP config-slot switches), then returns to color once it's done.
 - Touch menu (not all items on all devices): input selection, preset selection, device selection, brightness, click sound on/off, restart device
-- Synced against the device thru polling so external changes (app, another remote) update deloop.
+- Synced against the device through polling so external changes (app, another remote) update deloop.
 - Runs on [CircuitPython](https://circuitpython.org/board/m5stack_dial/)
 - Pluggable device backend (`src/driver.py`) -- see [Device backends](#device-backends)
-- Note that deloop is not currently designed to support displaying and/or switching Audyssey filters on Deonon/Marantz.
+- Note that deloop is not currently designed to support displaying and/or switching Audyssey filters on Denon/Marantz.
 - Manual over-the-air updates via the Menu, using AWS S3 artifacts pushed by the GitHub Actions job here
 
 ## User Interface
 
-The main screen's color bar has a white triangular pointer that rotates live around the color bar as you adjust the volume with the rotary encoder, indicating current position within the active backend's volume range. The color bands are proportional to that range -- bottom 60% green, next 10% amber, next 10% orange, top 20% red -- which on a Denon AVR's -80dB..+18dB range works out to:
+The main screen's color bar has a white triangular pointer that rotates live around the color bar as you adjust the volume with the rotary encoder, indicating current position within the active backend's volume range. The color bands are proportional to that range rather than fixed dB values, so they scale to whatever range is active: green up to 60%, amber to 70%, then orange, then red.
 
-- green:  -80dB to -20dB
-- yellow: -20dB to -10dB
-- orange: -10dB to 0dB
-- red: 0dB to +18dB
-- Major ticks indicate 10dB increemnts
+Where red starts is the one exception. If the range has 0dB inside it, red is realigned to begin exactly at 0dB rather than at a fixed percentage -- 0dB is unity/reference level, which is a far more meaningful "you're now loud" line than an arbitrary fraction of a range that varies per backend. On a Denon AVR's -80dB..+18dB range that works out to:
+
+- green:  -80dB to -21dB
+- amber:  -21dB to -11dB
+- orange: -11dB to 0dB
+- red:    0dB to +18dB
+- Major ticks indicate 10dB increments
 - Minor ticks indicate 5dB increments
+
+Ranges with no interior 0dB reference (MiniDSP's -127..0, where 0dB is already the top of the arc, or HA/WiiM's 0-100 percent) keep the plain proportional bands.
 
 deloop has volume range defaults for each back end that should feel appropriate, but the device's volume range is also configurable via settings file. 
 
@@ -64,7 +68,7 @@ Because each back end device type has slightly different options, I've taken car
 
 ### Mute
 
-Tapping the screen area anywhere above the preset name will mute the device. While muted, the volume number and all color elemnts on the display appear blue, and the number will slowly pulsate like a sleep indicator. Set `MUTE_PULSE = "false"` in `settings.toml` if you don't want the pulsing.
+Tapping the screen area anywhere above the preset name will mute the device. While muted, the volume number and all color elements on the display appear blue, and the number will slowly pulsate like a sleep indicator. Set `MUTE_PULSE = "false"` in `settings.toml` if you don't want the pulsing.
 
 ![Main screen muted](ui/ui-muted.png)
 
@@ -76,7 +80,7 @@ For devices that support power, when the device is in standby mode, a dim power 
 
 ## Hardware
 
-- Only tested on the [M5Dial](https://docs.m5stack.com/en/core/M5Dial). There are lots of other ESP32 rotary encoders out there, but I would not expect them work out of the box with this project. If you want to investigate porting it or trying it elsewhere, download this repo and have Claude perform that investigation. It's very good at doing this since it's CLAUDE.md file is well trained on the device hardware and quite good at sorting out what libraries work with what hardware.
+- Only tested on the [M5Dial](https://docs.m5stack.com/en/core/M5Dial). There are lots of other ESP32 rotary encoders out there, but I would not expect them work out of the box with this project. If you want to investigate porting it or trying it elsewhere, download this repo and have Claude perform that investigation. It's very good at doing this since its CLAUDE.md file is well trained on the device hardware and quite good at sorting out what libraries work with what hardware.
 
 ## Device backends
 
@@ -90,7 +94,7 @@ deloop talks to the amp through a swappable driver module (`src/driver.py`), sel
 | Extra dependency   | None                                          | That host must be running and reachable on the LAN -- run with no `--config` at all and it already binds to `0.0.0.0:5380` (all interfaces); a config file only takes effect if passed explicitly via `--config`, and its example ships with the restrictive `127.0.0.1:5380` active by default | That host must be running CamillaDSP, started with a websocket port (`-p`) and bound to a LAN-reachable address (`-a 0.0.0.0` or similar -- it defaults to `127.0.0.1`, local-only) | A Home Assistant instance reachable on the LAN and a long-lived access token (Profile -> Security -> Long-Lived Access Tokens) | None -- but its API is HTTPS-only with a self-signed certificate; deloop already trusts it (the same fixed cert ships on every LinkPlay unit), no setup needed |
 | Power/standby      | Yes (long-press gesture)                     | No -- the DSP is "on" whenever the host + USB link are up; the long-press gesture is disabled | No -- same reasoning as `minidsp`, the DSP is "on" whenever its host process is running | Auto-detected from the entity's `supported_features` -- on if it supports both `turn_on` and `turn_off`, off otherwise | No -- no power/standby concept found in the streamer's API; the long-press gesture is disabled, same as `minidsp` |
 | Input selection     | Named HDMI-style sources, renamed by the AVR | The DSP's source enum (Toslink/USB/Analog/...), derived from the unit's hw_id -- see `src/minidsp.py` | No selectable input -- CamillaDSP's capture device lives inside its loaded config file, not a separate switchable axis; switching capture devices is just a different preset (below). The otherwise-unused input display instead shows live DSP status: the processing rate (e.g. `96khz`) while actively processing audio, or the raw processing state (`Paused`/`Inactive`/`Starting`/`Stalled`) otherwise | The entity's own `source_list`, auto-detected the same way as power | A configurable list of switchable sources (default: WiFi, Bluetooth, Line In, Optical) -- set `WIIM_INPUTS` to match your unit, since the API has no way to report which physical inputs it actually has |
-| Presets            | Dirac Live filter picker. Selecting a filter always engages it -- there's no separate on/off bit, so switching filters and enabling are the same action | Always the DSP's config-slot switching (0..N-1) -- slot count isn't discoverable via the API, set `MINIDSP_PRESET_COUNT` to match your unit. Names default to "Preset 1", "Preset 2", etc. since the API can't read slot names back either -- set `MINIDSP_PRESET_NAMES` to override. If the unit also reports a `dirac` field (e.g. a Flex with a Dirac license), tapping the *active* slot additionally toggles Dirac on/off in place; switching to a *different* slot deliberately leaves that on/off state untouched, since a slot may want Dirac off on purpose (e.g. a headphone config) -- see `CAPS["preset_select_enables"]` in `src/driver.py` | A fixed list of CamillaDSP config files, set via `CAMILLADSP_PRESETS` as `"Name:/path,Name2:/path2"` pairs -- there's no slot count to configure, just the list itself, always reachable through the scrollable Preset menu regardless of length. Unlike `minidsp`/`wiim`, the currently active preset is a real reported value (`GetConfigFilePath`), not a guess or a permanent placeholder. Main-screen quick-select buttons are a *separate*, smaller list -- up to 4 names from `CAMILLADSP_PRESETS`, set via `CAMILLADSP_QUICK_PRESETS` -- since unlike MiniDSP's physically-fixed slot count, the full list has no real ceiling and could easily outgrow the button row; leave it unset for submenu-only, same as `wiim` | Not supported -- there's no generic `media_player` equivalent of Dirac Live/config slots, so no preset menu is drawn at all | Your WiiM-app Favorites, activated via `MCUKeyShortClick`. The plain HTTP API can't list Favorites back reliably (confirmed live -- `getPresetInfo` stays empty even with real ones configured; real names need WiiM's separate UPnP/SOAP interface, not implemented here) -- same fallback as `minidsp`: list them in `WIIM_PRESET_NAMES`, in Favorite order. That list *is* the preset set -- its length is the count, and a name's position in it is the Favorite number. Always reachable through the scrollable Preset menu (a WiiM unit can have up to 12 favorites, far more than the main-screen button row holds), or by tapping the status row itself, which jumps straight into the Preset menu. `WIIM_PRESET_BUTTONS` optionally promotes a few of them to main-screen quick-select buttons, named as in `WIIM_PRESET_NAMES` and in draw order (max 4, same as `CAMILLADSP_QUICK_PRESETS`) -- but buttons and the play/pause + skip controls want the same band of pixels and can't coexist, so setting it trades the media controls for a `denon`/`minidsp`-style button row. Leave it unset to keep the media controls. Since a preset here is a one-shot action rather than a persistent mode, that row shows "(Preset)" until you pick one, rather than sitting blank |
+| Presets            | Dirac Live filter picker. Selecting a filter always engages it -- there's no separate on/off bit, so switching filters and enabling are the same action | Always the DSP's config-slot switching (0..N-1) -- slot count isn't discoverable via the API, set `MINIDSP_PRESET_COUNT` to match your unit. Names default to "Preset 1", "Preset 2", etc. since the API can't read slot names back either -- set `MINIDSP_PRESET_NAMES` to override. If the unit also reports a `dirac` field (e.g. a Flex with a Dirac license), tapping the *active* slot additionally toggles Dirac on/off in place; switching to a *different* slot deliberately leaves that on/off state untouched, since a slot may want Dirac off on purpose (e.g. a headphone config) -- see `CAPS["preset_select_enables"]` in `src/driver.py` | A fixed list of CamillaDSP config files, set via `CAMILLADSP_PRESETS` as `"Name:/path,Name2:/path2"` pairs -- there's no slot count to configure, just the list itself, always reachable through the scrollable Preset menu regardless of length. Unlike `minidsp`/`wiim`, the currently active preset is a real reported value (`GetConfigFilePath`), not a guess or a permanent placeholder. Main-screen quick-select buttons are a *separate*, smaller list -- up to 4 names from `CAMILLADSP_PRESETS`, set via `CAMILLADSP_QUICK_PRESETS` -- since unlike MiniDSP's physically-fixed slot count, the full list has no real ceiling and could easily outgrow the button row; leave it unset for submenu-only, same as `wiim` | Not supported -- there's no generic `media_player` equivalent of Dirac Live/config slots, so no preset menu is drawn at all | Your WiiM-app Favorites, activated via `MCUKeyShortClick`. The plain HTTP API can't list Favorites back reliably (confirmed live -- `getPresetInfo` stays empty even with real ones configured; real names need WiiM's separate UPnP/SOAP interface, not implemented here) -- same fallback as `minidsp`: list them in `WIIM_PRESET_NAMES`, in Favorite order. That list *is* the preset set -- its length is the count, and a name's position in it is the Favorite number. Always reachable through the scrollable Preset menu (a WiiM unit can have up to 12 favorites, far more than the main-screen button row holds), or by tapping the status row itself, which jumps straight into the Preset menu. `WIIM_PRESET_BUTTONS` optionally promotes a few of them to main-screen quick-select buttons, named as in `WIIM_PRESET_NAMES` and in draw order (max 4, same as `CAMILLADSP_QUICK_PRESETS`) -- but buttons and the play/pause + skip controls want the same band of pixels and can't coexist, so setting it trades the media controls for a `denon`/`minidsp`-style button row. Leave it unset to keep the media controls. Since a preset here is a one-shot action rather than a persistent mode, that row shows "(Set Preset)" until you pick one, rather than sitting blank |
 | Preset switch speed | Near-instant                                | Confirmed ~4s+ on real hardware -- minidsp-rs's POST blocks until the DSP finishes reconfiguring. The screen shows a static gray frame for the duration (see `dial_ui.draw_busy`); raise `MINIDSP_PRESET_TIMEOUT` if your unit is slower than the ~10s default | Confirmed ~1-3ms against a trivial test config (a signal generator + one filter, no FIR/convolution files to load) -- but that's a lower bound, not a general answer: a real room-correction config with large filter files could be much slower to load. `CAMILLADSP_PRESET_TIMEOUT`'s generous ~10s default is unchanged until someone times a real production config | N/A -- no presets | Near-instant |
 | Volume range       | -80dB to +18dB (dB relative to reference)    | -127dB to 0dB (dB of attenuation below unity) -- the gauge's color bands and tick marks scale to whichever range is active | -50dB to 0dB by default -- CamillaDSP's `SetVolume` actually accepts -150..+50 server-side, but -50..0 matches [CamillaGUI](https://github.com/HEnquist/camillagui-backend)'s own default volume-slider range (`volume_range: 50` / `volume_max: 0`, confirmed from its source), a more practical default than the full protocol range. Both `minidsp` and `camilladsp` use the identical dB convention (20·log10 of amplitude, confirmed from CamillaDSP's own source), so -50dB is the same amount of digital attenuation on both -- but not necessarily the same perceived loudness, since that also depends on each system's downstream DAC/amp gain. Raise `VOLUME_MAX` if a config genuinely needs headroom above unity | 0 to 100 percent -- HA always normalizes `volume_level` to a 0.0-1.0 fraction regardless of the underlying device, so there's no real dB value to show | 0 to 100 percent -- the streamer's own native volume range, no conversion needed |
 | Playback control    | N/A                                            | N/A                                                   | N/A                                                    | Nothing to configure. The status line below the volume shows "Playing"/"Paused" (tap to toggle) whenever the entity reports one of those two states, with `<`/`>` on either side to skip back/forward; blank, with no tap targets, otherwise. That means the controls stay hidden until a poll actually reports playback -- a source with nothing to pause (a plain analog input reports "on", not "playing") never shows them | Always on -- the status line shows "Playing"/"Paused" (tap to toggle) plus `<`/`>` skip controls, same state-driven behavior as `ha` |
@@ -157,6 +161,7 @@ After the first deploy, `make deploy` is the fast path for iterating on code cha
 | `install-libs` | Install required CircuitPython libraries onto the mounted device    |
 | `full-deploy`  | `install-libs` + `deploy` (fresh flash / onboarding)                 |
 | `deploy`       | Precompile every module to `.mpy` and copy to the device -- what it should actually run day to day (needs `local/mpy-cross`) |
+| `deploy-code`  | Same as `deploy` but skips fonts and the splash image -- faster when only `.py` files changed |
 | `deploy-src`   | Copy plain, uncompiled `.py` files instead (fast iteration / clearer tracebacks; no `local/mpy-cross` needed) |
 | `fonts`        | Regenerate the Inter PCF bitmap fonts from the TTF source            |
 | `splash`       | Regenerate the splash screen BMP from `ui/hobbysprawl.png`           |
@@ -171,6 +176,10 @@ After the first deploy, `make deploy` is the fast path for iterating on code cha
 | `probe-ha`     | Host-side REST probe against a Home Assistant instance (`PROBE_ARGS=...`) |
 | `probe-wiim`   | Host-side HTTPS probe against a WiiM/LinkPlay streamer (`PROBE_ARGS=...`) |
 | `probe-ota`    | Host-side sanity check for the CI-published GitHub Release (`PROBE_ARGS=...`) |
+| `probe-ota-regression` | On-device: run the real OTA path end to end against the live bucket, stopping just before it overwrites anything |
+| `avr-health`   | Host-side AVR latency/reliability check, independent of the Dial -- run before blaming the network |
+| `network-stress` | On-device soak test: networking only, no rendering. Toggles mute periodically |
+| `chaos-stress` | On-device soak test: rendering + networking + deliberate heap fragmentation. Toggles mute periodically |
 | `usb-drive-off` | Hide the CIRCUITPY drive so OTA updates can remount the filesystem — run this once after your first deploy |
 | `usb-drive-on` | Expose CIRCUITPY again so `make deploy` can copy files over USB |
 | `build-manifest` | Build an OTA `manifest.json` locally from whatever `make deploy` last compiled, for testing before a real release |
@@ -196,7 +205,8 @@ deloop can update its own app files over Wi-Fi from a flat S3 layout, without pl
 
 ## Code layout
 
-- `src/code.py` — CircuitPython entry point: must stay tiny, since it's the one file that can't be `.mpy`-compiled. Just `import app; app.main()`
+- `src/code.py` — CircuitPython entry point: must stay tiny, since it's one of only two files that can't be `.mpy`-compiled. Checks for a pending update, then hands off to either `app.py` or `ota_boot.py`
+- `src/boot.py` — runs before USB enumerates, which is the only moment `storage.disable_usb_drive()` works. This is what `make usb-drive-off` toggles; it does nothing unless that flag is set
 - `src/app.py` — the real entry-point logic: input handling (encoder, touch), menu state machine, and the main loop
 - `src/driver.py` — selects the active device backend and documents the driver contract other backends implement
 - `src/denon.py` — HTTP client for the Denon/Marantz control API (volume, power, mute, inputs, Dirac Live presets)
@@ -211,6 +221,7 @@ deloop can update its own app files over Wi-Fi from a flat S3 layout, without pl
 - `src/sound.py` — piezo buzzer click feedback for taps and menu actions
 - `src/config.py` — settings loader/defaults
 - `src/ota.py` — self-update: checks S3 for a new release, downloads and verifies it, installs it. Orthogonal to `DEVICE_DRIVER` — see "Updating deloop" above
+- `src/ota_boot.py` — the lean boot path an update runs in. `code.py` loads this *instead of* `app.py` when an update is pending, so the driver stack and fonts are never resident and there's enough free heap for a TLS handshake
 - `src/version.py` — deloop's own app version (a bare integer); overwritten by the release workflow, not meaningful in git history
 - `tools/` — host-side scripts used during development (AVR/minidsp-rs/HA/GitHub Release probing, font/splash generation, off-device screen rendering, OTA manifest building); not deployed to the device
 - `.github/workflows/release.yml` — builds and publishes a new OTA release on every push to `main` (version auto-incremented, never hand-chosen)
