@@ -4,7 +4,9 @@
 # Black canvas, precision arc gauge with gradient colour, wedge pointer,
 # clean split-size typography. Every element earns its place.
 #
-# Public API (unchanged from v1 for code.py compatibility):
+# Public API (app.py calls all of these; the backend UI extensions in
+# ha_ui.py/wiim_ui.py reach further in -- see driver.py's UI-extension
+# contract):
 #   init()                              → ui dict
 #   draw_main(ui, state)
 #   draw_busy(ui, state)                static all-gray "please wait" frame
@@ -22,7 +24,7 @@
 #                                       skip-track icons flanking that row
 #   menu_standby_tap(x, y)             hit-test for the centered MENU zone
 #                                       on the power-off screen
-#   BRIGHTNESS_ON                      constant used by code.py
+#   BRIGHTNESS_ON                      constant used by app.py
 #
 # Screen layout:
 #   Upper 75 %: circular arc gauge (8 o'clock → 4 o'clock, 240° sweep)
@@ -43,14 +45,13 @@ import vectorio
 import config
 # driver is deliberately NOT imported at module level. Every function that
 # needs it (media tap-zones, draw_status_rows, draw_main, draw_busy) does
-# its own local `import driver as _driver`; Python caches the import so
-# this costs nothing extra once it's genuinely needed. Doesn't help OTA's
-# memory budget by itself, since app.py's own top-level `import driver`
-# (separate from dial_ui.py's) pulls in the backend stack regardless --
-# see ota_boot.py's module docstring for the actual fix (a separate boot
-# path that never imports dial_ui.py/driver.py/app.py at all). Kept anyway
-# since it's still a real, harmless reduction in what importing dial_ui.py
-# alone costs.
+# its own local `import driver as _driver`; Python caches the import, so
+# this costs nothing once it's genuinely needed and keeps the cost of
+# importing dial_ui.py alone down to dial_ui.py.
+#
+# This is not what makes OTA's memory budget work -- ota_boot.py simply
+# never imports dial_ui.py, driver.py or app.py at all (see its module
+# docstring). This is just tidiness that happens to compose with it.
 
 # ── Screen ────────────────────────────────────────────────────────────────────
 CX = CY = 120
@@ -113,7 +114,7 @@ BRIGHTNESS_ON = 1.0
 # one. Configurable via STANDBY_BRIGHTNESS_FRAC in settings.toml.
 _STANDBY_BRIGHTNESS_FRAC = config.STANDBY_BRIGHTNESS_FRAC
 
-# ── Menu geometry (exported so code.py can map touch_y → item index) ─────────
+# ── Menu geometry (exported so app.py can map touch_y → item index) ─────────
 MENU_ITEM_Y0  = 44    # y-centre of first visible item
 MENU_ITEM_DY  = 38    # vertical spacing between items
 MENU_VISIBLE  = 5     # max items shown at once
@@ -121,7 +122,7 @@ MENU_VISIBLE  = 5     # max items shown at once
 # ── Preset quick-select button geometry ───────────────────────────────────────
 # Row of small numbered buttons just below the preset name, letting a tap
 # switch presets directly from the main screen instead of via the menu.
-# Exported so code.py can split the main screen's tap zones: mute above this
+# Exported so app.py can split the main screen's tap zones: mute above this
 # line, quick-select buttons (and nothing else) at or below it.
 PRESET_NAME_Y = CY + 18
 # Input/source name row, above the volume number -- halfway between it and the
@@ -160,9 +161,8 @@ _DBTN_MAX  = 5     # pre-allocated label slots -- NOT how many actually fit.
                    # presets); this stays 5 as the allocation/clamp bound.
 
 # ── Shape palette (16 colours; every vectorio shape indexes into this one) ───
-# _PRR and _BTNSEL_FILTER are aliases, not separate slots: both used to be
-# their own shade of orange, but they're the same colour as _ORG now, so
-# they just point at it instead of duplicating the palette entry.
+# _PRR and _BTNSEL_FILTER are aliases of _ORG, not separate slots -- give
+# either its own shade only by adding a real palette entry for it.
 _BG    = 0   # black background
 _GRN   = 1   # green   (bottom 60% of the volume range)
 _AMB   = 2   # amber   (next 10%)
@@ -426,8 +426,9 @@ def _arc_color(angle):
 
 # ── Shape geometry ────────────────────────────────────────────────────────────
 # These return point lists for vectorio.Polygon. Nothing here rasterises:
-# displayio composites the shapes in C during refresh(), which is the whole
-# reason this file no longer owns a 28.8KB bitmap. See docs/rendering.md.
+# displayio composites the shapes in C during refresh(), so the gauge costs
+# no pixel storage at all -- worth 28.8KB of heap and ~27ms a frame against
+# painting it into a bitmap. See docs/rendering.md.
 #
 # The one hazard, and both bugs found while proving this out were it:
 # THIN STROKES DO NOT SURVIVE INTEGER ROUNDING. A fractional offset that
@@ -538,13 +539,11 @@ def _tick_values():
 
 # ── Layer builders ────────────────────────────────────────────────────────────
 # Each returns a Group so a whole layer can be shown or hidden with one flag.
-# That is what replaces the old _clear()/full-repaint model: nothing is ever
-# erased, it is just not composited.
+# Nothing is ever erased, it is just not composited.
 
 # Arc sectors exist only to place the colour boundaries. Subdividing further
-# buys nothing -- measured 2026-08-05, 4 sectors 1.74ms vs 24 sectors 1.65ms
-# per frame, so the bounding-box culling this was once expected to need
-# turned out to be irrelevant.
+# buys nothing -- measured 4 sectors at 1.74ms vs 24 at 1.65ms per frame, so
+# there is no bounding-box culling to gain here.
 _ARC_SECTORS = 12
 
 
@@ -658,16 +657,10 @@ def _build_presets(pal):
     return g, pairs
 
 
-# Play/pause icon geometry -- shapes rather than a font glyph. This sidesteps
-# the font-encoding-table-bloat risk entirely (see the note above
-# _PLAY_CHAR/_PAUSE_CHAR): a codepoint far outside the base ASCII range
-# balloons every generated .pcf's encoding table regardless of how good the
-# glyph itself looks (confirmed: U+25B6, the "right-pointing triangle" Unicode
-# glyph, renders fine at this size but still isn't worth that cost when a few
-# filled shapes do the same job with zero font involvement). Sized to roughly
-# match the row's font-rendered text height (~16px) without touching the row
-# above -- the exact failure mode that sank an earlier Unicode pause-bar
-# attempt.
+# Play/pause icon geometry -- shapes rather than a font glyph, which keeps
+# the fonts at pure ASCII (see the note above _PLAY_CHAR/_PAUSE_CHAR and the
+# Makefile's `fonts` target). Sized to roughly match the row's font-rendered
+# text height (~16px); anything taller collides with the row above.
 _ICON_HALF_H = 8    # half-height of both shapes
 _ICON_HALF_W = 7    # play triangle: tip-to-base half-width
 _ICON_BAR_W  = 4    # pause: width of each bar
@@ -701,15 +694,13 @@ def _build_icon(pal):
 def draw_play_pause_icon(ui, cx, cy, playing, ci):
     """Show a play triangle or pause bars centered at (cx, cy).
 
-    playing=True draws pause bars, not a pause icon's opposite -- a
-    play/pause control always shows the action a tap performs, not the
-    current state (see dial_ui.py's _MEDIA_STATE_TEXT note, same
-    convention, formerly font text, now these shapes).
+    playing=True draws pause bars, not a play triangle -- a play/pause
+    control always shows the action a tap performs, not the current state
+    (same convention as _MEDIA_STATE_TEXT below).
 
-    Takes `ui`, not a bitmap: there is no bitmap any more. Callers are the
-    backend UI extensions (ha_ui.py, wiim_ui.py) -- see driver.py's
-    UI-extension contract. They only ever SHOW the icon; hiding it is
-    _draw_status_rows()'s job, which blanks it before delegating so a
+    Callers are the backend UI extensions (ha_ui.py, wiim_ui.py) -- see
+    driver.py's UI-extension contract. They only ever SHOW the icon; hiding
+    it is _draw_status_rows()'s job, which blanks it before delegating so a
     backend that stops reporting media_state doesn't leave one stranded.
     """
     play, bars = ui["icon_play"], ui["icon_bars"]
@@ -736,9 +727,8 @@ def _hide_icon(ui):
 
 
 # ── Gauge scene control ───────────────────────────────────────────────────────
-# What used to be _render_gauge()/_clear()/_restore_region(). No pixels are
-# produced here: these set visibility, colour indices and the pointer's three
-# points, and displayio does the rest during refresh().
+# No pixels are produced here: these set visibility, colour indices and the
+# pointer's three points, and displayio does the rest during refresh().
 
 def _set_arc_mode(ui, muted, busy):
     """Recolour the arc band. Gradient normally; flat blue muted; flat gray
@@ -781,7 +771,9 @@ def _hide_gauge(ui):
 
 # ── Volume formatting ─────────────────────────────────────────────────────────
 
-_SENTINEL = _VOL_MIN - 1.0   # −81: "no volume known" (startup state)
+# "No volume known" (startup / error screens). Below _VOL_MIN by definition,
+# which is what _set_pointer() tests to hide the pointer entirely.
+_SENTINEL = _VOL_MIN - 1.0
 
 
 def _split_vol(db):
@@ -809,10 +801,9 @@ def _split_vol(db):
 # further. Names that come from the user's own gear -- an HA entity's friendly
 # name, a renamed Denon input, a config-supplied preset name -- have no length
 # limit, so any of them can run under the arc band and then get clipped by the
-# display circle. Found live 2026-08-07 with the HA entity "Dining Room
-# Speakers" (215px into a 172px row); the same class of bug hit wiim.py's
-# "TIDAL Connect" the day before, but that one was fixable at the source
-# because the names were ours. These aren't.
+# display circle -- "Dining Room Speakers" is 215px into a 172px row. Names
+# deloop owns (wiim.py's _MODE_NAME, say) can be shortened at the source;
+# these can't, so every user-supplied string goes through fit_text().
 #
 # tools/font_fit.py measures any string against these same budgets off-device.
 
@@ -836,10 +827,10 @@ def _row_budget(y, half_h=8):
     return int(2 * math.sqrt(_R_IN * _R_IN - dy * dy))
 
 
-# Derived once at import from this module's own geometry, rather than written
-# down as literals -- the rows move (PRESET_NAME_Y is CY-relative) and a stale
-# copied number is exactly how tools/font_fit.py first shipped wrong.
-# Currently: input 122px, preset 172px, player 150px.
+# Derived once at import from this module's own geometry, never written down
+# as literals -- the rows move (PRESET_NAME_Y is CY-relative), so a copied
+# number goes stale silently. Currently: input 122px, preset 172px, player
+# 150px.
 _BUDGET_INPUT  = _row_budget(_INPUT_NAME_Y)
 _BUDGET_PRESET = _row_budget(PRESET_NAME_Y)
 _BUDGET_PLAYER = _row_budget(_PLAYER_NAME_Y)
@@ -906,15 +897,14 @@ def _preset_name(state):
     return ""
 
 
-# Plain ASCII fallback text -- only actually rendered by the default (no
-# UI extension) path below, for a hypothetical future backend that reports
-# state.media_state without pairing a UI extension the way ha_ui.py does.
-# ha_ui.py itself draws real shapes instead (see draw_play_pause_icon()
-# above) -- avoids the font question entirely rather than picking a careful
-# ASCII substitute, after a Unicode glyph (U+25B6) balloon a generated
-# .pcf's encoding table enough to take down WiFi on real hardware (a
-# codepoint far outside the base ASCII range does that regardless of how
-# good the glyph itself looks -- see Makefile's `fonts` target).
+# Plain ASCII fallback text -- only rendered by the default (no UI
+# extension) path below, for a backend that reports state.media_state
+# without pairing a UI extension the way ha_ui.py/wiim_ui.py do. Those
+# draw real shapes instead (draw_play_pause_icon() above), which sidesteps
+# the font question entirely: a codepoint outside the base ASCII range
+# balloons every generated .pcf's encoding table regardless of how good the
+# glyph looks, and once took down WiFi on real hardware. See the Makefile's
+# `fonts` target.
 _PLAY_CHAR  = "Play"
 _PAUSE_CHAR = "Pause"
 # Shows the action a tap performs, not the current state -- same convention
@@ -998,7 +988,7 @@ def _draw_preset_filter_buttons(ui, state):
     that distinction).
 
     There's no separate "off" button -- tapping the already-selected slot
-    toggles state.preset_enabled in place (see code.py), so the same slot
+    toggles state.preset_enabled in place (see app.py), so the same slot
     stays highlighted either way: orange when engaged, light gray when
     selected but disabled -- a visual cue for on/off without losing track
     of which config/filter is loaded. While muted, an engaged slot goes
@@ -1211,15 +1201,6 @@ def init():
     }
 
 
-# _scene_signature() used to live here, guarding a fast path that skipped
-# repainting the static arc and ticks when nothing but the volume had
-# changed. It was a real 5.8x win (2026-08-04) but it was a cache in front of
-# an expensive model. With the gauge composed rather than painted there is no
-# repaint to skip: a full draw_main() sets a handful of visibility flags,
-# colour indices and three pointer points. Removed 2026-08-05 -- see
-# docs/rendering.md.
-
-
 def draw_main(ui, state):
     """Render current AVRState to the display."""
     import driver as _driver
@@ -1258,16 +1239,17 @@ def draw_main(ui, state):
 
     ui["display"].brightness = getattr(state, "brightness", BRIGHTNESS_ON)
 
-    # There is no fast path any more, because there is no slow one.
+    # No fast path, and none needed: this whole function sets a handful of
+    # visibility flags, colour indices and three pointer points. Nothing is
+    # rasterised here (see docs/rendering.md).
     #
-    # Why that matters beyond redraw smoothness: the main loop is cooperative
-    # and pumps the async status poll once per iteration, so back when a full
-    # draw_main() cost ~350ms the whole loop ran at ~3 iterations/sec and each
-    # poll -- needing ~3 pumps -- stretched to ~1000ms. That reads as "flaky
-    # networking" while the network itself is perfectly healthy (0 errors
-    # throughout the measurement run that found it), and the dropped touch
-    # events had the identical cause. Keeping every frame cheap is a
-    # correctness property of this loop, not a nicety.
+    # Resist adding a change-detection cache in front of it. Keeping every
+    # frame cheap is a correctness property of the main loop, not a nicety:
+    # that loop is cooperative and pumps the async status poll once per
+    # iteration, so an expensive draw_main() drags the whole loop down to a
+    # few iterations/sec, which stretches each poll to ~1000ms and silently
+    # drops touch events. Both read as flaky hardware or networking while
+    # the real cause is frame cost.
     quick = _driver.CAPS["preset_quickbuttons"]
     _show_gauge(ui, presets=quick, menu_home=True)
     _set_arc_mode(ui, state.muted, False)
@@ -1278,11 +1260,11 @@ def draw_main(ui, state):
     _set_vol_labels(ui, state.volume_db, state.muted)
     ui["input"].text  = _fit_input(_driver.friendly_input(state.input))
     ui["input"].color = _C_DIM
-    # Restore the preset label's normal row position before drawing into it.
-    # draw_error/draw_reconnecting recenter this label for their own layout
-    # and nothing ever put it back, so it stayed stranded mid-screen on the
-    # first main render afterwards (user-confirmed, seen twice). Set before
-    # _draw_status_rows so a UI extension with its own placement still wins.
+    # Restore the preset label's normal row position before drawing into it:
+    # draw_error/draw_reconnecting recenter this same label for their own
+    # layout, and this is the only thing that puts it back -- without it the
+    # label stays stranded mid-screen on the first main render afterwards.
+    # Set before _draw_status_rows so a UI extension's own placement wins.
     ui["preset"].anchor_point      = (0.5, 0.5)
     ui["preset"].anchored_position = (CX, PRESET_NAME_Y)
     _draw_status_rows(ui, state, _C_DIM)
@@ -1560,13 +1542,19 @@ def show_splash(display):
 
 
 def show_message(display, text):
-    """Minimal single-line status screen -- no ~28KB gauge bitmap, no label
-    pool. Used by app.py's OTA apply-mode boot branch, which needs to show
-    brief status text (e.g. "Updating...") without paying dial_ui.init()'s
-    full allocation cost on top of everything else that boot already needs
-    resident (wifi, ssl, ota, adafruit_hashlib) -- confirmed live
-    (2026-07-31) that doing both causes a real MemoryError. Same "no large
-    bitmap" approach show_splash() already uses, for the same reason.
+    """Minimal single-line status screen: takes the raw `display`, not a
+    `ui` dict, and builds its own throwaway group.
+
+    Used by app.py's Update menu to show "Checking..." in the moment
+    between requesting a check and the supervisor.reload() that hands off
+    to ota_boot.py. That reload discards the display group anyway, so
+    there is nothing to restore afterwards and no reason to route it
+    through the retained scene every other screen here uses.
+
+    ota_boot.py has its own near-identical copy of this rather than
+    importing dial_ui -- deliberately, since importing this module at all
+    would pull in three PCF fonts it has no memory budget for. See its
+    module docstring.
     """
     group = displayio.Group()
     try:

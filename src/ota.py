@@ -157,12 +157,11 @@ class _Fetcher:
 
     def _maybe_reset(self, url, attempt):
         """Only rebuild when it's actually needed: on any retry (attempt
-        > 1 -- same safety net _retry_wait() used to provide directly), or
-        when the target host has genuinely changed since the last request
-        this Fetcher made. Every URL apply()/check_latest_version() ever
+        > 1), or when the target host has genuinely changed since the last
+        request this Fetcher made. Every URL apply()/check_latest_version()
         requests shares one host (config.OTA_S3_BASE), so in practice this
         never rebuilds mid-install -- the reset path exists for retries,
-        not something the happy path exercises."""
+        not for anything the happy path exercises."""
         host = _host_of(url)
         if attempt > 1 or host != self._last_host:
             self._reset_connections()
@@ -170,11 +169,12 @@ class _Fetcher:
 
     def _retry_wait(self, attempt, t0, url, e):
         """Common tail of a failed attempt: log, decide whether to retry.
-        Raises the original exception once attempts are exhausted. Doesn't
-        rebuild the session itself -- _reset_connections() already runs at
-        the top of every loop iteration in get_json()/download(), so
-        rebuilding here too would just be a redundant extra rebuild right
-        before another one."""
+        Raises the original exception once attempts are exhausted.
+
+        Deliberately does not rebuild the session itself -- _maybe_reset()
+        runs at the top of every get_json()/download() loop iteration and
+        will do it there, so rebuilding here would just be a second one
+        immediately before the first."""
         print("ota: GET failed after {:.2f}s ({}):".format(
             time.monotonic() - t0, url), type(e), e)
         if attempt >= _MAX_ATTEMPTS:

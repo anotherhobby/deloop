@@ -121,19 +121,12 @@
 #     protocol/complexity class on a memory-constrained device, untested
 #     against this unit's actual UPnP service layout).
 #   - CAPS["preset_quickbuttons"] is config-driven, via WIIM_PRESET_BUTTONS.
-#     This was False until 2026-08-06, on the reasoning that WiiM can have
-#     far more presets than the main-screen row's 5 pre-allocated slots
-#     (this unit reports "preset_key": "12" in getStatusEx, i.e. 12 favorite
-#     slots, confirmed live) so presets should be submenu-only. That
-#     reasoning was already overturned during the CamillaDSP work -- see
-#     camilladsp.py's rejected-design (2), which names this module -- and the
-#     back-port was simply missed: the row having fewer slots than the list
-#     is an argument for showing a *subset*, not for showing none.
-#     WIIM_PRESET_BUTTONS picks that subset by name, so the full list
-#     stays reachable through the scrollable Preset submenu (the same
-#     generic menu HA's Media Player picker uses) while the few worth a
-#     one-tap shortcut get buttons. See driver.py's _CAPS_DEFAULTS for the
-#     flag, and config.py for the parsing/validation.
+#     A WiiM unit can have far more presets than the main-screen row holds
+#     (this one reports "preset_key": "12" in getStatusEx, i.e. 12 favorite
+#     slots, confirmed live) -- which is an argument for showing a *subset*,
+#     not for showing none. WIIM_PRESET_BUTTONS picks that subset by name;
+#     the full list stays reachable through the scrollable Preset submenu.
+#     See driver.py's _CAPS_DEFAULTS for the flag, config.py for parsing.
 #     NOTE this setting also chooses the whole lower-screen layout: buttons
 #     and the play/pause + skip row want the same pixels and cannot coexist,
 #     so unset means media controls (the default) and naming any preset means
@@ -418,11 +411,10 @@ def get_presets():
     which preset (if any) is currently active, so current_value is always
     "" -- the Preset submenu opens with no slot pre-highlighted.
 
-    The list length is the preset count, full stop. A separate
-    WIIM_PRESET_COUNT used to clamp this, which meant naming 3 Favorites
-    with a count of 2 silently dropped the third; the count now lives on as
-    WIIM_PRESET_BUTTONS, answering the question it was actually added for
-    (how many quick-select buttons to draw). See get_quick_presets().
+    The list length is the preset count, full stop -- see config.py for why
+    there is no separate count setting. WIIM_PRESET_BUTTONS answers the
+    different question of how many get main-screen buttons; see
+    get_quick_presets().
     """
     names = [(str(i), name)
              for i, name in enumerate(config.WIIM_PRESET_NAMES, 1)]

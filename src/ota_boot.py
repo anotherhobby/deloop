@@ -144,9 +144,9 @@ def _new_session():
     enable/disable toggle isn't enough to guarantee a clean radio/TLS
     state for the new session; the stop/start station cycle is.
 
-    Gated on wifi.radio.connected: no prior connection to reset on the
-    very first call of a fresh boot, so just connect plainly there
-    instead of stopping a station that was never started."""
+    Gated on wifi.radio.connected: on the very first call of a fresh boot
+    there is no prior connection to reset, so just connect plainly rather
+    than stopping a station that was never started."""
     if wifi.radio.connected:
         try:
             wifi.radio.stop_station()
@@ -155,17 +155,11 @@ def _new_session():
             time.sleep(0.5)
         except Exception as e:
             print("ota: wifi radio stop/start station cycle failed:", type(e), e)
-        try:
-            wifi.radio.power_management = wifi.PowerManagement.NONE
-        except Exception as e:
-            print("power_management NONE failed:", type(e), e)
-        wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
-    else:
-        try:
-            wifi.radio.power_management = wifi.PowerManagement.NONE
-        except Exception as e:
-            print("power_management NONE failed:", type(e), e)
-        wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
+    try:
+        wifi.radio.power_management = wifi.PowerManagement.NONE
+    except Exception as e:
+        print("power_management NONE failed:", type(e), e)
+    wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
     pool = socketpool.SocketPool(wifi.radio)
     import ssl
     ssl_context = ssl.create_default_context()
@@ -200,13 +194,12 @@ def _prompt_install(latest):
     """Arm the install from right here, without reloading into the full app
     first. NEVER RETURNS -- both exits are the user's, not this function's.
 
-    Why this exists: a Check Now that finds an update used to reload back
-    into normal mode just so the Update submenu could offer "Install
-    Update (vN)", and the install then needs a genuine power cycle anyway
-    (see docs/ota.md). That put a full deloop boot -- driver stack, fonts,
-    WiFi association, first poll, ~30-40s -- in between the check and a
-    reboot the user was about to perform regardless. Prompting here skips
-    it entirely.
+    Why arm from here rather than reloading into the app first: the
+    install needs a genuine power cycle regardless (see docs/ota.md), so
+    reloading just to let the Update submenu offer "Install Update (vN)"
+    would put a full deloop boot -- driver stack, fonts, WiFi association,
+    first poll, ~30-40s -- between the check and a reboot the user is
+    about to perform anyway.
 
     Waits indefinitely, by explicit design: an unattended check parks on
     this screen rather than timing out. The two ways out are the two the

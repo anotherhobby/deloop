@@ -52,7 +52,24 @@ AVR_HOST   = os.getenv("AVR_HOST", "192.168.1.100")
 AVR_PORT   = int(os.getenv("AVR_PORT", "8080"))
 AVR_PORT_UI = 11080  # web UI port (inputs/sources, Dirac Live)
 AVR_SCHEME = "http"
-AVR_TIMEOUT_MS = 1000  # 1 s -- keep low so a slow AVR does not block the UI
+
+# ---------------------------------------------------------------------------
+# Request timeouts are constants, NOT settings -- deliberately
+# ---------------------------------------------------------------------------
+# Every backend's ordinary volume/mute/status request gets a fixed timeout
+# below, with no settings.toml key to override it. These were configurable
+# once and the keys were withdrawn: on a LAN, a volume call either answers in
+# milliseconds or the device is unreachable, so there is no middle ground a
+# user could usefully tune. All the key ever did was invite someone to raise
+# it, which does not fix an unreachable device -- it just makes the UI hang
+# longer before saying so.
+#
+# The PRESET timeouts further down are the deliberate exception, and they are
+# genuinely different: a preset switch is a full DSP reconfiguration that
+# blocks for seconds, varies by unit and by how large the config is, and a
+# too-short value there breaks a working setup. That is a real reason to
+# expose a knob. "The network might be slow today" is not.
+AVR_TIMEOUT_MS = 1000  # keep low so a slow AVR does not block the UI
 
 # Bounded connect-only timeout for denon.py's non-blocking status-poll
 # engine (_AsyncRequest) -- see docs/architecture.md's touch-drop
@@ -68,13 +85,14 @@ AVR_CONNECT_TIMEOUT_MS = 75
 MINIDSP_HOST          = os.getenv("MINIDSP_HOST", "192.168.1.101")
 MINIDSP_PORT          = int(os.getenv("MINIDSP_PORT", "5380"))
 MINIDSP_DEVICE_INDEX  = int(os.getenv("MINIDSP_DEVICE_INDEX", "0"))
+MINIDSP_TIMEOUT_MS        = 2000   # see "Request timeouts are constants" above
 # minidsp-rs's POST /devices/{index} blocks until the change is actually
 # applied on the hardware, not just accepted -- volume/mute are near-instant
 # (confirmed ~0.05-1.1s), but switching config slots/presets is a full DSP
-# reconfiguration and measured ~4s on a real Flex. A too-short timeout here
-# doesn't just show a stale UI -- the abandoned in-flight request seems to
-# be able to crash minidsp-rs itself (observed once during testing).
-MINIDSP_TIMEOUT_MS        = int(os.getenv("MINIDSP_TIMEOUT", "2000"))
+# reconfiguration and measured ~4s on a real Flex. Configurable because that
+# figure is per-unit: a too-short value here doesn't just show a stale UI,
+# the abandoned in-flight request seems able to crash minidsp-rs itself
+# (observed once during testing).
 MINIDSP_PRESET_TIMEOUT_MS = int(os.getenv("MINIDSP_PRESET_TIMEOUT", "10000"))
 # Optional: pin to a specific unit by its serial number (see GET /devices'
 # "version.serial", or `make probe-minidsp`) instead of MINIDSP_DEVICE_INDEX.
@@ -100,17 +118,16 @@ HA_HOST       = os.getenv("HA_HOST", "")
 HA_PORT       = int(os.getenv("HA_PORT", "8123"))
 HA_TOKEN      = os.getenv("HA_TOKEN", "")
 HA_ENTITY_ID  = os.getenv("HA_ENTITY_ID", "media_player.office")
-HA_TIMEOUT_MS = int(os.getenv("HA_TIMEOUT", "2000"))
-# An HA_MEDIA_CONTROLS opt-in flag lived here until 2026-08-06, defaulting to
-# off. It predated the media_state design and was made redundant by it: the
-# play/pause row already renders only while the entity reports the literal
-# state "playing"/"paused", so a source with nothing to pause (a plain analog
-# input reports "on") never draws the controls in the first place. The flag
-# was a second gate on top of a check that already did the job.
+HA_TIMEOUT_MS = 2000   # see "Request timeouts are constants" above
+# There is deliberately no setting to enable/disable the media controls.
+# The play/pause row renders only while the entity reports the literal state
+# "playing"/"paused", so a source with nothing to pause (a plain analog input
+# reports "on") never draws them anyway -- a flag would be a second gate on
+# top of a check that already does the job.
 
 # WiiM/LinkPlay streamer settings
 WIIM_HOST       = os.getenv("WIIM_HOST", "")
-WIIM_TIMEOUT_MS = int(os.getenv("WIIM_TIMEOUT", "2000"))
+WIIM_TIMEOUT_MS = 2000   # see "Request timeouts are constants" above
 # Physical/network sources to offer in the Source menu, as switchmode keys
 # (comma-separated). The default set (wifi, bluetooth, line-in, optical) was
 # empirically confirmed against a WiiM Pro -- see wiim.py's module
@@ -131,9 +148,7 @@ WIIM_INPUTS = [s.strip() for s in
 # WIIM_PRESET_NAMES IS the preset list -- its length is how many presets
 # exist. There is deliberately no separate count setting: the names are the
 # slots, so a count could only ever agree with len() or silently contradict
-# it. (It did contradict it: a WIIM_PRESET_COUNT setting used to clamp this
-# list, so naming 3 Favorites with a count of 2 silently hid the third. See
-# docs/device-drivers.md.)
+# it, and silently hiding a preset the user named is the worse failure.
 WIIM_PRESET_NAMES = [n.strip() for n in
                       os.getenv("WIIM_PRESET_NAMES", "").split(",")
                       if n.strip()]
@@ -142,13 +157,13 @@ WIIM_PRESET_NAMES = [n.strip() for n in
 # Night first). Names must appear in WIIM_PRESET_NAMES.
 #
 # By name, not by position, to match CAMILLADSP_QUICK_PRESETS -- these two
-# settings look parallel in settings.toml.template and should behave the
-# same. WiiM did take positions briefly (a position here is also the WiiM
-# Favorite number, since get_presets() numbers slots 1..N and that is what
-# MCUKeyShortClick:<n> takes), which was defensible for WiiM alone but read
-# as an inconsistency next to CamillaDSP. Names also survive reordering the
-# list, and a rename breaks loudly with the boot print below rather than
-# silently pointing at whatever preset moved into that slot.
+# settings look parallel in settings.toml.template and must behave the same.
+# Positions would be defensible for WiiM alone (a position here is also the
+# WiiM Favorite number, since get_presets() numbers slots 1..N and that is
+# what MCUKeyShortClick:<n> takes) but read as an inconsistency next to
+# CamillaDSP. Names also survive reordering the list, and a typo or rename
+# breaks loudly via the boot print below rather than silently pointing at
+# whatever preset moved into that slot.
 #
 # LEAVE THIS UNSET TO KEEP THE MEDIA CONTROLS. Buttons and the play/pause +
 # skip row cannot share the screen -- they want the same band of pixels, and
@@ -185,10 +200,9 @@ def _parse_wiim_preset_buttons(raw, presets):
     stays a pure lookup with no validation of its own.
 
     Empty/unset returns nothing, which is what keeps the media controls --
-    see the note above. There is deliberately no separate "off" value (an
-    earlier draft took "0"/"none"): unset already means off, so a second
-    spelling of the default would be config surface that can never change
-    any behavior.
+    see the note above. There is deliberately no separate "off" value:
+    unset already means off, so a second spelling of the default would be
+    config surface that can never change any behavior.
     """
     raw = raw.strip()
     if not raw:
@@ -220,7 +234,7 @@ WIIM_PRESET_BUTTONS = _parse_wiim_preset_buttons(
 # CamillaDSP settings
 CAMILLADSP_HOST       = os.getenv("CAMILLADSP_HOST", "")
 CAMILLADSP_PORT       = int(os.getenv("CAMILLADSP_PORT", "1234"))
-CAMILLADSP_TIMEOUT_MS = int(os.getenv("CAMILLADSP_TIMEOUT", "2000"))
+CAMILLADSP_TIMEOUT_MS = 2000   # see "Request timeouts are constants" above
 # Switching the active config file (see camilladsp.py's presets) reloads the
 # whole filter pipeline. Measured ~1-3ms live (2026-07-30) against a trivial
 # test config (SignalGenerator capture + one filter, no FIR/convolution files
@@ -387,13 +401,10 @@ else:
 # Inter-tick interval (ms) below which fast mode kicks in.
 # 50ms = ~20 ticks/sec = ~1.3 revolutions/sec -- feels like a deliberate quick sweep.
 ACCEL_THRESHOLD_MS = int(os.getenv("ACCEL_THRESHOLD", "100"))
-# An ACCEL_SAFETY_CAP lived here until 2026-08-06 -- a ceiling a fast upward
-# spin couldn't cross without slowing down, meant to prevent accidental
-# blasting. Nothing ever read it: apply_volume_delta() clamps to VOLUME_MIN/
-# VOLUME_MAX and nothing else, and it had been inert since the first POC
-# snapshot. Removed rather than implemented, on the maintainer's call that the
-# protection isn't needed now that the render loop is fast enough for a quick
-# spin to stay controllable (see docs/rendering.md's 2026-08-05 rewrite).
+# There is deliberately no volume ceiling a fast upward spin has to slow down
+# to cross. apply_volume_delta() clamps to VOLUME_MIN/VOLUME_MAX and nothing
+# else: the render loop is fast enough that a quick spin stays controllable
+# by feel, which is a better guard than a number the user can't see.
 
 # Standby/off screen brightness, as a fraction of the user's own brightness
 # setting (not a fixed value) -- dim room, dim standby indicator; bright
@@ -402,7 +413,7 @@ STANDBY_BRIGHTNESS_FRAC = float(os.getenv("STANDBY_BRIGHTNESS_FRAC", "0.25"))
 
 # Mute "breathing" animation (the volume number slowly pulses while muted) --
 # on by default. Turning this off also disables the trough-timed poll that
-# rides along with it (see code.py's _pulse_mute) -- polling while muted
+# rides along with it (see app.py's _pulse_mute) -- polling while muted
 # falls back to the normal adaptive schedule instead, since there's no
 # animation left to hide a poll's brief pause inside.
 MUTE_PULSE = _get_bool("MUTE_PULSE", True)

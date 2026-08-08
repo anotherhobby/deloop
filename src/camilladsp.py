@@ -105,10 +105,6 @@
 #     instead: "<rate>khz" while GetState is "Running", or the raw GetState
 #     word (Paused/Inactive/Starting/Stalled) otherwise. Purely a display
 #     choice, not a capability -- see get_status()/_format_status() below.
-#     Channel count is fetched/cached the same way (_fetch_channels()) but
-#     surfaced via get_status()'s separate "channels" key instead of this
-#     string -- combining both was confirmed visibly too wide on the real
-#     display.
 #   - Presets are CamillaDSP config files, offered as a fixed name/path list
 #     from config.CAMILLADSP_PRESETS (see config.py) -- CamillaDSP has no
 #     concept of a fixed "slot count" the way MiniDSP's config slots or
@@ -127,21 +123,18 @@
 #     is `len(config.CAMILLADSP_QUICK_PRESETS) > 0`, and get_quick_presets()
 #     returns that separate list rather than deferring to driver.py's default
 #     (which would just reuse get_presets()' full list, the denon.py/
-#     minidsp.py behavior). Two earlier designs were tried and rejected here,
-#     in order: (1) always show quick buttons for the whole CAMILLADSP_PRESETS
-#     list, matching denon.py/minidsp.py -- wrong because unlike their
-#     physically-small, fixed slot counts, CamillaDSP presets are arbitrary
-#     named config files with no real ceiling, so a long list would hit the
-#     same button-row/tap-rect overflow wiim.py's docstring describes; (2)
-#     always False, always scrollable-submenu-only, matching wiim.py exactly
-#     -- rejected by the user, who pointed out the row has room for a few
-#     buttons (dial_ui.py's _DBTN_MAX=5, though 4 is the practical limit used
-#     here) and there's no reason to give up that shortcut just because the
-#     *full* list can be long. CAMILLADSP_QUICK_PRESETS (config.py) is the
-#     resolution: a separately configured, capped-at-4 list of *names* that
-#     must already appear in CAMILLADSP_PRESETS, letting a user pick which
-#     few of their (possibly many) presets are worth a one-tap button, while
-#     the complete list stays reachable through the submenu regardless.
+#     minidsp.py behavior).
+#
+#     The subset is the point, and both extremes are wrong. Buttons for the
+#     whole list (the denon.py/minidsp.py behavior) breaks here because
+#     CamillaDSP presets are arbitrary named config files with no ceiling,
+#     unlike their physically-fixed slot counts -- a long list overflows the
+#     button row and its tap-rect math. But no buttons at all gives up a
+#     genuinely useful shortcut just because the *full* list can be long.
+#     CAMILLADSP_QUICK_PRESETS (config.py) is the middle: a capped-at-4 list
+#     of names that must already appear in CAMILLADSP_PRESETS, so a user
+#     picks which few are worth one tap while the complete list stays
+#     reachable through the submenu.
 #   - CAPS["player_select"] is False -- this backend only ever controls the
 #     one CamillaDSP instance at CAMILLADSP_HOST/PORT.
 
@@ -218,7 +211,7 @@ def _ws_handshake(sock):
     sock.send(request.encode("utf-8"))
 
     buf = b""
-    head, sep, rest = buf.partition(b"\r\n\r\n")
+    sep = b""
     while not sep:
         buf = _recv_more(sock, buf)
         head, sep, rest = buf.partition(b"\r\n\r\n")
@@ -363,9 +356,7 @@ def _ws_query(command, arg=None, timeout=None):
 # GetState word (Paused/Inactive/Starting/Stalled) otherwise. This is
 # display-only -- CAPS["input_select"] stays False, no Input menu,
 # friendly_input() is never called since nothing reads state.input_names
-# for this backend. Channel count is separate -- see get_status()'s
-# "channels" key (driver.py's generic contract) -- combining both into one
-# string measured visibly too wide on the real display.
+# for this backend.
 #
 # CONFIRMED CAMILLADSP QUIRK (2026-07-30, real hardware + CamillaDSP 4.1.3
 # source read directly): a "SignalGenerator" capture device -- which is what
@@ -388,24 +379,6 @@ def _ws_query(command, arg=None, timeout=None):
 # for this specific test setup, not a regression.
 _RUNNING = "Running"
 
-_channels = None   # cached; see _fetch_channels()'s docstring for why
-
-
-def _fetch_channels():
-    """Read devices.capture.channels from the currently loaded config via
-    GetConfigJson. Channel count is a static property of whichever config is
-    loaded -- unlike volume/mute/state, it can't change except when a preset
-    switch loads a different config -- so this is fetched once and cached,
-    not re-queried on every poll. set_preset() invalidates the cache after a
-    successful switch. Returns None on any failure (unexpected field shape,
-    network error, etc.) -- the status text falls back to just the state
-    word in that case, same as if GetCaptureRate failed."""
-    try:
-        cfg = json.loads(_ws_query("GetConfigJson"))
-        return int(cfg["devices"]["capture"]["channels"])
-    except Exception:
-        return None
-
 
 def _format_status(state_str, rate):
     """Format the DSP status text for dial_ui.py's top label. Only shows the
@@ -413,11 +386,12 @@ def _format_status(state_str, rate):
     meaningful yet during "Starting", and doesn't apply at all to
     Paused/Inactive/Stalled -- so every other state just shows the literal
     GetState word, which CamillaDSP's own vocabulary already makes clear to
-    anyone familiar with the tool. Channel count deliberately isn't part of
-    this string -- "<channels>ch - <rate>khz" measured visibly too wide on
-    the real display (confirmed live) -- see get_status()'s separate
-    "channels" key, which _fetch_channels() still populates for whatever
-    display ends up using it."""
+    anyone familiar with the tool.
+
+    Rate only, never channel count: "<channels>ch - <rate>khz" was built
+    and measured visibly too wide on the real display. The channel count is
+    available (GetConfigJson's devices.capture.channels) if a row is ever
+    found for it."""
     if state_str != _RUNNING or not rate:
         return state_str or ""
     rate_khz = rate / 1000.0
@@ -430,17 +404,9 @@ def get_status():
 
     Returns a dict shaped like denon.get_status() -- power is always "ON"
     since CamillaDSP has no power/standby concept (see module docstring).
-    "input" is repurposed for DSP processing status (rate only; see
-    _format_status()), not a real input. "channels" is the optional generic
-    contract key (see driver.py) -- the loaded config's input channel count,
-    or None if it couldn't be determined; not folded into "input" itself
-    since that string was already too wide with both. Raises OSError on
-    network/protocol failure.
+    "input" is repurposed for DSP processing status (see _format_status()),
+    not a real input. Raises OSError on network/protocol failure.
     """
-    global _channels
-    if _channels is None:
-        _channels = _fetch_channels()
-
     volume_db, muted, state_str, rate = _ws_query_many([
         ("GetVolume", None), ("GetMute", None),
         ("GetState", None), ("GetCaptureRate", None),
@@ -450,7 +416,6 @@ def get_status():
         "muted": bool(muted),
         "power": "ON",
         "input": _format_status(state_str, rate),
-        "channels": _channels,
     }
 
 
@@ -501,6 +466,4 @@ def set_preset(path):
     rebuild, not just a settings change. Uses _PRESET_TIMEOUT; see its
     comment above -- measured near-instant on a trivial test config, still
     unverified on a real production one."""
-    global _channels
     _ws_query_many([("SetConfigFilePath", path), ("Reload", None)], timeout=_PRESET_TIMEOUT)
-    _channels = None   # different config may have a different channel count

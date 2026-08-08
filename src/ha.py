@@ -128,15 +128,14 @@ def get_status():
 
     Also includes "media_state" -- the raw HA state string (e.g. "on",
     "playing", "paused", "idle"), an optional key beyond the base driver
-    contract that dial_ui.py/code.py use to show a play/pause status line +
+    contract that dial_ui.py/app.py use to show a play/pause status line +
     touch target only when it's actually "playing"/"paused" (see
     state.py's apply_status(), which defaults it to "" for backends that
     don't return this key at all).
 
-    That state check is the whole gate. A config.HA_MEDIA_CONTROLS opt-in
-    flag used to sit on top of it, defaulting to off, and was removed
-    2026-08-06 as redundant: an entity with nothing to pause reports "on"
-    (or "idle"), not "playing", so the controls already never drew for it.
+    That state check is the whole gate, and it needs no setting alongside
+    it: an entity with nothing to pause reports "on" (or "idle"), never
+    "playing", so the controls simply never draw for it.
     """
     body = _get_state()
     state = body.get("state", "unknown")
