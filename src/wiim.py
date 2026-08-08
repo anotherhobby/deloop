@@ -96,7 +96,7 @@
 #     Plus) may expose a different physical set -- config.WIIM_INPUTS is a
 #     configurable override for exactly that, same escape hatch
 #     MINIDSP_PRESET_NAMES already uses for a similarly per-unit list.
-#   - CAPS["presets"] is config.WIIM_PRESET_COUNT > 0 -- NOT auto-discovered.
+#   - CAPS["presets"] is len(config.WIIM_PRESET_NAMES) > 0 -- NOT auto-discovered.
 #     HARD LESSON, confirmed live: getPresetInfo's preset_list stays
 #     genuinely empty ({"preset_num": 0, "preset_list": []}) even after
 #     configuring real Favorites in the WiiM app and rebooting the Dial --
@@ -112,22 +112,25 @@
 #     them back that the plain API can't do.
 #   - Given that, this backend falls back to the same "API can't report
 #     names, so config does" pattern minidsp.py already established for its
-#     own unrelated gap (config.MINIDSP_PRESET_COUNT/_NAMES): set
-#     WIIM_PRESET_COUNT to how many Favorites you've actually configured
-#     (1-12) and optionally WIIM_PRESET_NAMES to label them, falling back to
-#     "Preset N". This was a deliberate choice over implementing UPnP/SOAP
+#     own unrelated gap (config.MINIDSP_PRESET_NAMES): list the Favorites
+#     you've actually configured (1-12) in WIIM_PRESET_NAMES, in order --
+#     that list IS the preset set, its length is the count. This was a
+#     deliberate choice over implementing UPnP/SOAP
 #     just for this (see the user-facing tradeoff this was chosen over:
 #     real names with zero settings.toml upkeep, at the cost of a new
 #     protocol/complexity class on a memory-constrained device, untested
 #     against this unit's actual UPnP service layout).
-#   - CAPS["preset_quickbuttons"] = False: WiiM can have far more presets
-#     than the main-screen quick-select row's 5 pre-allocated slots was ever
-#     designed for (Denon: 2, MiniDSP: <=4) -- this unit reports
-#     "preset_key": "12" in getStatusEx, i.e. 12 favorite slots, confirmed
-#     live. Presets are reachable only through the scrollable Preset
-#     submenu (same generic menu HA's Media Player picker already uses for
-#     an equally unbounded list), never the quick-select buttons. See
-#     driver.py's _CAPS_DEFAULTS for the flag.
+#   - CAPS["preset_quickbuttons"] is config-driven, via WIIM_PRESET_BUTTONS.
+#     A WiiM unit can have far more presets than the main-screen row holds
+#     (this one reports "preset_key": "12" in getStatusEx, i.e. 12 favorite
+#     slots, confirmed live) -- which is an argument for showing a *subset*,
+#     not for showing none. WIIM_PRESET_BUTTONS picks that subset by name;
+#     the full list stays reachable through the scrollable Preset submenu.
+#     See driver.py's _CAPS_DEFAULTS for the flag, config.py for parsing.
+#     NOTE this setting also chooses the whole lower-screen layout: buttons
+#     and the play/pause + skip row want the same pixels and cannot coexist,
+#     so unset means media controls (the default) and naming any preset means
+#     buttons instead. wiim_ui.py's _media_row_active() is the predicate.
 #   - No separate "preset enabled" dimension -- MCUKeyShortClick just jumps
 #     to a favorite, there's no on/off toggle independent of which one was
 #     last activated. CAPS["preset_enable"]/["preset_select_enables"] stay
@@ -140,9 +143,10 @@ import json
 import config
 
 CAPS = {"power": False, "input_select": True,
-        "presets": config.WIIM_PRESET_COUNT > 0,
+        "presets": len(config.WIIM_PRESET_NAMES) > 0,
         "preset_enable": False, "preset_select_enables": False,
-        "player_select": False, "preset_quickbuttons": False}
+        "player_select": False,
+        "preset_quickbuttons": len(config.WIIM_PRESET_BUTTONS) > 0}
 LABELS = {"input_select": "Source", "presets": "Preset"}
 
 # LinkPlay's fixed self-signed firmware cert (CN=www.linkplay.com) -- the
@@ -344,15 +348,26 @@ _MODE_TO_INPUT_KEY = {"10": "wifi", "40": "line-in", "41": "bluetooth", "43": "o
 
 # Broad mode-code -> descriptive name table for get_status()'s "input" field
 # (friendly_input() below) -- distinct from the Source menu above, since
-# this shows *what's actually playing* (e.g. "TIDAL Connect"), not just
-# which physical input is selected. Ported from local/uc-intg-wiim's
+# this shows *what's actually playing* (e.g. "TIDAL"), not just which
+# physical input is selected. Ported from local/uc-intg-wiim's
 # PLAYBACK_MODE_MAP; "10"/"40"/"41"/"43" confirmed live, the rest are from
 # the reference and not individually re-verified.
+#
+# These are DISPLAY strings only -- nothing on the wire uses them -- and they
+# must fit dial_ui.py's input label, which sits at y=62 on a round 240px
+# screen in Inter_Medium_20. That row clears the gauge arc (inner radius 90)
+# for only ~122px, about 12 characters of typical mixed-case text; past that
+# the name draws under the arc band and then gets clipped by the display
+# circle. So three of the reference's names are deliberately shortened here:
+# "TIDAL Connect" (144px), "Spotify Connect" (156px) and "External Storage"
+# (158px) all overflowed. Measure with tools/font_fit.py before adding or
+# renaming an entry -- it is a pixel budget, not a character count (Inter's
+# advances run 5px for "i" to 20px for "W").
 _MODE_NAME = {
     "-1": "Idle", "0": "Idle", "1": "AirPlay", "2": "DLNA", "10": "WiiM",
-    "11": "USB Disk", "16": "TF Card", "31": "Spotify Connect",
-    "32": "TIDAL Connect", "40": "AUX-In", "41": "Bluetooth",
-    "42": "External Storage", "43": "Optical-In", "50": "Mirror",
+    "11": "USB Disk", "16": "TF Card", "31": "Spotify",
+    "32": "TIDAL", "40": "AUX-In", "41": "Bluetooth",
+    "42": "Storage", "43": "Optical-In", "50": "Mirror",
     "60": "Voice Mail", "99": "Slave",
 }
 
@@ -381,7 +396,7 @@ def friendly_input(raw_mode):
 # ---------------------------------------------------------------------------
 # Presets -- WiiM-app Favorites, activated via MCUKeyShortClick. See module
 # docstring's CAPS["presets"] note for why this is config-driven
-# (WIIM_PRESET_COUNT/_NAMES) rather than auto-discovered -- getPresetInfo's
+# (WIIM_PRESET_NAMES/_BUTTONS) rather than auto-discovered -- getPresetInfo's
 # preset_list does not reliably reflect this feature's contents, confirmed
 # live even after configuring real Favorites and rebooting. No on/off
 # dimension either (CAPS["preset_enable"] stays False) -- MCUKeyShortClick
@@ -389,21 +404,34 @@ def friendly_input(raw_mode):
 # ---------------------------------------------------------------------------
 
 def get_presets():
-    """Return (current_value, [(value, name), ...]) for slots 1..WIIM_PRESET_COUNT.
+    """Return (current_value, [(value, name), ...]) for every WIIM_PRESET_NAMES entry.
 
-    `value` is the 1-based preset number MCUKeyShortClick expects. There's
-    no API field reporting which preset (if any) is currently active, so
-    current_value is always "" -- the Preset submenu just opens with no
-    slot pre-highlighted. Names come from config.WIIM_PRESET_NAMES if set
-    (by index), falling back to "Preset N" -- identical shape to
-    minidsp.py's get_presets(), same underlying reason (the API can't read
-    slot names back).
+    `value` is the 1-based preset number MCUKeyShortClick expects, which is
+    just the name's position in the list. There's no API field reporting
+    which preset (if any) is currently active, so current_value is always
+    "" -- the Preset submenu opens with no slot pre-highlighted.
+
+    The list length is the preset count, full stop -- see config.py for why
+    there is no separate count setting. WIIM_PRESET_BUTTONS answers the
+    different question of how many get main-screen buttons; see
+    get_quick_presets().
     """
-    custom_names = config.WIIM_PRESET_NAMES
-    names = [(str(i), custom_names[i - 1] if i - 1 < len(custom_names)
-              else "Preset {}".format(i))
-             for i in range(1, config.WIIM_PRESET_COUNT + 1)]
+    names = [(str(i), name)
+             for i, name in enumerate(config.WIIM_PRESET_NAMES, 1)]
     return "", names
+
+
+def get_quick_presets():
+    """Return the subset of get_presets() that gets main-screen buttons.
+
+    config.WIIM_PRESET_BUTTONS is configured by name but already resolved to
+    1-based positions there, along with all the validation (unknown or
+    repeated names dropped with a boot print, capped at what fits) -- so this
+    is a pure lookup. Order is the configured one, since "Night,Movie" is a
+    request to draw Night first.
+    """
+    presets = config.WIIM_PRESET_NAMES
+    return [(str(pos), presets[pos - 1]) for pos in config.WIIM_PRESET_BUTTONS]
 
 
 def set_preset(value):

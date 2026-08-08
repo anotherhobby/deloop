@@ -26,7 +26,7 @@
 #
 #   - No power/standby concept at all -- the DSP is "on" whenever the host
 #     and USB link are up. get_status() always reports power="ON", and
-#     CAPS["power"] is False so code.py never offers a power gesture for it.
+#     CAPS["power"] is False so app.py never offers a power gesture for it.
 #
 #   - "Input" means the DSP's source enum (Toslink/USB/Analog/...), not a
 #     renameable HDMI-style source list. There's no HTTP endpoint that
@@ -212,9 +212,12 @@ _SOURCE_MAP = {
     27: ["Analog", "Toslink", "Spdif", "Usb", "Bluetooth"],
     32: ["Analog", "Toslink", "Spdif", "Usb", "Hdmi"],
 }
-# hw_id 10 splits on dsp_version: 100/101 use one set, everything else another.
-_SOURCE_MAP_HW10_LEGACY = ["Analog", "Toslink", "Usb"]
-_SOURCE_MAP_HW10        = ["I2S", "Toslink", "Usb"]
+# hw_id 10 splits on dsp_version: 100/101 expose an analog input where every
+# other dsp_version on the same hw_id exposes I2S instead. Named for the input
+# that differs, not for which came first -- 100 is the Flex, i.e. the newer of
+# the two, so any "legacy"/"modern" naming here reads backwards.
+_SOURCE_MAP_HW10_ANALOG = ["Analog", "Toslink", "Usb"]
+_SOURCE_MAP_HW10_I2S    = ["I2S", "Toslink", "Usb"]
 
 _SOURCE_FRIENDLY = {
     "NotInstalled": "Not Installed", "Analog": "Analog", "Toslink": "Toslink",
@@ -247,7 +250,7 @@ def load_input_names():
 
     if hw_id == 10:
         dsp_version = info.get("dsp_version")
-        names = _SOURCE_MAP_HW10_LEGACY if dsp_version in (100, 101) else _SOURCE_MAP_HW10
+        names = _SOURCE_MAP_HW10_ANALOG if dsp_version in (100, 101) else _SOURCE_MAP_HW10_I2S
     else:
         names = _SOURCE_MAP.get(hw_id, [])
 

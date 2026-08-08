@@ -41,29 +41,13 @@ from state import AVRState
 
 _MAX_ERRORS = 5
 
-# How long after a locally-issued power command to stop trusting the polled
-# power state for external-change detection.
-#
-# Power commands are applied optimistically (state.power is set immediately,
-# see _handle_touch_power) but the device takes seconds to actually get
-# there, so polls in between report the OLD state. That makes the local
-# write and the poll disagree in exactly the shape _apply_poll_result's
-# "powered on/off externally" tests look for -- a local power-OFF reads as
-# "was standby, now reports ON", i.e. someone just turned it on.
-#
-# It was always a race; it became reliable when the 2026-08-04 rendering fix
-# took poll latency from ~1000ms to ~20ms and the loop from 3 to ~240
-# iterations/sec, so the confirming poll now lands well before the device
-# settles. Confirmed live: a long-press power-off played the power-on splash
-# and bounced straight back to the volume screen.
 # ---------------------------------------------------------------------------
 # Optimistic device writes
 # ---------------------------------------------------------------------------
 #
 # The interaction model: assume our command worked, update the UI immediately,
 # and let polling true it up. A device that only shows state it has read back
-# always feels slower than it is -- deloop was doing that for input switching,
-# where the row could not change until a poll landed.
+# always feels slower than it is.
 #
 # The catch, learned four separate times: a poll issued BEFORE the device acted
 # reports the pre-command value, and apply_status() writes it straight back.
@@ -75,26 +59,30 @@ _MAX_ERRORS = 5
 # tell the truth again. Too short and the flicker returns; too long and a
 # change made from the device's own remote takes that long to show up. That is
 # the whole tradeoff -- tune against real hardware, not reasoning.
+#
+# The loop runs at ~240 iterations/sec and a poll resolves in ~20ms, so the
+# confirming poll reliably lands well before a slow device has settled. These
+# windows are what stands between that and a visible flicker; they are not
+# belt-and-braces.
 _SETTLE_S = {
     "power":       10.0,   # a real power-on is seconds of boot time
     "muted":        1.5,   # lands in well under a second
     "media_state":  1.5,   # transport commands are immediate
     "input":        5.0,   # AVRs keep reporting the old source while HDMI re-handshakes
 }
-# Only fields apply_status() actually writes belong here. A "preset": 8.0 entry
-# lived here briefly and was pure dead weight -- apply_status() never writes
-# preset, so nothing could ever revert it and the window never once ran. Add
-# the line if a backend starts reporting preset back; do not pre-add windows
-# for fields on the theory that some future backend might.
-
+# Only fields apply_status() actually writes belong here -- a window for
+# anything else can never run, since nothing would ever revert it. Add a line
+# when a backend starts reporting that field back, not on the theory that one
+# might.
+#
 # There is deliberately no timed "switching" transition state to go with this.
 # A backend slow enough to need one blocks the loop outright while it switches,
 # so the only honest signal is a static frame painted before the blocking call
 # (see _confirm_sub) -- a timer would just be a guess laid over a frozen loop.
 # Not built until a backend actually needs it.
 
-
-# Kept as names for the places that read them directly.
+# Named separately because the power window is also read directly by
+# _apply_poll_result's externally-changed tests, not just by _settle_guard.
 _POWER_SETTLE_S = _SETTLE_S["power"]
 
 
@@ -131,6 +119,11 @@ _denon = None
 # retrying permanently the moment it succeeds once -- see _retry_presets().
 _PRESET_RETRY_INTERVAL_S = 10.0
 
+# Submenu title for sub_type == "update". Every other submenu derives its
+# title from the driver LABELS entry or the sub_type itself; this one has no
+# such source.
+_OTA_MENU_TITLE = "UPDATE"
+
 # Menu mode constants
 MODE_MAIN     = 0
 MODE_MENU_TOP = 1   # top-level menu
@@ -161,25 +154,18 @@ TOUCH_MIN_S     = 0.05  # minimum tap duration; filters electrical noise
 
 # Release debounce + post-tap lockout. Both exist because the FocalTouch chip
 # has no queue and can report touched=0 for a single frame in the MIDDLE of a
-# real press. _handle_touch samples at TOUCH_FRAME_S (~60Hz) and used to treat
-# any untouched frame as a release: dispatch the tap, reset, done. One dropout
-# therefore split one press into two taps -- two mute toggles from one finger.
-#
-# This was latent for as long as the code existed and only became reachable
-# 2026-08-05, when composing the gauge (docs/rendering.md) took draw_main from
-# ~350ms to ~90ms. At ~3 loop iterations/sec a press got sampled once or twice
-# and a mid-press dropout landed in a gap nobody looked at; sampling it at the
-# real 60Hz exposes it. Same shape as the _POWER_SETTLE_S race the last
-# rendering speedup surfaced -- assume more of these are waiting.
+# real press. Treating any untouched frame as a release splits one press into
+# two taps -- two mute toggles from one finger. Only visible once the loop got
+# fast enough to actually sample at 60Hz; at ~3 iterations/sec a press was
+# sampled once or twice and the dropout fell in a gap nobody looked at.
 TOUCH_RELEASE_S = 0.05  # untouched must persist this long to count as a release
 #
 # CAUTION: TOUCH_RELEASE_S delays the release, so tap duration must be measured
 # to the last frame that was actually TOUCHED (loop.touch_last_seen), never to
 # the release time. Measuring to release adds TOUCH_RELEASE_S to every gesture,
 # which makes even a single-frame noise blip clear TOUCH_MIN_S -- defeating the
-# very filter that constant exists to be. That regression shipped briefly on
-# 2026-08-05 and produced phantom mute taps, confirmed by the AVR itself
-# reporting it had been muted with nobody touching the device.
+# very filter that constant exists to be. The symptom is phantom mutes: the
+# device reporting itself muted with nobody touching it.
 TAP_RELOCK_S    = 0.25  # ignore new touch-downs this long after dispatching a tap
 
 # How long an unbroken run of failed I2C reads is tolerated before the touch
@@ -216,16 +202,14 @@ TOUCH_FRAME_S = 1.0 / 60   # ~60 fps
 # the FocalTouch chip itself. Prints a per-stage breakdown of any
 # iteration slower than STALL_THRESHOLD_S.
 #
-# The per-touch and per-tap prints that used to accompany this were removed
-# 2026-08-05. One of them fired on every touch-poll frame -- ~60/sec while a
-# finger was down -- and a blocking USB CDC write at that rate is a credible
-# cause of the very dropouts it was added to investigate.
+# Do not add per-touch or per-tap logging alongside this. A print on every
+# touch-poll frame is ~60 blocking USB CDC writes/sec while a finger is
+# down, which is itself a credible cause of the dropouts it would be added
+# to investigate.
 #
-# Threshold raised 0.03 -> 0.12 the same day. 30ms was ~2 frames back when a
-# draw_main() cost ~350ms and any draw tripped it anyway; now that composing
-# the gauge (docs/rendering.md) took that to ~90ms, 30ms would fire on every
-# single frame that draws. 120ms sits above a normal draw and below anything
-# that could swallow a tap.
+# 120ms sits above the cost of a normal frame that draws (~90ms) and below
+# anything long enough to swallow a whole tap. Re-tune it if draw cost
+# moves materially in either direction.
 STALL_THRESHOLD_S = 0.12
 
 
@@ -363,19 +347,14 @@ def _build_dev_menu():
     return ["Brightness", "Sound", "Restart"]
 
 
-def _ota_menu_title():
-    """Submenu title for sub_type == "update"."""
-    return "UPDATE"
-
-
 def _ota_version_text():
     """Current version string for the Update submenu's persistent status
     row (dial_ui.draw_menu's version_text param) -- visible the moment the
     submenu opens, no tap required, styled to match the main screen's
-    "input" label (dim gray) rather than a bright title. Separate from
-    _ota_menu_title() because draw_menu()'s title parameter is never
-    actually rendered (see its own comment: "no title; context comes from
-    the items themselves") -- version_text is a real, distinct label.
+    "input" label (dim gray) rather than a bright title. Distinct from the
+    submenu title, which draw_menu() never actually renders (see its own
+    comment: "no title; context comes from the items themselves") --
+    version_text is a real, visible label.
 
     Returns "" for a local build. version.CURRENT_VERSION is 0 in git and
     only ever gets a real number baked in by the release workflow, in its
@@ -453,7 +432,7 @@ def _open_submenu(sub_type, label, state, loop):
         ids = [i for i, _ in state.player_names]
         if state.player_id in ids:
             sc = ids.index(state.player_id)
-    title = _ota_menu_title() if sub_type == "update" else label.upper()
+    title = _OTA_MENU_TITLE if sub_type == "update" else label.upper()
     ver = _ota_version_text() if sub_type == "update" else ""
     return sub_type, sc, title, ver, _build_sub_items(sub_type, state, loop)
 
@@ -475,14 +454,27 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop, now):
     """Apply sub-menu selection (side-effects only).
 
     Returns a truthy value to mean "stay open, refresh items" instead of
-    the usual "close back to MODE_MAIN" -- every branch below except
-    "update"'s Install/Cancel actions implicitly returns None (falsy), so
-    existing behavior for every other sub_type is unchanged. "Check Now"/
-    "Check Again" reload immediately and never return at all; "Install"
-    sets the pending action and stays open to show "power cycle now"
-    instead (see that branch's comment for why); "Cancel" clears the
-    pending action and closes normally.
+    the usual "close back to MODE_MAIN". Only the "update" branch ever does
+    that: "Check Now"/"Check Again" reload immediately and never return at
+    all; "Install" sets the pending action and stays open to show "power
+    cycle now"; "Cancel" clears it and closes. Every other branch falls off
+    the end returning None, which closes.
     """
+    # Bounds-check before any branch indexes its list. A list here is empty
+    # whenever its boot-time fetch failed -- ha.py's _source_list is the live
+    # example, where one failed _refresh_entity() at boot leaves the Source
+    # menu empty for the whole session -- and each branch indexes outside its
+    # own try, so without this an IndexError escapes the function entirely
+    # instead of being caught and logged like a failed device call.
+    _LIST_FOR = {"input": state.input_names,
+                 "preset": state.preset_names,
+                 "player": state.player_names}
+    _items = _LIST_FOR.get(sub_type)
+    if _items is not None and not (0 <= sub_cursor < len(_items)):
+        print("menu:", sub_type, "has no entry at", sub_cursor,
+              "-- list is", len(_items), "long; ignoring tap")
+        return
+
     if sub_type == "input":
         index, name = state.input_names[sub_cursor]
         try:
@@ -501,20 +493,17 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop, now):
             # whose set_preset() blocks for real seconds (MiniDSP: ~4-10s
             # measured) freezes the loop, so paint before the call -- nothing
             # can animate meanwhile. The async path returns immediately, so
-            # painting grey there is a flash with nothing behind it, gone again
-            # on the next draw. That was unconditional until 2026-08-06 and
-            # visibly flashed on every Denon preset change.
+            # painting grey there is a flash with nothing behind it, gone
+            # again on the next draw, and it reads as a glitch.
             if _denon is not None:
                 _denon.async_set_preset(val, now)
             else:
                 dial_ui.draw_busy(ui, state)
                 driver.set_preset(val)
-            # Optimistic, like volume/mute elsewhere -- some backends (Denon)
-            # take several seconds to actually apply a preset change, so an
-            # immediate re-query would just read back stale state.
-            # The draw_busy() above covers the MiniDSP block; this just
-            # records the write and starts its settle window.
-            _optimistic(loop, state, now, "preset", val)
+            # Set directly, not via _optimistic() -- no backend reports preset
+            # back through apply_status(), so there is nothing for a settle
+            # window to guard against (see _SETTLE_S).
+            state.preset = val
             # Only flip to enabled if this backend's set_preset() actually
             # does that itself (see CAPS["preset_select_enables"] in
             # driver.py) -- on MiniDSP, preset and Dirac on/off are
@@ -600,26 +589,24 @@ _MENU_X_PAD = 14
 def _menu_item_at(ui, x, y, max_items):
     """Return visible item index [0..max_items-1] for a touch, or -1.
 
-    Tests BOTH axes against the item's actual rendered extent. This used to
-    test y only, which meant an item's hit band spanned the full width of the
-    screen at that row -- so a tap far to the left of "Dirac Live" selected
-    Dirac Live, and the only real miss zones were above the first item and
-    below the last. Found live 2026-08-06.
+    Tests BOTH axes against the item's actual rendered extent. Testing y
+    alone gives every item a hit band spanning the full screen width, so a
+    tap far to the left of "Dirac Live" selects Dirac Live and the only real
+    miss zones are above the first item and below the last -- which is what
+    makes _tap_missed_target's left-half-goes-back gesture unreachable.
 
     Width comes from the Label's own bounding_box rather than a fixed column,
     because menu text varies enormously: "PC" is 33px wide while "Install
     Update (v13)" is 221px and reaches x=10. A fixed left column wide enough
-    to hit reliably would have swallowed taps on the long ones.
+    to hit reliably would swallow taps on the long ones.
 
-    max_items is required, not defaulted to MENU_VISIBLE -- found live
-    (2026-08-01) that scanning all MENU_VISIBLE slot positions regardless
-    of how many items a menu actually has meant a menu with fewer than
-    MENU_VISIBLE items (the Update submenu's single "Check Now" row is the
-    extreme case) had "phantom" hit zones below its real content: a tap
-    landing near one of those unused slot positions returned a real index
-    that then failed the caller's `tapped < actual count` check and closed
-    the menu entirely, misread as "tapped outside every item." Every
-    caller must pass its own real, currently-visible item count.
+    max_items is required, not defaulted to MENU_VISIBLE: scanning all
+    MENU_VISIBLE slot positions regardless of how many items a menu really
+    has gives a short menu (the Update submenu's single "Check Now" row is
+    the extreme case) phantom hit zones below its real content. A tap there
+    returns a real index, fails the caller's `tapped < actual count` check,
+    and closes the menu -- misread as "tapped outside every item." Pass the
+    real, currently-visible count.
     """
     half_y = dial_ui.MENU_ITEM_DY // 2 - 2
     for i in range(max_items):
@@ -669,12 +656,8 @@ class _Loop:
         self.touch_err_since  = 0.0
         self.touch_err_logged = False
 
-        # monotonic time of the last locally-issued power command. Polls for
-        # the next _POWER_SETTLE_S report the pre-command state, which looks
-        # identical to the device being changed from its own remote -- see
-        # _POWER_SETTLE_S.
-        # monotonic time of the last locally-issued write, per field --
-        # see _SETTLE_S and _optimistic().
+        # monotonic time of the last locally-issued write, per field -- see
+        # _SETTLE_S and _optimistic().
         self.cmd_at = {}
         self.last_touch_poll   = 0.0   # throttles touch reads -- see TOUCH_FRAME_S
 
@@ -782,7 +765,7 @@ def _handle_encoder_button(loop, ui, state, btn, now):
             items = _build_sub_items(loop.sub_type, state, loop)
             loop.sub_cursor = 0
             loop.sub_scroll = 0
-            title = _ota_menu_title() if loop.sub_type == "update" else loop.sub_type.upper()
+            title = _OTA_MENU_TITLE if loop.sub_type == "update" else loop.sub_type.upper()
             ver = _ota_version_text() if loop.sub_type == "update" else ""
             dial_ui.draw_menu(ui, title, items[:dial_ui.MENU_VISIBLE], 0, clear_bg=True, version_text=ver)
         else:
@@ -855,7 +838,7 @@ def _handle_encoder_rotation(loop, ui, state, encoder, now):
         elif loop.sub_type == "preset":  title = driver.LABELS["presets"].upper()
         elif loop.sub_type == "player":  title = driver.LABELS["player_select"].upper()
         elif loop.sub_type == "sound":   title = "SOUND"
-        elif loop.sub_type == "update":  title = _ota_menu_title()
+        elif loop.sub_type == "update":  title = _OTA_MENU_TITLE
         else:                            title = loop.sub_type.upper()
         ver = _ota_version_text() if loop.sub_type == "update" else ""
         vis = items[loop.sub_scroll : loop.sub_scroll + dial_ui.MENU_VISIBLE]
@@ -927,8 +910,8 @@ def _read_touch_point(touch):
     """Return (x, y) of the first active touch point, or None.
 
     Retries once: the I2C read to the FocalTouch fails intermittently with
-    OSError EIO (see _handle_touch), and a single dropped coordinate read
-    used to be indistinguishable from a genuinely empty touch list.
+    OSError EIO (see _handle_touch), and without the retry a single dropped
+    coordinate read is indistinguishable from a genuinely empty touch list.
     """
     for _attempt in range(2):
         try:
@@ -944,22 +927,16 @@ def _read_touch_point(touch):
 def _handle_touch_down(loop, ui, state, touch, now):
     """Touch held down: track position, fire long-press power toggle.
 
-    Found + fixed 2026-08-01: touch_y used to be set only once, on the
-    very first frame of a touch-down, while touch_x kept updating on every
-    later frame (for swipe detection). If that first frame's read came
-    back phantom/empty (the FocalTouch driver can report touched>0 with
-    an empty touches list after filtering invalid points -- confirmed
-    reachable), touch_y stayed stuck at its reset value of 0 for the
-    entire gesture, even once a later frame got a real reading. Since
-    every real menu item sits near vertical screen center, a stuck
-    touch_y=0 never matches any item's hit band regardless of how many
-    items exist -- indistinguishable from "tapped outside everything,"
-    closing the menu on release. touch_x_start (the swipe-detection
-    baseline) had the same latent gap: only ever set on the literal first
-    frame, so a phantom first read left it stuck at 0 too. Both are now
-    set on whichever frame first produces a real point, not necessarily
-    the first frame, and touch_x/touch_y both keep updating on every
-    later frame a valid point comes back."""
+    CAREFUL: touch_x_start and touch_y anchor on whichever frame first
+    produces a real point, NOT on the first frame of the gesture. The
+    FocalTouch driver can report touched>0 with an empty touches list
+    (confirmed reachable), and anchoring on the literal first frame leaves
+    both stuck at their reset value of 0 for the whole gesture even after a
+    later frame reads cleanly. A stuck touch_y=0 is not a harmless default:
+    every menu item sits near vertical center, so it matches no item's hit
+    band and reads as "tapped outside everything," closing the menu. A
+    stuck touch_x_start breaks swipe detection the same way.
+    """
     first_frame = loop.touch_start == 0.0
     if first_frame:
         loop.touch_start = now
@@ -1038,10 +1015,7 @@ def _tap_missed_target(loop, ui, state, now):
     collide with real content. Reinterpreting a MISS costs nothing, because
     by definition no target was there.
 
-    This also makes the three menus agree. They previously disagreed on what
-    a miss meant -- top closed, device went back, and a submenu closed all
-    the way out rather than stepping back one level, which was the actively
-    annoying one.
+    All three menus route here, so a miss means the same thing everywhere.
 
     Note the reachable area shrinks as menus grow: item hit bands are 34px of
     the 38px spacing, so the gaps BETWEEN items are only 4px and effectively
@@ -1118,7 +1092,7 @@ def _tap_menu_sub(loop, ui, state, now):
         items = _build_sub_items(loop.sub_type, state, loop)
         loop.sub_cursor = 0
         loop.sub_scroll = 0
-        title = _ota_menu_title() if loop.sub_type == "update" else loop.sub_type.upper()
+        title = _OTA_MENU_TITLE if loop.sub_type == "update" else loop.sub_type.upper()
         ver = _ota_version_text() if loop.sub_type == "update" else ""
         dial_ui.draw_menu(ui, title, items[:dial_ui.MENU_VISIBLE], 0, clear_bg=True, version_text=ver)
     else:
@@ -1138,36 +1112,30 @@ def _tap_open_menu(loop, ui, now):
 
 def _start_mute_pulse(loop, now):
     loop.mute_phase_origin  = now
-    # NOT False. _pulse_mute polls the AVR at the trough of the breathing
+    # NOT False. _pulse_mute polls the device at the trough of the breathing
     # cycle, and frac = 0.5*(1 - cos(2*pi*t/8)) is 0 at t=0 -- so the cycle
     # STARTS at a trough. Arming the poll here fires one on the very next
-    # pulse frame, milliseconds after we sent the mute command, and it comes
-    # back reporting the pre-command state: the display goes blue, snaps back
-    # to full colour, then blue again at the real trough 8s later.
-    #
-    # Survivable until 2026-08-05 only by accident -- poll latency was ~1000ms,
-    # which gave the AVR time to actually apply the mute before the answer
-    # arrived. At ~20ms the poll now wins the race. Skipping this one trough
-    # costs nothing: it immediately follows our own command, so it can only
-    # ever confirm what we just did or report staleness.
+    # pulse frame, milliseconds after we sent the mute command, and at ~20ms
+    # latency it beats the device to the punch and reports the pre-command
+    # state: the display goes blue, snaps back to full colour, then blue
+    # again at the real trough 8s later. Skipping this one trough costs
+    # nothing -- it immediately follows our own command, so it can only
+    # confirm what we just did or report staleness.
     loop.mute_trough_polled = True
 
 
 def _try_action(loop, label, action):
     """Run `action()` (a no-arg callable -- usually a driver call, or a
     closure wrapping one plus a local state flip), then reset the poll
-    timer + error count on success or print+count on failure. Shared tail
-    of every simple single-action tap handler below -- fires exactly once
-    per tap, no multi-step logic. Returns True on success so a caller with
-    something to redraw (a flipped state field) can branch on it; a caller
-    with nothing to redraw (media prev/next -- no local field changes)
-    can just ignore the return value.
+    timer + error count on success, or print + count on failure.
 
-    Not used by every tap handler in this file -- the preset quick-select
-    and power-toggle handlers each have their own extra steps (a busy
-    screen, a non-default poll-timer offset, redrawing on failure too)
-    that don't fit this shared shape, and forcing them into it would cost
-    more in indirection than the duplication it would remove.
+    Shared tail of the simple single-action tap handlers. Returns True on
+    success so a caller with something to redraw can branch on it; media
+    prev/next flip no local state and ignore it.
+
+    The preset quick-select and power-toggle handlers deliberately don't
+    use this -- they each need a busy frame, a different poll-timer offset,
+    or a redraw on the failure path too.
     """
     try:
         action()
@@ -1304,9 +1272,8 @@ def _tap_main_screen(loop, ui, state, now):
     sound.click()
     try:
         # The "please wait" frame belongs on the BLOCKING branches only --
-        # see the same note in _confirm_sub. Painting it unconditionally here
-        # made every Denon quick-preset tap flash grey for no reason, since
-        # the async path returns immediately.
+        # see the same note in _confirm_sub. On the async path it is a grey
+        # flash with nothing behind it.
         if idx == selected_idx:
             # Tapping the already-active slot toggles it in place instead of
             # switching slots -- keeps "which config is loaded" visible (see
@@ -1325,7 +1292,9 @@ def _tap_main_screen(loop, ui, state, now):
             else:
                 dial_ui.draw_busy(ui, state)
                 driver.set_preset(val)
-            _optimistic(loop, state, now, "preset", val)
+            # See the same note in _confirm_sub: set directly, no settle
+            # window, because nothing reports preset back.
+            state.preset = val
             # Only flip to enabled if this backend's set_preset() actually
             # does that itself (see CAPS["preset_select_enables"] in
             # driver.py) -- on MiniDSP, preset and Dirac on/off are
@@ -1334,9 +1303,9 @@ def _tap_main_screen(loop, ui, state, now):
             # state.preset_enabled exactly as it was.
             if driver.CAPS["preset_select_enables"]:
                 state.preset_enabled = True
-        # Optimistic, like volume/mute elsewhere -- some backends (Denon)
-        # take several seconds to actually apply a preset change, so an
-        # immediate re-query would just read back stale state.
+        # Repaint from local state rather than re-querying: some backends
+        # (Denon) take seconds to actually apply a preset change, so an
+        # immediate read-back would just return the old value.
         dial_ui.draw_main(ui, state)
         loop.last_poll = time.monotonic()
         loop.error_count = 0
@@ -1349,12 +1318,11 @@ def _tap_main_screen(loop, ui, state, now):
 def _dispatch_tap(loop, ui, state, now):
     """Route a completed tap by current mode and touch zone."""
     if loop.mode == MODE_ERROR:
-        # Connection-lost screen: deliberately inert. This used to restart
-        # the device on any tap, which was worse than useless -- a reset
-        # never cleared the states we actually hit (only pulling power did),
-        # and .claude/CLAUDE.md documents microcontroller.reset() leaving the
-        # next boot's networking broken, so tapping could turn a recoverable
-        # blip into a failed boot. Polling continues regardless and
+        # Connection-lost screen: deliberately inert, and do NOT wire a
+        # tap-to-restart here. A reset never cleared any state we actually
+        # got stuck in (only pulling power did), and it can leave the next
+        # boot's networking broken -- so a tap would turn a recoverable blip
+        # into a failed boot. Polling continues regardless, and
         # _apply_poll_result clears MODE_ERROR the moment one succeeds.
         return
 
@@ -1482,13 +1450,11 @@ def _apply_poll_result(loop, ui, state, now, status):
     detected powering on externally, so a timer-driven caller can
     reschedule its next poll sooner.
 
-    Wraps the whole diffing/render body in the same try/except the
-    original inline _poll_now() used to have around this same code (not
-    just around the network call) -- state.apply_status()/dial_ui calls
-    are unlikely to raise given a well-formed status dict, but preserving
-    the original protection here means both callers (_poll_now and
-    _pump_denon_poll) get it for free rather than one of them silently
-    losing it.
+    The try/except wraps the whole diffing/render body, not just the parts
+    that touch the device -- apply_status()/dial_ui calls are unlikely to
+    raise given a well-formed status dict, but a malformed one must not be
+    able to take the main loop down, and both callers get that guarantee
+    from here rather than each needing their own.
     """
     try:
         powered_on_externally = False
@@ -1548,13 +1514,12 @@ def _apply_poll_result(loop, ui, state, now, status):
         # encoder is still navigating it, so the next knob turn jumps back
         # to whatever menu screen was open instead of changing volume.
         #
-        # Reliably reproducible after an OTA install, which boots straight
+        # Easiest to hit right after an OTA install, which boots straight
         # into the Update submenu to show its result -- the first poll after
         # boot always reports "changed" (real status vs. defaults) and lands
-        # a second or two later, right on top of it. User-confirmed on the
-        # v11 -> v12 upgrade. Whoever closes the menu (_auto_close_menu, a
-        # tap, a swipe) calls draw_main() itself, so nothing is lost by
-        # deferring to them. Same guard _retry_presets already uses.
+        # a second or two later, right on top of it. Whoever closes the menu
+        # (_auto_close_menu, a tap, a swipe) calls draw_main() itself, so
+        # nothing is lost by deferring to them. Same guard _retry_presets uses.
         if changed and loop.mode == MODE_MAIN:
             dial_ui.draw_main(ui, state)
         loop.error_count = 0
@@ -1712,17 +1677,11 @@ def _retry_presets(loop, ui, state, now):
         state.preset, state.preset_names = driver.get_presets()
         state.preset_enabled = driver.get_preset_enabled()
         state.preset_quick_names = driver.get_quick_presets()
-        # Found + fixed 2026-08-01: this used to render unconditionally
-        # once preset_names arrived, with no check on loop.first_poll.
-        # state.power defaults to "STANDBY" (see AVRState.__init__) until
-        # the first real status poll lands, and this retry's own interval
-        # can genuinely fire before that first poll does -- rendering here
-        # painted the power-off screen using that fabricated default,
-        # which then got silently corrected a few seconds later once the
-        # real poll came in. User-reported symptom: "it goes to the power
-        # off screen before the menu screen... it's not powered off."
-        # Guarding on first_poll means this only ever renders once
-        # state.power reflects a real reading.
+        # The `not first_poll` guard is load-bearing. state.power defaults
+        # to "STANDBY" (see AVRState.__init__) until the first real status
+        # poll lands, and this retry's interval can fire before that -- so
+        # rendering unguarded paints the power-off screen from a fabricated
+        # default, which a real poll then silently corrects seconds later.
         if state.preset_names and loop.mode == MODE_MAIN and not loop.first_poll:
             dial_ui.draw_main(ui, state)   # quick-select buttons now have names to show
     except Exception as e:

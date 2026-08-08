@@ -13,10 +13,18 @@
 # v1-v4 predate this workflow (hand-created tags, no assets) -- the version
 # step below sees them as ordinary existing tags and continues from v5.
 #
-# The MPY_MODULES list below must be kept in sync by hand with the
-# Makefile's MPY_MODULES and tools/build_release_manifest.py's
+# The module list in the compile step below must be kept in sync by hand
+# with the Makefile's MPY_MODULES and tools/build_release_manifest.py's
 # _MPY_MODULES (same explicit-list tradeoff used throughout this project
 # rather than a glob).
+#
+# A module missing from these lists is worse than it looks: `make deploy`
+# still puts it on the device over USB, so everything keeps working and
+# nothing reports an error -- it just silently stops being updatable over
+# the air. That is how ota_boot.py went from its introduction to v14
+# without ever shipping in a release, which would have made a bug in the
+# installer itself unfixable by the very mechanism meant to fix it. Add
+# to all three lists or none.
 name: Build and publish deloop release
 
 on:
@@ -99,11 +107,14 @@ jobs:
       - name: Compile .mpy modules
         run: |
           mkdir -p dist
-          for m in config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app ota version; do
+          for m in config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app ota ota_boot version; do
             ./mpy-cross "src/$m.py" -o "dist/$m.mpy"
           done
-          # Never .mpy-compiled -- code.py is CircuitPython's boot entry point.
+          # Never .mpy-compiled -- CircuitPython requires both of these as
+          # plain source: code.py is the boot entry point, boot.py runs
+          # earlier still (before USB enumerates).
           cp src/code.py dist/code.py
+          cp src/boot.py dist/boot.py
 
       - name: Build manifest.json
         run: |

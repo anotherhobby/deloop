@@ -128,13 +128,14 @@ def get_status():
 
     Also includes "media_state" -- the raw HA state string (e.g. "on",
     "playing", "paused", "idle"), an optional key beyond the base driver
-    contract that dial_ui.py/code.py use to show a play/pause status line +
+    contract that dial_ui.py/app.py use to show a play/pause status line +
     touch target only when it's actually "playing"/"paused" (see
     state.py's apply_status(), which defaults it to "" for backends that
-    don't return this key at all). Gated by config.HA_MEDIA_CONTROLS --
-    reported as "" (same as "on"/idle/anything else) when that's off, so
-    the status line/tap target never appear at all rather than appearing
-    but silently doing nothing.
+    don't return this key at all).
+
+    That state check is the whole gate, and it needs no setting alongside
+    it: an entity with nothing to pause reports "on" (or "idle"), never
+    "playing", so the controls simply never draw for it.
     """
     body = _get_state()
     state = body.get("state", "unknown")
@@ -150,7 +151,7 @@ def get_status():
         "muted":       bool(attrs.get("is_volume_muted", False)),
         "power":       "STANDBY" if state == "off" else "ON",
         "input":       attrs.get("source") or "",
-        "media_state": state if config.HA_MEDIA_CONTROLS else "",
+        "media_state": state,
     }
 
 
@@ -210,23 +211,43 @@ def _refresh_entity():
     Shared by load_source_list() (boot) and set_player() (runtime switch) --
     the entity's capabilities can genuinely differ from one media_player to
     another, so this needs to re-run every time the target changes, not
-    just once at boot. Silently does nothing on network failure -- CAPS
-    stays at whatever it was (conservative False defaults at boot; the
-    prior entity's values if a switch's refresh fails).
+    just once at boot. Leaves CAPS at whatever it was on failure
+    (conservative False defaults at boot; the prior entity's values if a
+    switch's refresh fails) -- but PRINTS, it does not fail silently.
+
+    That print matters more than it looks. This is the only thing that ever
+    populates _source_list, so if it fails at boot the Source menu is empty
+    for the rest of the session, and the next successful run only happens
+    when the user switches media player. A silent return made that failure
+    mode indistinguishable from "this entity has no sources" -- no log line,
+    no screen change, just a menu that does nothing.
     """
     global _source_list
     try:
         body = _get_state()
-    except Exception:
+    except Exception as e:
+        print("ha: _refresh_entity failed for", _current_entity, "--", e)
         return
 
     attrs = body.get("attributes", {})
+    if not attrs:
+        # A 404 for an unknown entity_id still returns valid JSON
+        # ({"message": "Entity not found."}), so it lands here rather than in
+        # the except above -- worth naming, since a typo'd or renamed
+        # HA_ENTITY_ID looks exactly like a device with no capabilities.
+        print("ha: no attributes for", _current_entity,
+              "-- check HA_ENTITY_ID; HA said:", body.get("message", body))
+        return
+
     features = attrs.get("supported_features") or 0
     CAPS["power"] = bool(features & _SUPPORT_TURN_ON) and bool(features & _SUPPORT_TURN_OFF)
 
     names = attrs.get("source_list") or []
     CAPS["input_select"] = bool(features & _SUPPORT_SELECT_SOURCE) and bool(names)
     _source_list = [(name, name) for name in names]
+    print("ha:", _current_entity, "features", features,
+          "-- power", CAPS["power"], "input_select", CAPS["input_select"],
+          "sources", len(names))
 
 
 def load_source_list():

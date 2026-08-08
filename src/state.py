@@ -1,13 +1,15 @@
-# state.py -- Local model of AVR state
+# state.py -- Local model of device state.
 #
-# Holds the last-known AVR state and tracks pending changes from the
-# rotary encoder so rapid spinning batches into fewer HTTP calls.
+# The last-known state of whatever the active backend controls, updated
+# optimistically by app.py's own handlers the moment a command is sent and
+# reconciled against the real device by apply_status() on every poll. The
+# display renders from here, never from a live query.
 
 import config
 
 
 class AVRState:
-    """Holds the current known state of the AVR and pending control changes."""
+    """The current known state of the device the active backend controls."""
 
     def __init__(self):
         self.volume_db = -40.0
@@ -29,16 +31,9 @@ class AVRState:
         # Raw playback-state string from backends that track it (currently
         # only ha.py -- "playing"/"paused"/"on"/"idle"/etc, or "" for
         # backends that never report this). dial_ui.py shows a play/pause
-        # status line + code.py offers a matching tap target only when this
+        # status line + app.py offers a matching tap target only when this
         # is exactly "playing" or "paused" -- see driver.py's contract note.
         self.media_state = ""
-
-        # Input channel count, from backends that can determine it (currently
-        # only camilladsp.py). None for backends that never report this --
-        # deliberately None, not 0, so "no data" and "confirmed silent/zero
-        # channels" (not a real scenario, but keep the distinction) aren't
-        # conflated. Not shown anywhere yet -- see driver.py's contract note.
-        self.channels = None
 
         # Presets -- a device-specific "pick one of a few stored configs"
         # menu (Dirac Live filters on Denon, DSP config slots on MiniDSP;
@@ -63,9 +58,9 @@ class AVRState:
         # preset_names.
         self.preset_quick_names = []
 
-        # Input list -- loaded from AVR at boot via denon.get_inputs().
+        # Input/source list -- loaded at boot via driver.get_inputs().
         # input_names: list of (index, friendly_name)
-        # input_index: current Zone 1 source index string
+        # input_index: currently selected index, as the backend spells it
         self.input_names    = []
         self.input_index    = ""
 
@@ -78,27 +73,24 @@ class AVRState:
         self.player_id    = ""
         self.player_names = []
 
-        # Rotary encoder increments accumulated since the last volume command.
-        self._pending_ticks = 0
-
     # ------------------------------------------------------------------
     # State update from a successful poll
     # ------------------------------------------------------------------
 
     def apply_status(self, status):
-        """Update state from a dict returned by denon.get_status().
+        """Update state from a status dict (see driver.py's contract).
 
-        Returns True if any visible field changed.
+        Returns True if any visible field changed -- app.py only repaints
+        the main screen when it did, so anything compared here has to be
+        something the display can actually show.
         """
         media_state = status.get("media_state", "")
-        channels = status.get("channels")
         changed = (
             status["volume_db"] != self.volume_db
             or status["muted"] != self.muted
             or status["power"] != self.power
             or status["input"] != self.input
             or media_state != self.media_state
-            or channels != self.channels
         )
         self.volume_db = status["volume_db"]
         self.muted = status["muted"]
@@ -106,22 +98,11 @@ class AVRState:
         self.power_known = True    # heard it from the device, not a default
         self.input = status["input"]
         self.media_state = media_state
-        self.channels = channels
         return changed
 
     # ------------------------------------------------------------------
     # Rotary encoder
     # ------------------------------------------------------------------
-
-    def add_ticks(self, ticks):
-        """Accumulate rotary encoder ticks. Positive = clockwise = louder."""
-        self._pending_ticks += ticks
-
-    def take_pending_ticks(self):
-        """Return accumulated tick count and reset to zero."""
-        ticks = self._pending_ticks
-        self._pending_ticks = 0
-        return ticks
 
     def apply_volume_delta(self, ticks, step=None):
         """Update local volume immediately (optimistic) without waiting for a poll.
@@ -137,6 +118,4 @@ class AVRState:
             config.VOLUME_MIN,
             min(config.VOLUME_MAX, self.volume_db + delta_db),
         )
-
-    # ------------------------------------------------------------------
 

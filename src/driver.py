@@ -1,6 +1,6 @@
 # driver.py -- selects and re-exports the active device backend.
 #
-# code.py and dial_ui.py talk to this module only, never to denon.py or
+# app.py and dial_ui.py talk to this module only, never to denon.py or
 # minidsp.py directly. Swapping hardware is a one-line change in
 # settings.toml (DEVICE_DRIVER); adding support for a new device means
 # writing a new module that matches the contract below and pointing
@@ -15,7 +15,7 @@
 #                  "preset_enable": bool, "preset_select_enables": bool,
 #                  "player_select": bool, "preset_quickbuttons": bool}
 #     Declares which optional features the device/backend actually supports.
-#     code.py uses this to decide which menu items to build and whether the
+#     app.py uses this to decide which menu items to build and whether the
 #     power long-press / preset-disable gestures do anything -- it never
 #     guesses based on which driver is loaded by name. A backend's CAPS
 #     dict only needs to set the keys it has an opinion about; this module
@@ -24,7 +24,7 @@
 #     still safe to read CAPS["player_select"] on them. "preset_enable" may
 #     be set after init() rather than at import time, if only a live query
 #     can determine it (see minidsp.py, which discovers it from the
-#     device's own reported state) -- code.py only reads it after boot.
+#     device's own reported state) -- app.py only reads it after boot.
 #
 #     "preset_select_enables" says whether set_preset(value) alone also
 #     turns the preset on, i.e. whether "which slot" and "enabled" are
@@ -33,7 +33,7 @@
 #     to pick a filter without engaging it) or genuinely independent
 #     (MiniDSP: `preset` and `dirac` are separate fields, and a config
 #     slot may deliberately want Dirac left off -- e.g. a headphone
-#     preset). code.py reads this to decide whether switching slots
+#     preset). app.py reads this to decide whether switching slots
 #     should also flip state.preset_enabled to True, or leave it alone.
 #
 #     "preset_quickbuttons" (default True) says whether the main-screen
@@ -72,43 +72,25 @@
 #   the driver's raw playback-state string (e.g. "playing"/"paused"), for
 #   backends whose underlying entity can report that. There's no CAPS flag
 #   for this: state.py defaults it to "" via .get() for any backend that
-#   doesn't return the key at all, and dial_ui.py/code.py only ever look
+#   doesn't return the key at all, and dial_ui.py/app.py only ever look
 #   for the exact values "playing"/"paused" -- so a backend that never sets
 #   it is simply never treated as playback-capable, no special-casing
 #   needed elsewhere. media_play()/media_pause() are the matching optional
 #   controls, called only when state.media_state is "playing"/"paused".
 #
-#   get_status()'s dict may also include an optional "channels" key -- the
-#   number of audio channels present on whatever the backend considers its
-#   current input (an integer), for backends that can determine that. Same
-#   no-CAPS-flag shape as "media_state": state.py defaults it to None via
-#   .get() for any backend that doesn't return the key, and nothing reads it
-#   yet beyond storing it -- added for camilladsp.py (from GetConfigJson's
-#   devices.capture.channels, cached rather than fetched every poll since
-#   it's static per loaded config).
-#
-#   Checked (2026-07-30) whether the other four backends could fill this in
-#   too -- none currently can, each for a different confirmed reason, not
-#   just "not implemented yet":
-#     denon.py: no known AppCommand.xml/telnet command reports the incoming
-#       signal's channel count -- confirmed unresolved even in the wider
-#       HA/Denon integration community (a Home Assistant community thread
-#       asking this exact question found no answer), not just unchecked here.
-#     minidsp.py: minidsp-rs's HTTP API never serializes a channel count at
-#       all -- confirmed from its own source (daemon/src/http/mod.rs's
-#       `Device` struct only has url/version/product_name). The hardware's
-#       fixed input/output channel definitions exist as compile-time static
-#       data per hw_id (protocol/src/device/mod.rs), same shape as
-#       minidsp.py's own _SOURCE_MAP, but nothing exposes it over HTTP to
-#       read even if a similar hardcoded table were added.
-#     ha.py: confirmed absent from HA's own media_player entity schema by
-#       reading homeassistant/components/media_player/__init__.py directly
-#       -- no audio-channel-count attribute exists (media_channel, the one
-#       lookalike name, is a broadcast/TV/radio channel, unrelated).
-#     wiim.py: getMetaInfo has documented sampleRate/bitDepth/bitRate fields
-#       (per community API docs, unverified live) -- genuinely relevant
-#       "audiophile info" territory, just not a channels field specifically,
-#       and a different feature scope than what this key was added for.
+#   An audio-channel-count key was researched (2026-07-30) and deliberately
+#   not added: only camilladsp.py can supply one at all, and there is no row
+#   on a 240px round screen currently free to show it. If that changes, the
+#   source is GetConfigJson's devices.capture.channels (static per loaded
+#   config, so cache it rather than polling). The other four genuinely
+#   cannot, each for a confirmed reason rather than "not implemented yet":
+#   denon.py -- no AppCommand.xml/telnet command reports it, unresolved in
+#   the wider HA/Denon community too; minidsp.py -- minidsp-rs never
+#   serializes it (daemon/src/http/mod.rs's `Device` struct is only
+#   url/version/product_name); ha.py -- absent from HA's media_player entity
+#   schema entirely (media_channel is a broadcast channel, unrelated);
+#   wiim.py -- getMetaInfo has sampleRate/bitDepth/bitRate but no channel
+#   count.
 #
 #   power_on() / power_standby()           -- required only if CAPS["power"]
 #   load_input_names() / load_source_list() / get_inputs() -> (index, [(index, name)])
@@ -144,19 +126,19 @@
 #     target, like the input list) inside set_player() itself, since two
 #     targets discovered this way can genuinely have different
 #     capabilities -- see ha.py's set_player()/_refresh_entity(). This
-#     works with zero changes to code.py's menu-building: CAPS is the same
+#     works with zero changes to app.py's menu-building: CAPS is the same
 #     dict object every reader sees (`driver.CAPS is _impl.CAPS`), and
-#     code.py's menu functions already read it fresh on every render rather
+#     app.py's menu functions already read it fresh on every render rather
 #     than caching a snapshot from boot.
 #   media_previous() / media_next() -- optional, alongside media_play()/
 #     media_pause() above; called under the same "media_state is playing/
 #     paused" condition, no separate CAPS flag.
 #
 # Capabilities a driver doesn't support simply aren't called: the getattr
-# defaults below make the unsupported functions harmless no-ops so code.py
+# defaults below make the unsupported functions harmless no-ops so app.py
 # and dial_ui.py don't need to sprinkle CAPS checks around every call --
 # only around the menu-construction logic that decides which capabilities
-# to offer in the first place (see code.py's _top_menu_entries()), and
+# to offer in the first place (see app.py's _top_menu_entries()), and
 # around the preset-disable tap gesture (see CAPS["preset_enable"] above).
 #
 # ---------------------------------------------------------------------------

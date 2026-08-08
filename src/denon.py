@@ -73,16 +73,14 @@ def init_transport(pool):
 
 
 def _reset_connections():
-    """Force-close every socket this session has pooled, rather than the
-    normal resp.close() (which just *frees a socket for reuse*, never
-    actually closes it -- confirmed by reading adafruit_requests'
-    Response.close() source: it calls connection_manager.free_socket(),
-    not close_socket()). Needed because a body-read failure, or a
-    connect/send failure (found 2026-08-03: adafruit_requests' own
-    internal connect/send retry does not reliably prevent this -- see
-    _request_text()'s docstring), otherwise leaves a broken socket
-    sitting in the pool, ready to be silently handed back to the very
-    next request against the same host/port."""
+    """Force-close every socket this session has pooled.
+
+    resp.close() is not enough: it *frees a socket for reuse* and never
+    actually closes it (adafruit_requests' Response.close() calls
+    connection_manager.free_socket(), not close_socket()). So a body-read
+    or connect/send failure leaves a broken socket in the pool, ready to be
+    handed straight back to the next request against the same host/port --
+    see _request_text()."""
     try:
         _session._connection_manager._free_sockets(force=True)
     except Exception as e:
@@ -94,19 +92,15 @@ def _request_text(method, url, **kwargs):
 
     Retries once on failure, resetting the whole connection pool first
     (see _reset_connections()) so the retry can't be handed back the same
-    broken socket. Originally this only wrapped the body-read (resp.text),
-    on the theory that adafruit_requests' own internal "Repeated socket
-    failures" retry already covered connect/send. Found + fixed
-    2026-08-03: it doesn't cover it reliably enough in practice -- live
-    testing showed _poll_avr's connect/send call (the line that used to
-    sit outside this try) timing out (ETIMEDOUT) on nearly every poll,
-    every ~1s, indefinitely. That call raising means adafruit_requests
-    gave up internally without leaving the pool clean, so the exact same
-    broken socket got handed back to the very next poll -- a self-
-    perpetuating timeout loop, never recovering on its own. Now the
-    connect/send call is inside the same try/reset/retry as the body
-    read, so either failure mode gets the pool force-reset before a
-    retry."""
+    broken socket.
+
+    The connect/send call MUST stay inside this try, not just the body
+    read. Do not assume adafruit_requests' own internal "Repeated socket
+    failures" retry covers connect/send -- it does not do so reliably. When
+    that call raises, the library has given up without leaving the pool
+    clean, so the same broken socket goes straight to the next request: a
+    self-perpetuating ETIMEDOUT loop, once per poll, that never recovers on
+    its own."""
     attempt = 0
     while True:
         attempt += 1
@@ -205,19 +199,19 @@ def friendly_input(raw_name):
 
 # ---------------------------------------------------------------------------
 # Non-blocking status poll -- see docs/architecture.md's touch-drop
-# investigation (2026-08-03). app.py's main loop has no sleep and polls
-# touch every tick; a blocking status-poll request (the old _post_status()
-# via adafruit_requests) could freeze that loop for 1-3s on a slow/failed
-# request, and the FocalTouch controller has no queue, so any tap whose
-# entire gesture happened during that freeze was silently, permanently
-# lost. _AsyncRequest drives one HTTP/1.0 request/response over a raw,
-# non-blocking socket across many pump(now) calls instead, so the status
-# poll (the one call site that was actually measured causing these
-# freezes) never blocks the loop for more than a bounded slice.
+# investigation. app.py's main loop has no sleep and polls touch every tick;
+# a blocking request via adafruit_requests can freeze that loop for 1-3s on
+# a slow or failed request, and the FocalTouch controller has no queue, so
+# any tap whose whole gesture falls inside that freeze is silently and
+# permanently lost. _AsyncRequest drives one HTTP/1.0 request/response over
+# a raw non-blocking socket across many pump(now) calls, so nothing on the
+# hot path blocks the loop for more than a bounded slice.
 #
-# Control commands (_send(), set_input(), the boot-time loaders below)
-# deliberately still use the blocking _session/_request_text() path --
-# out of scope for this pass, see the plan this was built from.
+# The boot-time loaders (load_input_names, load_source_list, get_presets,
+# get_preset_enabled) still use the blocking _session/_request_text() path
+# on purpose: they run before the main loop exists, so there is no loop for
+# them to stall. Anything reachable from a tap or the encoder must use the
+# async engine -- see the control-command section further down.
 # ---------------------------------------------------------------------------
 
 _PHASE_SENDING   = 0
@@ -261,15 +255,15 @@ def _is_eagain(e):
 def _is_enotconn(e):
     """True if e is ENOTCONN. errno 128 confirmed against real hardware.
 
-    Found 2026-08-03, live: this build's recv_into(), in fully non-
-    blocking mode (timeout_ms==0), does NOT return 0 for a graceful peer
-    close the way a normal socket would -- reading CircuitPython's
-    socketpool_socket_recv_into() (Socket.c) shows that when lwip_recv()
-    returns 0 with timeout_ms==0, it's deliberately remapped to a raised
-    OSError(ENOTCONN) instead. Every response here ends with the peer
-    closing (we send "Connection: close"), so this is the normal,
-    expected end-of-response signal on this build, not a failure -- see
-    _AsyncRequest.pump()."""
+    Platform quirk, not a failure: this build's recv_into() in fully
+    non-blocking mode (timeout_ms==0) does NOT return 0 for a graceful
+    peer close the way a normal socket would. CircuitPython's
+    socketpool_socket_recv_into() (Socket.c) deliberately remaps
+    lwip_recv() returning 0 at timeout_ms==0 into a raised
+    OSError(ENOTCONN). Since every request here sends "Connection: close",
+    that is how each response normally ends -- see _AsyncRequest.pump(),
+    which treats it as success while receiving and as a real failure while
+    sending."""
     return len(e.args) > 0 and e.args[0] == _ENOTCONN
 
 
@@ -415,14 +409,11 @@ def pump_status_poll(now):
     if _poll_op.phase == _PHASE_DONE:
         result = _poll_op.result
         _poll_op = None
-        # Found 2026-08-03, live: gc.collect() here (originally added to
-        # reclaim the discarded buffer promptly) is itself a 400-700ms
-        # synchronous cost on this heap -- exactly the kind of main-loop
-        # stall this whole engine exists to eliminate. Removed; this
-        # restores the exact cadence the blocking design already shipped
-        # with (_poll_avr's existing gc.collect() before each poll
-        # kickoff, and nothing after) rather than adding a second point
-        # of collection that turned out not to be free.
+        # Do NOT add a gc.collect() here to reclaim the discarded buffer.
+        # Measured at 400-700ms synchronous on this heap -- exactly the kind
+        # of main-loop stall this whole engine exists to eliminate.
+        # _poll_avr already collects before each poll kickoff, which is the
+        # cheap moment to do it.
         try:
             status = _parse_status_xml(result)
         except Exception as e:
@@ -457,9 +448,9 @@ def pump_status_poll(now):
 #     case already covered elsewhere.
 #   - No queue. If a new command is kicked off while one is still in flight,
 #     the old one is dropped (socket closed) in favor of the new one --
-#     latest call always wins, same principle _send_volume_debounced already
-#     applies by collapsing every intermediate encoder tick into just the
-#     one final debounced value rather than sending each tick.
+#     latest call always wins, the same principle _send_volume_debounced
+#     applies by collapsing every intermediate encoder tick into one final
+#     debounced value rather than sending each tick.
 # ---------------------------------------------------------------------------
 
 _cmd_op = None
@@ -566,14 +557,13 @@ def _post_status():
 def _send(path):
     """HTTP GET for control commands where the response body is not needed.
 
-    Found 2026-08-03: this used to call _session.get() directly, bypassing
-    _request_text()'s retry/pool-reset -- every control command (volume,
-    mute, power, preset/Dirac select) could hang on the same broken-pooled-
-    socket bug _post_status() was just fixed for, with nothing to recover
-    it. Routed through _request_text() so it gets the same protection; the
+    Goes through _request_text(), never _session.get() directly -- a bare
+    session call skips the retry/pool-reset and leaves every control
+    command (volume, mute, power, preset/Dirac select) able to hang on the
+    same broken-pooled-socket failure with nothing to recover it. The
     response body is fetched and discarded rather than skipped, since
-    _request_text() needs it to detect a body-read failure at all -- for
-    these tiny control-command responses that cost is negligible."""
+    _request_text() needs it to detect a body-read failure at all; for
+    these tiny responses that cost is negligible."""
     url = _BASE + path
     _request_text("get", url, timeout=_TIMEOUT)
 
@@ -612,10 +602,9 @@ def _nth_cmd_block(xml, n):
 
 def _parse_status_xml(xml):
     """Parse an AppCommand.xml status response into the driver contract's
-    status dict. Shared by the blocking get_status() and the non-blocking
-    pump_status_poll() (see above) so the 2026-08-01 "raise on unparseable
-    power instead of smoothing into STANDBY" fix below can't drift between
-    two copies.
+    status dict. Deliberately shared by the blocking get_status() and the
+    non-blocking pump_status_poll() so the power-parse rule below can't
+    drift between two copies.
 
     Returns a dict:
         {
@@ -642,20 +631,15 @@ def _parse_status_xml(xml):
 
     volume_db = float(raw_volume) if raw_volume is not None else -80.0
     muted     = raw_mute.strip().lower() == "on"
-    # Found + fixed 2026-08-01: this used to be `raw_power or "STANDBY"`,
-    # then "STANDBY" again if the result wasn't "ON"/"OFF" -- silently
-    # converting ANY unparseable power reading (missing <zone1> tag, a
-    # truncated/malformed response) into a real, definite-looking
-    # "STANDBY" rather than treating it as the parse failure it actually
-    # is. Boot is this codebase's most heap-fragmented, most
-    # truncation-prone moment (see docs/architecture.md's boot-memory
-    # guardrails) -- exactly where a short/partial read is most likely,
-    # and exactly what was producing a real, reproducible "power off
-    # screen flashes at boot, then corrects itself" bug once app.py
-    # rendered from this fabricated value before a clean poll landed.
-    # Raising here instead routes a genuine parse failure through the
-    # same retry/error-count path _poll_now() already has for network
-    # errors, rather than smoothing it into a wrong-but-plausible answer.
+    # RAISE on an unparseable power value -- never default it to "STANDBY".
+    # A missing <zone1> tag or a truncated response is a parse failure, and
+    # smoothing it into a definite-looking "STANDBY" produces a real
+    # "power-off screen flashes at boot, then corrects itself" bug: boot is
+    # this codebase's most heap-fragmented, most truncation-prone moment
+    # (see docs/architecture.md's boot-memory guardrails), so that is
+    # exactly where a short read lands, and app.py renders from whatever
+    # this returns before a clean poll arrives. Raising routes it through
+    # the same retry/error-count path as any network error instead.
     power = (raw_power or "").strip().upper()
     if power not in ("ON", "OFF"):
         raise RuntimeError(
@@ -671,18 +655,16 @@ def _parse_status_xml(xml):
 
 def get_status():
     """Poll the AVR for current state (Main Zone only), via the blocking
-    adafruit_requests session. Not used by app.py's background poll any
-    more (see pump_status_poll() above) -- kept for any caller that wants
-    a synchronous read. Raises OSError on network failure."""
+    adafruit_requests session. Raises OSError on network failure.
+
+    Required by the driver contract (driver.py binds it unconditionally),
+    but app.py routes denon's own background poll through the non-blocking
+    engine above instead -- so on a denon build nothing actually calls
+    this. It stays because the contract is the contract: a backend that
+    only half-implements it is a trap for the next one written against it.
+    Same applies to the blocking set_volume/mute/power/preset calls below.
+    """
     return _parse_status_xml(_post_status())
-
-
-def volume_up():
-    _send("/goform/formiPhoneAppDirect.xml?MVUP")
-
-
-def volume_down():
-    _send("/goform/formiPhoneAppDirect.xml?MVDOWN")
 
 
 def set_volume(db):
@@ -814,7 +796,7 @@ def set_input(index):
 #   ajax Value for the same filter. This matches how the denonavr library
 #   (python-denonavr, used by Home Assistant) controls Dirac Live.
 #   Confirmed working, but the AVR takes several seconds (~5s observed) to
-#   actually apply a Dirac change -- code.py updates state optimistically
+#   actually apply a Dirac change -- app.py updates state optimistically
 #   rather than re-querying right after a set, same as volume/mute.
 #
 # get_presets()/set_preset() hide the Off value entirely and deal only in

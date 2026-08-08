@@ -6,7 +6,8 @@ CIRCUP   := ./.venv/bin/circup
 # Inter-4.1 is a local, gitignored download (not shipped) -- grab v4.1 from
 # https://github.com/rsms/inter/releases and extract it to local/Inter-4.1.
 FONT_TTF  := local/Inter-4.1/extras/ttf/Inter-Medium.ttf
-FONT_SIZES := 20 24 28 32 36 40
+# Exactly the three sizes dial_ui.py loads (_F_LG/_F_MD/_F_SM).
+FONT_SIZES := 20 24 36
 
 # Bootstrap: set up the host venv with all dev tools (run once after clone).
 # Requires Python 3.11+ and an existing .venv (python -m venv .venv).
@@ -38,14 +39,15 @@ full-deploy: install-libs deploy
 # source; see its own header comment). Not just a flash-space optimization:
 # CircuitPython compiles a module's entire bytecode before running any of
 # it, so plain .py costs real heap at boot whether or not most of it has
-# run yet -- this used to be two separate targets (`deploy` for fast plain-
-# .py iteration, `deploy-mpy` for the real thing) until plain `deploy` got
-# run out of habit, silently regressing the device back into exactly the
+# run yet, and a device left running plain source sits in exactly the
 # low-headroom state that caused a real WiFi-boot failure investigation
-# (see "CircuitPython heap/boot-memory guardrails" in CLAUDE.md). Requires
-# $(MPY_CROSS) -- see its comment below if missing; compiling locally is
-# fast (milliseconds/file) so this isn't meaningfully slower than the old
-# plain-.py path was.
+# (see "CircuitPython heap/boot-memory guardrails" in CLAUDE.md).
+#
+# Note the naming trap: `deploy` is the .mpy one and `deploy-src` is the
+# plain-.py one, which is the opposite of what "src" suggests to most
+# people. Requires $(MPY_CROSS) -- see its comment below if missing;
+# compiling locally is milliseconds per file, so this is not the slow path.
+
 # Every copy target needs the drive mounted. Without this the first cp just
 # fails with a bare "No such file or directory", which is genuinely confusing
 # when the usual cause is that you ran `make usb-drive-off` -- the one thing
@@ -96,11 +98,17 @@ deploy-src: _require-drive _copy-files
 MPY_CROSS := local/mpy-cross
 
 # Every module precompiled to .mpy by `deploy` -- everything except
-# code.py, which CircuitPython requires as uncompiled source (it's the boot
-# entry point, see code.py's own header comment). `.mpy` is more compact
-# than what the runtime compiler produces from `.py` source AND skips
-# paying that compile-time cost at all -- see CLAUDE.md's "CircuitPython
-# heap/boot-memory guardrails" for why that's not just a flash-space nicety.
+# code.py and boot.py, which CircuitPython requires as uncompiled source
+# (see each file's own header comment). `.mpy` is more compact than what
+# the runtime compiler produces from `.py` source AND skips paying that
+# compile-time cost at all -- see CLAUDE.md's "CircuitPython heap/boot-
+# memory guardrails" for why that's not just a flash-space nicety.
+#
+# This list is one of three that must agree: the other two are
+# tools/build_release_manifest.py's _MPY_MODULES and the compile step in
+# .github/workflows/release.yml. A module here but missing there still
+# deploys fine over USB and simply stops being OTA-updatable, with no
+# error anywhere -- see release.yml's header for what that cost once.
 MPY_MODULES := config driver denon minidsp camilladsp ha ha_ui wiim wiim_ui state dial_ui sound app ota ota_boot version
 
 _copy-code-mpy:
@@ -126,7 +134,6 @@ _copy-code-mpy:
 _copy-files-mpy: _copy-code-mpy
 	cp src/splash_logo.bmp $(CIRCUITPY)/splash_logo.bmp
 	mkdir -p $(CIRCUITPY)/fonts
-	cp src/fonts/FreeMonoBold_36.pcf $(CIRCUITPY)/fonts/FreeMonoBold_36.pcf
 	@for s in $(FONT_SIZES); do \
 	  cp src/fonts/Inter_Medium_$${s}.pcf $(CIRCUITPY)/fonts/ && \
 	  echo "  copied Inter_Medium_$${s}.pcf"; \
@@ -149,11 +156,12 @@ _copy-files-mpy: _copy-code-mpy
 # WIFI_REASON_AUTH_EXPIRE, misleading since the real cause was upstream
 # memory pressure, not anything WiFi-specific) and cost a long real
 # debugging session to trace back to this. See project-context.md for the
-# full incident writeup. Both play and pause glyphs are plain ASCII now
-# ("|>" and "II") specifically to never hit this again -- if a Unicode
-# icon glyph is ever truly necessary, use otf2bdf's `-m mapfile` to
-# re-encode it onto a codepoint adjacent to the existing range instead of
-# just adding its real (possibly far-away) codepoint to `-l`.
+# full incident writeup. The play/pause indicator sidesteps the question
+# entirely -- it is drawn as vectorio shapes, with no glyph involved (see
+# dial_ui.py's _build_icon). If a Unicode icon glyph is ever truly
+# necessary, use otf2bdf's `-m mapfile` to re-encode it onto a codepoint
+# adjacent to the existing range instead of just adding its real (possibly
+# far-away) codepoint to `-l`.
 
 # splash: (re)generate the splash screen BMP from ui/hobbysprawl.png.
 # Requires: pip install pillow
@@ -189,13 +197,13 @@ ui-renders:
 	  $(PYTHON) tools/render_ui_screenshots.py --backend denon
 	DEVICE_DRIVER=minidsp VOLUME_MIN=-50.0 VOLUME_MAX=0.0 \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend minidsp
-	DEVICE_DRIVER=wiim WIIM_PRESET_COUNT=3 WIIM_PRESET_NAMES="Bass +8,Preset 1,Preset 2" \
+	DEVICE_DRIVER=wiim WIIM_PRESET_NAMES="Bass +8,Night,Vocal" \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend wiim
 	DEVICE_DRIVER=camilladsp \
 	  CAMILLADSP_PRESETS="Flat:/path/to/flat.yml,Quiet:/path/to/quiet.yml,Muffled:/path/to/muffled.yml" \
 	  CAMILLADSP_QUICK_PRESETS="Flat,Quiet,Muffled" \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend camilladsp
-	DEVICE_DRIVER=ha VOLUME_MIN=0.0 VOLUME_MAX=100.0 HA_MEDIA_CONTROLS=true \
+	DEVICE_DRIVER=ha VOLUME_MIN=0.0 VOLUME_MAX=100.0 \
 	  $(PYTHON) tools/render_ui_screenshots.py --backend ha
 	$(PYTHON) tools/render_ui_grid.py
 
@@ -234,7 +242,6 @@ _copy-files:
 	cp src/boot.py     $(CIRCUITPY)/boot.py
 	cp src/splash_logo.bmp $(CIRCUITPY)/splash_logo.bmp
 	mkdir -p $(CIRCUITPY)/fonts
-	cp src/fonts/FreeMonoBold_36.pcf $(CIRCUITPY)/fonts/FreeMonoBold_36.pcf
 	@for s in $(FONT_SIZES); do \
 	  cp src/fonts/Inter_Medium_$${s}.pcf $(CIRCUITPY)/fonts/ && \
 	  echo "  copied Inter_Medium_$${s}.pcf"; \
@@ -428,4 +435,4 @@ network-stress:
 chaos-stress:
 	$(PYTHON) -m mpremote connect auto run tools/chaos_stress_check.py
 
-.PHONY: _require-drive usb-drive-on usb-drive-off bootstrap install-libs full-deploy deploy deploy-src _copy-files _copy-files-mpy ls shell probe avr-health dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression network-stress chaos-stress renders ui-renders
+.PHONY: _require-drive usb-drive-on usb-drive-off bootstrap install-libs full-deploy deploy deploy-code deploy-src fonts splash _copy-code-mpy _copy-files _copy-files-mpy ls shell probe avr-health dump-avr probe-minidsp probe-ha probe-wiim probe-camilladsp probe-ota build-manifest probe-ota-regression network-stress chaos-stress renders ui-renders

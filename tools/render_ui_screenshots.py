@@ -88,14 +88,18 @@ def _fixture_wiim():
     # state.preset stays "" always (see wiim.py's get_presets()) -- so the
     # realistic fixture is CAPS["presets"] True with nothing selected,
     # rendering wiim_ui.py's literal "(Set Preset)" placeholder, not a named
-    # slot. Needs WIIM_PRESET_COUNT/WIIM_PRESET_NAMES actually set in the
+    # slot. Needs WIIM_PRESET_NAMES/WIIM_PRESET_BUTTONS actually set in the
     # environment (see the Makefile line) for CAPS["presets"] to be True at
     # all -- same "CAPS is config-derived at import time, state alone can't
     # fake it" gotcha as camilladsp's quick-button row, see CLAUDE.md.
-    state.preset_names = state.preset_quick_names = list(
-        zip((str(i) for i in range(1, len(config.WIIM_PRESET_NAMES) + 1)),
-            config.WIIM_PRESET_NAMES)
-    )
+    #
+    # Taken from the driver rather than rebuilt here, because the quick list
+    # is a configured *subset* of the full one (WIIM_PRESET_BUTTONS) -- a
+    # hand-assembled fixture that set both to the same list would render a
+    # button row this backend never actually draws.
+    import driver as _driver
+    _, state.preset_names = _driver.get_presets()
+    state.preset_quick_names = _driver.get_quick_presets()
     state.preset_enabled = True
     state.volume_db = 65        # native 0-100 percent range
     return state
@@ -180,6 +184,16 @@ def main():
         )
 
     state = _FIXTURES[args.backend]()
+    # Set here rather than in each _fixture_*, so a new fixture can't forget
+    # it. draw_main() refuses to render device state it hasn't actually heard
+    # from the device and falls back to draw_reconnecting() (see
+    # state.AVRState.power_known); the fixtures build AVRState() directly
+    # instead of going through dial_sim._base_state(), which is where that
+    # flag normally gets set. Missing this silently rendered "lost connection"
+    # for EVERY backend from 2026-08-05 (when power_known landed) until
+    # 2026-08-06 -- the failure looks like a plausible screen, not a crash,
+    # and nothing here re-runs on its own, so it sat in ui/ unnoticed.
+    state.power_known = True
     ui = dial_sim.dial_ui.init()
     dial_sim.dial_ui.draw_main(ui, state)
     # README's filename is "ui-homeassistant.png", not "ui-ha.png" -- the

@@ -115,11 +115,17 @@ WiFi and sockets use built-in CircuitPython modules: `wifi`, `socketpool`.
 - **Never** use `busio.I2C(board.SCL, board.SDA)` -- causes "pins already in use" errors
 - If init fails with "No I2C device": power-cycle the device (stale I2C lock from REPL session)
 
-### Font
+### Fonts
 
-`src/fonts/FreeMonoBold_36.pcf` -- extracted from the official Adafruit circuitpython-fonts
-release bundle. Monospaced so volume digits never shift width. Deployed to
-`/CIRCUITPY/fonts/FreeMonoBold_36.pcf` by `make deploy`.
+Three Inter Medium PCF bitmaps -- `Inter_Medium_20/24/36.pcf` -- generated from the TTF by
+`make fonts` and deployed to `/CIRCUITPY/fonts/` by `make deploy`. `dial_ui.py` loads them as
+`_F_SM`/`_F_MD`/`_F_LG`; only the volume digits are pre-cached, everything else loads lazily from
+flash to keep boot-time heap free for the WiFi stack.
+
+The Makefile's `FONT_SIZES` must stay exactly the set `dial_ui.py` loads. Generating a size
+nothing opens is dead flash on the device, and the character set is capped at printable ASCII
+32-126 for a reason -- see the `fonts` target's own comment, which documents a real production
+WiFi outage caused by one out-of-range codepoint tripling every font's size.
 
 ## Hardware Bring-Up Notes
 

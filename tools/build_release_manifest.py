@@ -1,8 +1,8 @@
 """
 build_release_manifest.py -- build a deloop OTA release manifest.json from
-a directory of already-built app files: the exact set `make deploy`/
-`deploy-mpy` ships (precompiled .mpy for everything in the Makefile's
-MPY_MODULES, plus code.py, which stays uncompiled).
+a directory of already-built app files: the exact set `make deploy` ships
+(precompiled .mpy for everything in the Makefile's MPY_MODULES, plus
+code.py and boot.py, which stay uncompiled).
 
 Run locally against local/build/ (whatever `make deploy` last compiled
 there) via `make build-manifest`, or in CI (.github/workflows/release.yml)
@@ -26,14 +26,18 @@ import json
 import os
 import sys
 
-# Kept in sync by hand with Makefile's MPY_MODULES.
+# Kept in sync by hand with Makefile's MPY_MODULES and release.yml's
+# compile step -- see release.yml's header for why a module missing from
+# one of the three lists fails silently rather than loudly.
 _MPY_MODULES = [
     "config", "driver", "denon", "minidsp", "camilladsp", "ha", "ha_ui",
-    "wiim", "wiim_ui", "state", "dial_ui", "sound", "app", "ota", "version",
+    "wiim", "wiim_ui", "state", "dial_ui", "sound", "app", "ota", "ota_boot",
+    "version",
 ]
-# Never .mpy-compiled -- code.py is CircuitPython's boot entry point,
-# required as plain source.
-_UNCOMPILED_FILES = ["code.py"]
+# Never .mpy-compiled -- CircuitPython requires both of these as plain
+# source: code.py is the boot entry point, boot.py runs earlier still
+# (before USB enumerates, which is what lets it hide the drive at all).
+_UNCOMPILED_FILES = ["code.py", "boot.py"]
 
 
 def _manifest_files(build_dir):
