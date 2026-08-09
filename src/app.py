@@ -1370,7 +1370,17 @@ def _handle_touch_released(loop, ui, state, now):
         _dispatch_tap(loop, ui, state, now)
         # Re-arm only after TAP_RELOCK_S. A tap that ends in a bounce would
         # otherwise start a fresh gesture on the very next frame.
-        loop.tap_relock_until = now + TAP_RELOCK_S
+        #
+        # Anchored to when _dispatch_tap actually returned, not to `now`.
+        # `now` is sampled before the dispatch, and a tap can dispatch a
+        # blocking device write -- a MiniDSP preset switch is a full DSP
+        # reconfiguration, measured ~4s -- which outlasts TAP_RELOCK_S many
+        # times over. Using `now` there left the lockout already expired on
+        # return, so a finger still on the glass after the write started a
+        # fresh gesture and dispatched the very same preset a second time
+        # (confirmed live on MiniDSP 2026-08-08: correct switch, then an
+        # immediate identical one the moment the first completed).
+        loop.tap_relock_until = time.monotonic() + TAP_RELOCK_S
 
     loop.touch_start       = 0.0
     loop.touch_up_at       = 0.0
