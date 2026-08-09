@@ -318,6 +318,183 @@ def _connect_wifi(ui):
         print("wifi lease print failed:", e)
 
 
+def _build_transport():
+    """Build the socket pool + HTTP session and wire up the active backend's
+    transport. Returns (pool, session).
+
+    Call this again in full after any radio reset. Cycling the radio invalidates
+    every socket bound to the old pool, and the wiim/camilladsp/denon transports
+    below hold their own reference to it -- rebuilding only the shared Session
+    would leave those backends pointing at a dead pool."""
+    pool = socketpool.SocketPool(wifi.radio)
+    session = adafruit_requests.Session(pool)
+    if config.DEVICE_DRIVER == "wiim":
+        # WiiM's httpapi.asp is HTTPS-only with a self-signed cert whose CN
+        # (www.linkplay.com) never matches WIIM_HOST (an IP) -- and
+        # adafruit_requests has no way to use a different SNI/verification
+        # hostname than the request URL's literal host, so wiim.py can't use
+        # the shared Session above at all. It gets its own raw-socket
+        # transport instead, wired up directly here rather than through the
+        # generic driver.init(session) contract -- see wiim.py's module
+        # docstring for the full story (confirmed live on real hardware).
+        # Imported here, not at module level, so a denon/minidsp/ha build
+        # never pays to import or compile either module (see the heap/boot-
+        # memory guardrails in .claude/CLAUDE.md).
+        import ssl
+        import wiim
+        ssl_context = ssl.create_default_context()
+        ssl_context.load_verify_locations(cadata=wiim.LINKPLAY_CA_PEM)
+        wiim.init_transport(pool, ssl_context)
+    elif config.DEVICE_DRIVER == "camilladsp":
+        # CamillaDSP's control protocol is WebSocket-only -- adafruit_requests
+        # doesn't speak that at all, so this backend needs the raw socket pool
+        # directly, same reason (different protocol) as wiim.py above. No TLS
+        # here (plain ws://), so no ssl_context needed. See camilladsp.py's
+        # module docstring for the transport details -- confirmed working on
+        # real hardware, same as wiim's.
+        import camilladsp
+        camilladsp.init_transport(pool)
+    elif config.DEVICE_DRIVER == "denon":
+        # Unlike wiim/camilladsp above, denon.py does NOT replace the
+        # shared session -- control commands and boot-time loaders still
+        # go through it via the normal driver.init(session) contract
+        # below. Only the background status poll (the one call site
+        # confirmed to freeze the touch-polling main loop for 1-3s on a
+        # slow/failed request) gets its own raw, non-blocking socket path
+        # -- see denon.py's "Non-blocking status poll" section.
+        global _denon
+        import denon as _denon
+        _denon.init_transport(pool)
+    return pool, session
+
+
+def _net_diag(tag):
+    """One-line dump of radio/lease state plus a gateway ping.
+
+    Runs on every boot, healthy or not, and must keep doing so -- it is part of
+    the sequence measured at 0/12 wedges, and the gc.collect() and ping below
+    may be doing real work rather than just reporting. Read the gateway ping
+    with care, though: on 2026-08-08 a wedged device answered ICMP to both the
+    gateway and the target in 3-4ms while every TCP connection to that same
+    target timed out, so a healthy ping here is NOT evidence the stack works --
+    the probe result is the number that counts."""
+    try:
+        ap = wifi.radio.ap_info
+    except Exception:
+        ap = None
+    # gc.collect() before ping(): it raises MemoryError on a tight heap, and
+    # boot is this codebase's most fragmented moment.
+    gc.collect()
+    try:
+        gw = wifi.radio.ipv4_gateway
+        rtt = wifi.radio.ping(gw, timeout=1.0) if gw is not None else None
+        ping = ("%.0fms" % (rtt * 1000)) if rtt is not None else "NO REPLY"
+    except Exception as e:
+        ping = "ERR %s" % (e,)
+    print("netdiag[%s] ip=%s gw=%s dns=%s bssid=%s rssi=%s ch=%s pm=%r"
+          " gwping=%s freemem=%d" % (
+              tag, wifi.radio.ipv4_address, wifi.radio.ipv4_gateway,
+              wifi.radio.ipv4_dns,
+              "".join("%02x" % b for b in ap.bssid) if ap is not None else "?",
+              ap.rssi if ap is not None else "?",
+              ap.channel if ap is not None else "?",
+              wifi.radio.power_management, ping, gc.mem_free()))
+
+
+def _probe_net():
+    """One real fetch through deloop's own libraries. Returns (ok, err).
+
+    driver.get_status() deliberately: it is backend-agnostic and it is the exact
+    call whose failure produces the lost-connection screen. Not a raw socket --
+    that exercises a different code path and can only ever be a comparison
+    between methods, never a test of whether deloop's networking works."""
+    try:
+        driver.get_status()
+        return True, None
+    except Exception as e:
+        return False, e
+
+
+# Errno values that mean the peer answered us, so the local network stack is
+# demonstrably working and cycling the radio would be pointless. ECONNRESET
+# came up live on minidsp when its host was down: the check treated it as a
+# wedge, spent 4.7s resetting the radio, and reported failure for a fault that
+# was never ours.
+_PEER_ANSWERED = (104, 111)   # ECONNRESET, ECONNREFUSED
+
+
+def _boot_network_check(ui, pool, session):
+    """Prove the network works before the boot fetches, and recover it if not.
+
+    Returns the (pool, session) to carry on with: the radio reset rebuilds both,
+    so the caller must take these back rather than keep its own.
+
+    Cold power-ons intermittently associate, take a *correct* DHCP lease, and
+    then fail every request permanently until power is physically cut -- a soft
+    reset does not clear it. Measured on real hardware 2026-08-08, same location
+    and same BSSID throughout, classifying each cold boot by whether the status
+    poll survived:
+
+        no check at all               3/6 cold boots wedged
+        this check                    0/12 wedged
+        a 1.5s settle delay alone     still wedged
+
+    Two things follow, and both are easy to get backwards. A delay is not what
+    helps -- issuing an early request is, so this has to make a real request
+    ahead of the boot fetches rather than just sleeping. And the radio reset
+    below has fired exactly once in testing, on a false positive, so it is
+    still an untested recovery; it earns its place only because the device
+    otherwise has none, and once wedged nothing ever re-associates.
+
+    None of this is a root cause. Why an early throwaway request should matter
+    is still open."""
+    # Exactly one probe, then _net_diag() unconditionally. This whole sequence
+    # -- including the gc.collect() and gateway ping _net_diag() does on a
+    # perfectly healthy boot -- is what measured 0/12. Which part of it matters
+    # is not known, so do not make any of it conditional on the probe failing,
+    # and do not add retries: three probes instead of one delays boot past the
+    # brightness being applied when the network is bad.
+    ok, err = _probe_net()
+    _net_diag("boot")
+    if ok:
+        print("netcheck: ok")
+        return pool, session
+
+    print("netcheck: probe failed: %r" % (err,))
+    if isinstance(err, OSError) and err.args and err.args[0] in _PEER_ANSWERED:
+        print("netcheck: peer answered -- our stack is fine, not resetting radio")
+        return pool, session
+
+    print("netcheck: cycling radio")
+    try:
+        dial_ui.draw_status(ui, "Network...")
+    except Exception:
+        pass
+    t0 = time.monotonic()
+    try:
+        wifi.radio.enabled = False
+        time.sleep(1.0)
+        wifi.radio.enabled = True
+        try:
+            wifi.radio.power_management = wifi.PowerManagement.NONE
+        except Exception as e:
+            print("netcheck: power_management NONE failed:", e)
+        wifi.radio.connect(config.WIFI_SSID, config.WIFI_PASS)
+    except Exception as e:
+        # Never let recovery brick the boot: the caller still has a working UI,
+        # and the main loop's own retry paths get their chance either way.
+        print("netcheck: radio reset FAILED %r" % (e,))
+        return pool, session
+    print("netcheck: radio reset + reconnect took %.1fs" % (time.monotonic() - t0))
+
+    pool, session = _build_transport()
+    driver.init(session)
+    _net_diag("after-reset")
+    ok, err = _probe_net()
+    print("netcheck: %s" % ("RECOVERED" if ok else "STILL WEDGED after reset (%r)" % (err,)))
+    return pool, session
+
+
 def _top_menu_entries():
     """(sub_type, label) pairs for the top-level menu, filtered by what the
     active driver actually supports -- see driver.CAPS / driver.LABELS.
@@ -1832,46 +2009,13 @@ def main():
                 pass
 
     # --- HTTP session (device backend selected by config.DEVICE_DRIVER) ---
-    pool = socketpool.SocketPool(wifi.radio)
-    session = adafruit_requests.Session(pool)
-    if config.DEVICE_DRIVER == "wiim":
-        # WiiM's httpapi.asp is HTTPS-only with a self-signed cert whose CN
-        # (www.linkplay.com) never matches WIIM_HOST (an IP) -- and
-        # adafruit_requests has no way to use a different SNI/verification
-        # hostname than the request URL's literal host, so wiim.py can't use
-        # the shared Session above at all. It gets its own raw-socket
-        # transport instead, wired up directly here rather than through the
-        # generic driver.init(session) contract -- see wiim.py's module
-        # docstring for the full story (confirmed live on real hardware).
-        # Imported here, not at module level, so a denon/minidsp/ha build
-        # never pays to import or compile either module (see the heap/boot-
-        # memory guardrails in .claude/CLAUDE.md).
-        import ssl
-        import wiim
-        ssl_context = ssl.create_default_context()
-        ssl_context.load_verify_locations(cadata=wiim.LINKPLAY_CA_PEM)
-        wiim.init_transport(pool, ssl_context)
-    elif config.DEVICE_DRIVER == "camilladsp":
-        # CamillaDSP's control protocol is WebSocket-only -- adafruit_requests
-        # doesn't speak that at all, so this backend needs the raw socket pool
-        # directly, same reason (different protocol) as wiim.py above. No TLS
-        # here (plain ws://), so no ssl_context needed. See camilladsp.py's
-        # module docstring for the transport details -- confirmed working on
-        # real hardware, same as wiim's.
-        import camilladsp
-        camilladsp.init_transport(pool)
-    elif config.DEVICE_DRIVER == "denon":
-        # Unlike wiim/camilladsp above, denon.py does NOT replace the
-        # shared session -- control commands and boot-time loaders still
-        # go through it via the normal driver.init(session) contract
-        # below. Only the background status poll (the one call site
-        # confirmed to freeze the touch-polling main loop for 1-3s on a
-        # slow/failed request) gets its own raw, non-blocking socket path
-        # -- see denon.py's "Non-blocking status poll" section.
-        global _denon
-        import denon as _denon
-        _denon.init_transport(pool)
+    pool, session = _build_transport()
     driver.init(session)
+
+    # Prove the network works before the boot fetches below, and recover it if
+    # it doesn't. Must stay ahead of them: the early request is what keeps cold
+    # boots off the permanent-wedge path -- see _boot_network_check().
+    pool, session = _boot_network_check(ui, pool, session)
 
     # Fetch input friendly names and source list (for menu) once at boot.
     # No-ops for drivers that don't support input selection (driver.CAPS).
