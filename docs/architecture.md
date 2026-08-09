@@ -36,8 +36,8 @@ into a 240x240 bitmap: 28,800 bytes of the displayio pool reclaimed, GC heap fre
 `draw_main` ~350ms -> ~92ms, and ~500 lines of raster primitives deleted. See
 [docs/rendering.md](rendering.md). That speedup unmasked three latent bugs -- two optimistic-write
 races and a touch double-dispatch -- all fixed. Separately, the long-running cold-boot networking
-failure stopped entirely once an overlapping AP was disabled; see the next-session prompt for why
-that does not contradict the earlier elimination.)
+failure stopped once an overlapping AP was disabled -- but it returned on 2026-08-08 elsewhere in
+the house, and is now mitigated in code by a network warm-up; see the next-session prompt.)
 
 Previously: 2026-08-03 (v2.5 -- self-update (OTA) now fetches from a flat S3 layout: deloop can
 pull app-file releases over Wi-Fi via a manual Update menu, live `storage.remount()` +
@@ -559,18 +559,43 @@ lasting rules that came out of it:
 
 ## Suggested Prompt For Next Session
 
-> **The cold-boot networking failure is considered RESOLVED (maintainer's call, 2026-08-06).** For
-> months, roughly half of power-ons (50-90% across sessions) associated to WiFi, took a *correct*
-> DHCP lease, and then failed every subsequent request permanently until power was cut. On
-> 2026-08-05 the user disabled a second, poorly-placed AP that overlapped the primary in the same
-> space. Every boot since has succeeded -- not one miss, across many power cycles and several full
-> OTA install cycles.
+> **The cold-boot networking failure returned on 2026-08-08 and is now mitigated in code, not
+> environmentally.** For months, roughly half of power-ons (50-90% across sessions) associated to
+> WiFi, took a *correct* DHCP lease, and then failed every subsequent request permanently until
+> power was cut. Disabling an overlapping AP on 2026-08-05 stopped it, and it was recorded here as
+> resolved. It came back in a different part of the house, where a different AP overlapped -- so
+> that fix removed the **trigger**, not the mechanism, exactly as `_connect_wifi`'s own comment
+> suspected.
 >
-> Treat it as closed, not as an active investigation. The material below is kept because the fault
-> was environmental rather than proven-and-patched, so if it ever returns this is the accumulated
-> evidence -- not because anything here is still owed work.
+> **What fixes it: making one real request through the active backend before the boot fetches**
+> (`_boot_network_check()` in `app.py`). Measured on hardware, same location and BSSID throughout,
+> each cold boot classified by whether the status poll survived:
 >
-> Read that carefully before concluding "it was the network, nothing to do with us," and before
+> | build | cold boots | wedged |
+> |---|---|---|
+> | no check at all | 6 | 3 |
+> | a 1.5s settle delay alone | 4 | 3 |
+> | with the check | 20 | **0** |
+>
+> Then **11/11 clean with the overlapping AP deliberately switched back on** -- the condition that
+> previously triggered the fault. That is the result that matters: earlier clean runs only showed
+> the device avoiding the trigger, this one shows it surviving the trigger.
+>
+> Two things follow and both are easy to get backwards. **A delay is not what helps** -- the
+> sleep-only build still wedged 3/4, so this has to issue a real request, not wait. And **why an
+> early throwaway request works is not known.** This is a mitigation, not a root cause. Hunting the
+> mechanism is still open and would be interesting; needing a network warm-up is an acceptable
+> answer in the meantime.
+>
+> Two measurement traps burned most of a session on 2026-08-08. **`mpremote` and the REPL reset the
+> radio** before anything you run (entering the REPL reports `connected=False, ip=None`), so every
+> "but it works from a test script" result was measured on a freshly re-initialised radio and the
+> apparent "app code vs test code" contrast was an artifact. And **a raw-socket probe tests a
+> different code path** than the app's `adafruit_requests` stack -- useful as a comparison between
+> methods, never as a test of whether deloop's networking works. Reproduce with the real libraries,
+> from a real cold boot, or you are measuring something else.
+>
+> Read the above carefully before concluding "it was the network, nothing to do with us," and before
 > concluding the opposite. Two things are true at once:
 >
 > - **This does not contradict the earlier "access-point choice" elimination.**
@@ -596,13 +621,29 @@ lasting rules that came out of it:
 > fault returns, they are the first thing anyone will want. Do not delete them as leftover debug.
 >
 > Still eliminated with evidence, do not re-open without new data: socket/pool exhaustion,
-> CircuitPython heap pressure, boot ordering, BSSID pinning, and display memory pressure on the
-> radio (measured directly -- see [docs/rendering.md](rendering.md)).
+> CircuitPython heap pressure, boot ordering, and display memory pressure on the radio (measured
+> directly -- see [docs/rendering.md](rendering.md)). Heap in particular was re-tested on
+> 2026-08-08 and points the other way: every passing configuration had *less* free memory than
+> every failing one.
 >
-> Note also that the device has **no network recovery at all**: once wedged, nothing ever
-> re-associates. Whatever the root cause turns out to be, a recovery path is worth having. A
-> gateway `ping()` cleanly distinguishes "our stack is broken" from "the target is switched off"
-> (remember `gc.collect()` first -- `ping()` raises `MemoryError` when the heap is tight).
+> **BSSID pinning is not eliminated -- it is unverified.** `tools/wifi_pin_check.py` confirms
+> pinning only by reading `ap_info.bssid` back after `connect(bssid=...)`, never checks both BSSIDs
+> were in range, and the maintainer's recollection is that pinning never actually worked. If it
+> didn't, that test never changed which AP it joined and its "the AP is not the variable" result
+> measured nothing. Re-establish that pinning works before relying on anything built on it.
+>
+> The device now has a recovery path -- `_boot_network_check()` cycles the radio and rebuilds the
+> transport when the probe fails -- but **it is untested**: across 20+ boots it fired exactly once,
+> on a false positive (a minidsp host that was down returned `ECONNRESET`, which now short-circuits
+> before the reset since a peer that answered proves our own stack works). Nothing has yet been
+> observed recovering from a real wedge, so do not treat that path as proven.
+>
+> Note also that a gateway `ping()` does **not** distinguish "our stack is broken" from "the target
+> is switched off", contrary to what this section used to advise. Measured 2026-08-08: a wedged
+> device answered ICMP to both the gateway and the target in 3-4ms while every TCP connection to
+> that same target timed out. `_net_diag()` still logs the ping because it is cheap context, but the
+> probe result is the only number that means anything. (Keep the `gc.collect()` before it --
+> `ping()` raises `MemoryError` when the heap is tight.)
 >
 > Read [docs/ota.md](ota.md) before touching `ota.py`/`ota_boot.py`'s Fetcher/session logic or
 > `app.py`'s Update-menu code. OTA is implemented and confirmed working end to end on real
