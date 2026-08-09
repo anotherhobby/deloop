@@ -288,7 +288,10 @@ def _connect_wifi(ui):
     if not config.WIFI_SSID:
         dial_ui.draw_error(ui, "No WiFi cfg")
         raise RuntimeError("WIFI_SSID not set in settings.toml")
-    dial_ui.draw_status(ui, "WiFi...")
+    # No progress screen here on purpose: the splash stays up until the gauge
+    # itself is ready, so boot reads splash -> gauge -> live with nothing
+    # flashing in between. draw_error() below still takes over when WiFi
+    # actually fails, which is the only case worth interrupting the splash for.
     try:
         wifi.radio.power_management = wifi.PowerManagement.NONE
     except Exception as e:
@@ -423,7 +426,7 @@ def _probe_net():
 _PEER_ANSWERED = (104, 111)   # ECONNRESET, ECONNREFUSED
 
 
-def _boot_network_check(ui, pool, session):
+def _boot_network_check(pool, session):
     """Prove the network works before the boot fetches, and recover it if not.
 
     Returns the (pool, session) to carry on with: the radio reset rebuilds both,
@@ -466,10 +469,6 @@ def _boot_network_check(ui, pool, session):
         return pool, session
 
     print("netcheck: cycling radio")
-    try:
-        dial_ui.draw_status(ui, "Network...")
-    except Exception:
-        pass
     t0 = time.monotonic()
     try:
         wifi.radio.enabled = False
@@ -1977,9 +1976,11 @@ def main():
     ui = dial_ui.init()
 
     # Enforce 2-second minimum splash display time
-    _remaining = 2.0 - (time.monotonic() - _splash_t)
-    if _remaining > 0.0:
-        time.sleep(_remaining)
+    # No minimum splash time. There used to be a 2s floor here, from when the
+    # splash was replaced by a progress screen the moment WiFi started; it now
+    # stays up until the gauge itself is live, which measured 7.1s on real
+    # hardware -- WiFi association and the boot fetches dominate, and the floor
+    # only ever padded the first 0.76s of work out to 2s.
 
     # dial_ui.init() just allocated the ~28KB gauge bitmap plus every label
     # object. Same insurance as the gc.collect() calls before each
@@ -2015,7 +2016,7 @@ def main():
     # Prove the network works before the boot fetches below, and recover it if
     # it doesn't. Must stay ahead of them: the early request is what keeps cold
     # boots off the permanent-wedge path -- see _boot_network_check().
-    pool, session = _boot_network_check(ui, pool, session)
+    pool, session = _boot_network_check(pool, session)
 
     # Fetch input friendly names and source list (for menu) once at boot.
     # No-ops for drivers that don't support input selection (driver.CAPS).
