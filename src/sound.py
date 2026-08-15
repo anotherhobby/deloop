@@ -41,18 +41,20 @@ def _chirp(phases):
 
 
 def click():
-    """Crisp tap sound – mute toggle, menu navigation, menu selection."""
+    """Crisp tap sound – mute toggle, menu navigation, menu selection.
+
+    Single short low tick, not a tone.
+    """
     _chirp([          # (frequency_hz, duration_ms, duty_cycle)
-        (1800, 3, 10000),
-        ( 800, 2, 16000),
-        ( 400, 2,  6000),
+        (500, 2, 1500),
     ])
 
 
 def click_heavy():
-    """Slightly heavier tap – power on / power off long-press confirmation."""
+    """Slightly heavier tap – power on / power off long-press confirmation.
+
+    Single short low tick, not a tone. Heavier duty cycle.
+    """
     _chirp([
-        (1800, 4, 24000),
-        (1200, 3, 12000),
-        ( 800, 2,  6000),
+        (500, 2, 30000),
     ])
