@@ -187,11 +187,37 @@ def load_input_names():
     _input_names = result
 
 
+# Display overrides applied on top of whatever name the AVR supplies. The AVR
+# calls its network input "HEOS Music" while the front panel shows the active
+# streaming sub-mode instead ("AirPlay", "Spotify", ...) -- so the two disagree
+# on screen even though both are correct. That sub-mode is not reachable from
+# the control API: confirmed live 2026-08-16 against an AVR-X4800H on firmware
+# 3.139.173 that during an AirPlay stream SI? returns SINET, the status XML
+# returns InputFuncSelect NET, GetNetAudioStatus returns an empty <rx>,
+# formNetAudio_StatusXml.xml is 403, and telnet NSE/NSA return nothing. (The
+# HEOS CLI on port 1255 does expose now-playing, but its sid for an AirPlay
+# stream is 1024 -- the same "Local Music" source a DLNA stream uses.) So show
+# the mode-neutral "Network" rather than picking one sub-mode's name.
+#
+# Keyed on the *display* name, not the raw code, because it has to apply to two
+# independent paths that share no raw value: friendly_input() below (raw NET,
+# via the rename table) and load_source_list()'s picker entries (port 11080,
+# which reports only an index and a name). Both say "HEOS Music" out of the box.
+_DISPLAY_OVERRIDE = {
+    "HEOS MUSIC": "Network",
+}
+
+
+def _display_name(name):
+    """Apply _DISPLAY_OVERRIDE to an AVR-supplied source name."""
+    return _DISPLAY_OVERRIDE.get(name.strip().upper(), name)
+
+
 def friendly_input(raw_name):
     """Return the user-visible name for a raw AVR source string."""
     if not raw_name:
         return ""
-    return _input_names.get(_norm_source(raw_name), raw_name)
+    return _display_name(_input_names.get(_norm_source(raw_name), raw_name))
 
 
 
@@ -757,7 +783,7 @@ def load_source_list():
         src_index = _attr(z1_block[src_start:tag_end + 1], "index")
         name = _tag(z1_block[src_start:src_end + 9], "Name")
         if src_index and name:
-            result.append((src_index.strip(), name.strip()))
+            result.append((src_index.strip(), _display_name(name.strip())))
         pos = src_end + 9
     _source_list = result
 
