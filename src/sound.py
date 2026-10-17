@@ -2,12 +2,14 @@
 #
 # The M5Dial exposes board.SPEAKER as a single GPIO driving a piezo element.
 # CircuitPython's audiopwmio is not available on ESP32-S3, so we use pwmio
-# with variable_frequency to generate a short, sharp chirp.
+# with variable_frequency to generate a short, sharp click.
 #
-# Each click is a short descending burst -- a few milliseconds per phase,
-# dropping in both frequency and duty cycle so it decays instead of ringing.
-# Tuned by ear on the real piezo; the numbers in click()/click_heavy() below
-# are the tuning, so change them there rather than describing them twice.
+# Each click is a single short pulse, only a cycle or two at its frequency
+# -- short enough that it reads as a mechanical tick rather than a tone.
+# click_heavy is the same pitch and length as click, just a heavier duty
+# cycle so it hits harder. Tuned by ear on the real piezo; the numbers in
+# click()/click_heavy() below are the tuning, so change them there rather
+# than describing them twice.
 #
 # Usage:
 #   import sound
@@ -41,18 +43,20 @@ def _chirp(phases):
 
 
 def click():
-    """Crisp tap sound – mute toggle, menu navigation, menu selection."""
+    """Crisp tap sound – mute toggle, menu navigation, menu selection.
+
+    Single short low tick, not a tone.
+    """
     _chirp([          # (frequency_hz, duration_ms, duty_cycle)
-        (1800, 3, 10000),
-        ( 800, 2, 16000),
-        ( 400, 2,  6000),
+        (500, 2, 1500),
     ])
 
 
 def click_heavy():
-    """Slightly heavier tap – power on / power off long-press confirmation."""
+    """Slightly heavier tap – power on / power off long-press confirmation.
+
+    Single short low tick, not a tone. Heavier duty cycle.
+    """
     _chirp([
-        (1800, 4, 24000),
-        (1200, 3, 12000),
-        ( 800, 2,  6000),
+        (500, 2, 30000),
     ])

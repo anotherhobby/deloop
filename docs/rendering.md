@@ -143,12 +143,12 @@ settle before the answer arrived.
 Audited and found **safe**: `preset`/`preset_enabled` (`apply_status()` never
 writes them) and `volume_db` (`_poll_avr` skips while the encoder is moving,
 and `recently_active` forces a 30s interval afterwards). `power` was already
-guarded by `_POWER_SETTLE_S`.
+guarded by `_POWER_SETTLE_MS`.
 
 Also fixed: `_handle_touch` treated any single untouched frame as a release, so
 one FocalTouch dropout mid-press dispatched two taps -- a mute button that
 toggled twice. Unreachable at ~3 iterations/sec; reachable once the loop
-actually samples at 60Hz. `TOUCH_RELEASE_S` debounce plus a `TAP_RELOCK_S`
+actually samples at 60Hz. `TOUCH_RELEASE_MS` debounce plus a `TAP_RELOCK_MS`
 lockout.
 
 **Assume there are more.** Every optimistic write is a candidate, and the

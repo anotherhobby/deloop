@@ -14,6 +14,9 @@ volume changes from outside the Dial.
   hardware. `grep` for them before shipping any backend/UI change.
 - **`dict.get(key, expr)` evaluates `expr` unconditionally**, even on a hit. Use
   `d.get(key) or fallback()`, never `d.get(key, expensive_or_unsafe_call())`.
+- **Never time anything with `time.monotonic()`** -- it's a 30-bit float whose resolution decays
+  with uptime (~250ms after a week), which silently broke touch after days of uptime. Use
+  `app.py`'s int-ms `_now_ms()`. See [docs/architecture.md](../docs/architecture.md)'s "Clock".
 - **Treat non-ASCII in string literals as unsafe** -- CircuitPython can crash on it. Use `chr(N)`,
   never a literal Unicode character or a `\u` escape in source.
 - **Every `adafruit_requests` response must be `.close()`'d** -- the socket pool is only ~4 deep.

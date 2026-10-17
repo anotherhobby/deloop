@@ -11,8 +11,8 @@
 #   draw_main(ui, state)
 #   draw_busy(ui, state)                static all-gray "please wait" frame
 #   draw_volume(ui, state)              fast path – encoder ticks
-#   pulse_mute(ui, elapsed_s)           mute "breathing" animation, per tick
-#   mute_pulse_at_trough(elapsed_s)     phase test, no render -- call before pulse_mute
+#   pulse_mute(ui, elapsed_ms)          mute "breathing" animation, per tick
+#   mute_pulse_at_trough(elapsed_ms)    phase test, no render -- call before pulse_mute
 #   fade_power_off(ui, elapsed_s, from_brightness, state)   one-shot power-off ease
 #   draw_status(ui, msg)               startup / progress
 #   draw_error(ui, msg)
@@ -213,7 +213,7 @@ _C_BTN_SEL = 0xA7A7A7   # preset quick-select button, selected: midpoint of _C_D
 # any slow work (e.g. an AVR poll): the animation is barely moving there
 # regardless, so a brief stall blends into the ease instead of reading as
 # a stutter.
-_PULSE_PERIOD_S  = 8    # full breathe cycle, in seconds
+_PULSE_PERIOD_MS = 8000  # full breathe cycle
 _PULSE_FLOOR     = 0.18   # dimmest point, as a fraction of full brightness -- never fully black
 _PULSE_TROUGH_TH = 0.04   # phase fraction below which pulse_mute() reports "at trough"
 
@@ -1312,25 +1312,27 @@ def draw_volume(ui, state):
     ui["display"].refresh()
 
 
-def mute_pulse_at_trough(elapsed_s):
+def mute_pulse_at_trough(elapsed_ms):
     """True near the trough of the mute breathing cycle -- the natural
     low-motion point where a caller can do slow work (e.g. an AVR poll)
     without a visible stutter -- see the "Mute pulse" note above."""
-    t = elapsed_s % _PULSE_PERIOD_S
-    frac = 0.5 * (1.0 - math.cos(2.0 * math.pi * t / _PULSE_PERIOD_S))
+    t = elapsed_ms % _PULSE_PERIOD_MS
+    frac = 0.5 * (1.0 - math.cos(2.0 * math.pi * t / _PULSE_PERIOD_MS))
     return frac < _PULSE_TROUGH_TH
 
 
-def pulse_mute(ui, elapsed_s):
+def pulse_mute(ui, elapsed_ms):
     """Render one frame of the mute breathing animation.
 
-    elapsed_s: seconds since the pulse phase started; wraps internally.
+    elapsed_ms: int ms since the pulse phase started; wraps internally.
+    Reduced modulo the period as an int BEFORE any float math -- a mute
+    can last days, and a float of that many ms would step visibly.
     Callers that poll on the trough (mute_pulse_at_trough) should call this
     LAST each tick, after the poll -- otherwise a poll-triggered draw_main()
     can stomp this frame's color with the static muted color.
     """
-    t = elapsed_s % _PULSE_PERIOD_S
-    frac = 0.5 * (1.0 - math.cos(2.0 * math.pi * t / _PULSE_PERIOD_S))
+    t = elapsed_ms % _PULSE_PERIOD_MS
+    frac = 0.5 * (1.0 - math.cos(2.0 * math.pi * t / _PULSE_PERIOD_MS))
     color = _pulse_color(frac)
     ui["vol_int"].color = color
     ui["vol_dec"].color = color

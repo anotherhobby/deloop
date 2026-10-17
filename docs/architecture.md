@@ -24,7 +24,7 @@ gap: preset-switch timing against a real production config, rather than the triv
 in `local/camilladsp/`.)
 
 Previously: 2026-08-06 (v2.7 -- interaction polish on top of v2.6's rendering rewrite. Device
-writes now go through one optimistic-write mechanism (`_SETTLE_S`/`_optimistic()`/`_settle_guard()`
+writes now go through one optimistic-write mechanism (`_SETTLE_MS`/`_optimistic()`/`_settle_guard()`
 in `app.py`): assume the command worked, update the UI immediately, let polling true it up. Input
 switching uses it, and `draw_busy()` no longer flashes grey on backends whose writes return
 immediately. Menus gained a tap-to-go-back gesture and two-axis hit testing. An OTA Check Now that
@@ -267,7 +267,7 @@ tap. Symptom: "the menu button does nothing." Bursts are denser shortly after bo
 look like a boot-settle problem; it is not, one captured failure was 145s into a session.
 
 A failed read now **skips the frame** rather than reporting a release, bounded by
-`TOUCH_ERR_GRACE_S` (0.5s) so a permanently dead bus cannot wedge a gesture open -- a stuck
+`TOUCH_ERR_GRACE_MS` (500ms) so a permanently dead bus cannot wedge a gesture open -- a stuck
 gesture is worse than a lost one, since it keeps the long-press power timer running against a
 finger that already left. `_read_touch_point()` retries once for the same reason.
 
@@ -276,6 +276,34 @@ Rate and clustering were never characterised, and no attempt was made at bus spe
 contention with the display. Worth revisiting if touch reliability regresses -- but note the
 mitigation makes the symptom invisible, so a worsening bus would now show up only as the
 once-per-run "I2C reads failing past grace" print.
+
+### Clock: never `time.monotonic()` for timing (found + fixed 2026-10-17)
+
+Symptom: touch got steadily less responsive over days to weeks of uptime -- a tap had to be held
+for a large fraction of a second to register -- and a reboot always "fixed" it. Not a leak, and
+the loop was not getting slower. `time.monotonic()` returns seconds as a CircuitPython float (30
+bits, ~22 of precision), so its resolution decays with uptime: ~31ms after a day, ~250ms after a
+week, ~1s after four weeks. Every touch timer (`TOUCH_FRAME_MS` 60Hz poll gate, `TOUCH_MIN_MS` tap
+minimum, release debounce, relock) is a difference of two clock readings, so they all collapsed
+onto the clock step: the touch chip was sampled once per step, and a tap shorter than one step
+measured `held=0` and was dropped. Confirmed on hardware by adding a one-week offset to the clock,
+which reproduced the symptom in minutes, plus a phantom ~312ms `STALL` line on nearly every clock
+step (the whole step charged to whichever stage straddled it, every other stage 0) -- so a
+`STALL` line with that shape is a clock artifact, not a slow loop.
+
+Fix: `app.py`'s `_now_ms()` extends `supervisor.ticks_ms()` (an exact int, but it wraps every
+2^29 ms, ~6.2 days) into a never-wrapping millisecond count, and every timestamp is an int of
+ms from it. Plain `now - then` and the `0` = unset sentinels work unchanged. CircuitPython
+schedules the first `ticks_ms` wrap ~65s after power-on, so every boot exercises the wrap path.
+`dial_ui.pulse_mute()`/`mute_pulse_at_trough()` take int ms and reduce modulo the period *before*
+any float math, since a mute can last days. The stall profile uses raw ticks via `_ticks_diff`.
+
+Known cost: past 2^30 ms (~12.4 days) the count is a long int and its arithmetic allocates.
+Measured with the clock started at 28 days: ~1965 loop iterations/sec vs ~3440 normally (Denon,
+idle) -- ~0.5ms per iteration against a 16ms touch frame, no stalls, touch confirmed responsive.
+Read `_now_ms()` once per iteration, not per stage: a dozen reads per iteration cost ~1160 vs
+~1965 iterations/sec in that regime. `ota.py` still times its own log lines with `monotonic()`;
+those are print-only durations, not behaviour.
 
 ### Menu tap hit-testing must be bounded by the menu's real item count (found + fixed 2026-08-01)
 `app.py`'s `_menu_item_at_y(y)` used to scan all `MENU_VISIBLE` (5) slot positions unconditionally,
@@ -413,7 +441,7 @@ current on-device measurement.
 Note the second-order effect, since it bit us: making the loop this much faster **unmasked three
 latent races** in which a poll issued before the device acted overwrote an optimistic UI update.
 They had always been there; the loop had simply been too slow to win. See the heap/boot-memory
-guardrails section below, which carries both the race pattern and the `_SETTLE_S` mechanism that
+guardrails section below, which carries both the race pattern and the `_SETTLE_MS` mechanism that
 now handles it.
 
 ## Configuration (settings.toml)
@@ -526,7 +554,7 @@ lasting rules that came out of it:
   device time to settle before the answer arrived.
     - 2026-08-04, power: the long-press applies optimistically and the confirming poll landed
       first, so `_apply_poll_result` read the disagreement as "powered on externally" and played
-      the splash. Guarded by `_POWER_SETTLE_S` (10s).
+      the splash. Guarded by `_POWER_SETTLE_MS` (10s).
     - 2026-08-05, mute and play/pause: same shape, after composing the gauge took `draw_main`
       ~350ms -> ~92ms. Mute's root cause was sharper than "a poll landed" -- the breathing cycle
       starts *at* a trough and `_pulse_mute` polls at troughs, so muting armed a poll milliseconds
@@ -537,10 +565,10 @@ lasting rules that came out of it:
       one FocalTouch dropout mid-press dispatched two taps. Unreachable at ~3 iterations/sec.
   **Every optimistic write is a candidate. Re-audit them after anything gets faster.**
 - **Optimistic writes now go through one mechanism, not per-field constants.** `app.py`'s
-  `_SETTLE_S` dict holds the per-field window; `_optimistic()` applies the write and starts the
+  `_SETTLE_MS` dict holds the per-field window; `_optimistic()` applies the write and starts the
   window; `_settle_guard()` reverts anything a poll changed inside it, per field, so a genuine
   external change to a *different* field still lands. The old `_MUTE_SETTLE_S`/`_MEDIA_SETTLE_S`
-  constants are gone (`_POWER_SETTLE_S` survives as an alias for code that reads it directly).
+  constants are gone (`_POWER_SETTLE_MS` survives as an alias for code that reads it directly).
   Windows are per-field because devices differ enormously in how fast they report truth again --
   too short and the flicker returns, too long and a change made from the device's own remote takes
   that long to appear. **Tune them against real hardware, not reasoning.** Note `input` (5.0s)
