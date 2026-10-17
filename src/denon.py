@@ -37,7 +37,7 @@ _TIMEOUT = config.AVR_TIMEOUT_MS // 1000
 # control command and boot-time loader.
 _pool = None
 _CONNECT_TIMEOUT_S  = config.AVR_CONNECT_TIMEOUT_MS / 1000
-_POLL_OP_DEADLINE_S = 2.0
+_POLL_OP_DEADLINE_MS = 2000   # vs app._now_ms() ints
 _RECV_CHUNK    = 512
 _RESP_BUF_SIZE = 2048
 _EAGAIN   = 11
@@ -329,7 +329,7 @@ class _AsyncRequest:
         self.phase     = _PHASE_SENDING
         self.error     = None
         self.result    = None
-        self._deadline = now + _POLL_OP_DEADLINE_S
+        self._deadline = now + _POLL_OP_DEADLINE_MS
         self._sock     = None
         self._request  = _build_request(method, path, body, port)
         self._sent     = 0

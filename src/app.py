@@ -27,6 +27,7 @@ import board
 import rotaryio
 import digitalio
 import microcontroller
+import supervisor
 import wifi
 import socketpool
 import adafruit_requests
@@ -40,6 +41,69 @@ import version
 from state import AVRState
 
 _MAX_ERRORS = 5
+
+# ---------------------------------------------------------------------------
+# Clock
+# ---------------------------------------------------------------------------
+#
+# Every timestamp in this file is an int of milliseconds from _now_ms(). Never
+# time.monotonic(): it returns seconds as a CircuitPython float -- 30 bits,
+# ~22 of precision -- so its resolution decays with uptime: ~31ms after a day,
+# ~250ms after a week, ~1s after four weeks. The touch timers below (60Hz
+# poll, 50ms tap minimum, release debounce) all quietly collapse onto that
+# step. Root-caused live 2026-10-17: after days to weeks of uptime a tap had
+# to be held for a large fraction of a second to register, and faking a week
+# of uptime reproduced it in minutes -- along with a phantom ~300ms STALL line
+# on nearly every clock step. A reboot only "fixed" it by resetting uptime.
+#
+# supervisor.ticks_ms() is an exact int but wraps every 2**29 ms (~6.2 days;
+# CircuitPython deliberately schedules the first wrap ~65s after power-on, so
+# every boot exercises the wrap branch below). _now_ms() extends it into a
+# count that never wraps, so plain `now - then` subtraction and the 0 = unset
+# sentinels stay correct at any uptime. It must run at least once per wrap
+# period to see every wrap -- the main loop calls it constantly.
+#
+# The count stays a small int (no heap allocation) for 2**30 ms (~12.4 days)
+# after boot; past that it is a long int and arithmetic on it allocates.
+# Measured 2026-10-17 with the clock started at 28 days: ~1965 loop
+# iterations/sec vs ~3440 normally -- still ~0.5ms per iteration against a
+# 16ms touch frame, and no stalls. Read it once per iteration (`now`), not
+# per stage -- see _ticks_diff.
+#
+# Starts at _CLOCK_START_MS, not 0, so a 0 sentinel ("never", e.g.
+# last_preset_retry) reads as at least that long ago on the very first pass,
+# the way monotonic()'s seconds-since-power-on always did.
+_TICKS_WRAP_MS  = 1 << 29
+_CLOCK_START_MS = 60000
+
+
+class _Clock:
+    def __init__(self):
+        self.last = supervisor.ticks_ms()
+        self.base = _CLOCK_START_MS - self.last
+
+    def now_ms(self):
+        t = supervisor.ticks_ms()
+        if t < self.last:
+            self.base += _TICKS_WRAP_MS
+        self.last = t
+        return self.base + t
+
+
+_now_ms = _Clock().now_ms
+
+# Raw-ticks interval for the main loop's per-stage stall profile only. Those
+# intervals are sub-second, so a masked difference of the wrapping counter
+# is exact and always a small int -- unlike _now_ms(), which past ~12.4
+# days of uptime is a long int that allocates on every read. Measured
+# 2026-10-17: a dozen _now_ms() reads per iteration for this profile ran
+# the loop at ~1160 iterations/sec in that long-int regime (vs ~1965 with
+# raw ticks), and ~2700 vs ~3440 before it.
+_TICKS_MASK = _TICKS_WRAP_MS - 1
+
+
+def _ticks_diff(end, start):
+    return (end - start) & _TICKS_MASK
 
 # ---------------------------------------------------------------------------
 # Optimistic device writes
@@ -60,15 +124,15 @@ _MAX_ERRORS = 5
 # change made from the device's own remote takes that long to show up. That is
 # the whole tradeoff -- tune against real hardware, not reasoning.
 #
-# The loop runs at ~240 iterations/sec and a poll resolves in ~20ms, so the
+# The loop runs at ~3400 iterations/sec and a poll resolves in ~20ms, so the
 # confirming poll reliably lands well before a slow device has settled. These
 # windows are what stands between that and a visible flicker; they are not
 # belt-and-braces.
-_SETTLE_S = {
-    "power":       10.0,   # a real power-on is seconds of boot time
-    "muted":        1.5,   # lands in well under a second
-    "media_state":  1.5,   # transport commands are immediate
-    "input":        5.0,   # AVRs keep reporting the old source while HDMI re-handshakes
+_SETTLE_MS = {
+    "power":       10000,   # a real power-on is seconds of boot time
+    "muted":        1500,   # lands in well under a second
+    "media_state":  1500,   # transport commands are immediate
+    "input":        5000,   # AVRs keep reporting the old source while HDMI re-handshakes
 }
 # Only fields apply_status() actually writes belong here -- a window for
 # anything else can never run, since nothing would ever revert it. Add a line
@@ -83,7 +147,7 @@ _SETTLE_S = {
 
 # Named separately because the power window is also read directly by
 # _apply_poll_result's externally-changed tests, not just by _settle_guard.
-_POWER_SETTLE_S = _SETTLE_S["power"]
+_POWER_SETTLE_MS = _SETTLE_MS["power"]
 
 
 def _optimistic(loop, state, now, field, value):
@@ -98,8 +162,8 @@ def _settle_guard(loop, state, now, prev):
     prev is the snapshot taken before apply_status(). Per-field, so a poll
     carrying a genuine external change to some OTHER field still lands.
     """
-    for field, window in _SETTLE_S.items():
-        if (now - loop.cmd_at.get(field, -1000.0)) >= window:
+    for field, window in _SETTLE_MS.items():
+        if (now - loop.cmd_at.get(field, -1000000)) >= window:
             continue
         if getattr(state, field, None) != prev.get(field):
             setattr(state, field, prev[field])
@@ -117,7 +181,7 @@ _denon = None
 # element (buttons never appear) rather than just slightly-stale state, and
 # is worth reconnecting for aggressively until the first success. Stops
 # retrying permanently the moment it succeeds once -- see _retry_presets().
-_PRESET_RETRY_INTERVAL_S = 10.0
+_PRESET_RETRY_INTERVAL_MS = 10000
 
 # Submenu title for sub_type == "update". Every other submenu derives its
 # title from the driver LABELS entry or the sub_type itself; this one has no
@@ -146,11 +210,11 @@ _NVM_SOUND      = 1
 # of that power cycle, root-caused live 2026-07-31.
 
 # Encoder debounce (volume mode only)
-ENC_DEBOUNCE_S = 0.15
+ENC_DEBOUNCE_MS = 150
 
 # Touch long-press / tap thresholds
-TOUCH_POWER_S   = 1.5
-TOUCH_MIN_S     = 0.05  # minimum tap duration; filters electrical noise
+TOUCH_POWER_MS  = 1500
+TOUCH_MIN_MS    = 50    # minimum tap duration; filters electrical noise
 
 # Release debounce + post-tap lockout. Both exist because the FocalTouch chip
 # has no queue and can report touched=0 for a single frame in the MIDDLE of a
@@ -158,15 +222,15 @@ TOUCH_MIN_S     = 0.05  # minimum tap duration; filters electrical noise
 # two taps -- two mute toggles from one finger. Only visible once the loop got
 # fast enough to actually sample at 60Hz; at ~3 iterations/sec a press was
 # sampled once or twice and the dropout fell in a gap nobody looked at.
-TOUCH_RELEASE_S = 0.05  # untouched must persist this long to count as a release
+TOUCH_RELEASE_MS = 50   # untouched must persist this long to count as a release
 #
-# CAUTION: TOUCH_RELEASE_S delays the release, so tap duration must be measured
+# CAUTION: TOUCH_RELEASE_MS delays the release, so tap duration must be measured
 # to the last frame that was actually TOUCHED (loop.touch_last_seen), never to
-# the release time. Measuring to release adds TOUCH_RELEASE_S to every gesture,
-# which makes even a single-frame noise blip clear TOUCH_MIN_S -- defeating the
+# the release time. Measuring to release adds TOUCH_RELEASE_MS to every gesture,
+# which makes even a single-frame noise blip clear TOUCH_MIN_MS -- defeating the
 # very filter that constant exists to be. The symptom is phantom mutes: the
 # device reporting itself muted with nobody touching it.
-TAP_RELOCK_S    = 0.25  # ignore new touch-downs this long after dispatching a tap
+TAP_RELOCK_MS   = 250   # ignore new touch-downs this long after dispatching a tap
 
 # How long an unbroken run of failed I2C reads is tolerated before the touch
 # frame is treated as a real "untouched" again. Long enough to ride out the
@@ -174,33 +238,33 @@ TAP_RELOCK_S    = 0.25  # ignore new touch-downs this long after dispatching a t
 # short enough that a genuinely dead bus can't hold a gesture open. A stuck
 # gesture is worse than a lost one: it would keep the long-press power timer
 # running against a finger that left.
-TOUCH_ERR_GRACE_S = 0.5
+TOUCH_ERR_GRACE_MS = 500
 MENU_TAP_Y      = 195   # pixels from top: taps below this open the menu
 SWIPE_THRESHOLD = 50    # pixels; horizontal delta to register a swipe
 
 # Menu auto-close
-MENU_TIMEOUT = 8.0   # auto-close menu after this many seconds idle
+MENU_TIMEOUT_MS = 8000   # auto-close menu after this long idle
 
 # Mute pulse: throttle how often we bother re-rendering / testing the trough.
 # The animation itself (period, floor, trough width) lives in dial_ui.pulse_mute().
-PULSE_FRAME_S = 1.0 / 30   # ~30 fps
+PULSE_FRAME_MS = 1000 // 30   # ~30 fps
 
 # Touch poll: the main loop has no sleep and spins as fast as the CPU allows,
 # but the FocalTouch controller itself only reports at ~60-120Hz -- polling
 # every iteration (thousands/sec while a finger is down) just burns CPU and
 # allocates a fresh touches list on every call for no benefit. Gate it like
 # the pulse frame rate above.
-TOUCH_FRAME_S = 1.0 / 60   # ~60 fps
+TOUCH_FRAME_MS = 1000 // 60   # ~60 fps
 
 # --- Loop-stall detector -----------------------------------------------
 # The FocalTouch chip has no queue -- it only reports whatever is touched
-# *right now*. The main loop has no sleep (see TOUCH_FRAME_S's comment
+# *right now*. The main loop has no sleep (see TOUCH_FRAME_MS's comment
 # above), so if any single iteration runs long (a blocking AVR/network
 # poll is the prime suspect), every touch-poll frame that would have
 # landed during that stall is simply never taken -- a tap that begins and
 # ends entirely inside the gap leaves no trace anywhere, in state or in
 # the FocalTouch chip itself. Prints a per-stage breakdown of any
-# iteration slower than STALL_THRESHOLD_S.
+# iteration slower than STALL_THRESHOLD_MS.
 #
 # Do not add per-touch or per-tap logging alongside this. A print on every
 # touch-poll frame is ~60 blocking USB CDC writes/sec while a finger is
@@ -210,7 +274,7 @@ TOUCH_FRAME_S = 1.0 / 60   # ~60 fps
 # 120ms sits above the cost of a normal frame that draws (~90ms) and below
 # anything long enough to swallow a whole tap. Re-tune it if draw cost
 # moves materially in either direction.
-STALL_THRESHOLD_S = 0.12
+STALL_THRESHOLD_MS = 120
 
 
 def _load_brightness():
@@ -469,7 +533,7 @@ def _boot_network_check(pool, session):
         return pool, session
 
     print("netcheck: cycling radio")
-    t0 = time.monotonic()
+    t0 = _now_ms()
     try:
         wifi.radio.enabled = False
         time.sleep(1.0)
@@ -484,7 +548,7 @@ def _boot_network_check(pool, session):
         # and the main loop's own retry paths get their chance either way.
         print("netcheck: radio reset FAILED %r" % (e,))
         return pool, session
-    print("netcheck: radio reset + reconnect took %.1fs" % (time.monotonic() - t0))
+    print("netcheck: radio reset + reconnect took %.1fs" % ((_now_ms() - t0) / 1000))
 
     pool, session = _build_transport()
     driver.init(session)
@@ -678,7 +742,7 @@ def _confirm_sub(sub_type, sub_cursor, state, ui, loop, now):
                 driver.set_preset(val)
             # Set directly, not via _optimistic() -- no backend reports preset
             # back through apply_status(), so there is nothing for a settle
-            # window to guard against (see _SETTLE_S).
+            # window to guard against (see _SETTLE_MS).
             state.preset = val
             # Only flip to enabled if this backend's set_preset() actually
             # does that itself (see CAPS["preset_select_enables"] in
@@ -814,14 +878,14 @@ class _Loop:
         self.last_pos         = 0   # overwritten with encoder.position before the loop starts
         self.last_btn_pressed = False
 
-        self.enc_last_move = 0.0
-        self.enc_last_tick = 0.0
+        self.enc_last_move = 0
+        self.enc_last_tick = 0
 
-        self.touch_start       = 0.0
-        self.touch_up_at       = 0.0   # provisional release time; 0 = none pending
-        self.touch_last_seen   = 0.0   # last frame the panel actually reported a touch
+        self.touch_start       = 0
+        self.touch_up_at       = 0     # provisional release time; 0 = none pending
+        self.touch_last_seen   = 0     # last frame the panel actually reported a touch
         self.touch_got_point   = False # did any frame yield real coordinates?
-        self.tap_relock_until  = 0.0   # touch-downs ignored until this time
+        self.tap_relock_until  = 0     # touch-downs ignored until this time
         self.touch_x           = 0   # coordinates captured at touch-down
         self.touch_y           = 0
         self.touch_x_start     = 0   # x at touch-down (for swipe detection)
@@ -829,15 +893,15 @@ class _Loop:
 
         # First frame of the current unbroken I2C-error run; 0 = no run in
         # progress. See _handle_touch's exception branch.
-        self.touch_err_since  = 0.0
+        self.touch_err_since  = 0
         self.touch_err_logged = False
 
-        # monotonic time of the last locally-issued write, per field -- see
-        # _SETTLE_S and _optimistic().
+        # _now_ms() of the last locally-issued write, per field -- see
+        # _SETTLE_MS and _optimistic().
         self.cmd_at = {}
-        self.last_touch_poll   = 0.0   # throttles touch reads -- see TOUCH_FRAME_S
+        self.last_touch_poll   = 0     # throttles touch reads -- see TOUCH_FRAME_MS
 
-        self.last_poll   = time.monotonic() + 2.0
+        self.last_poll   = _now_ms() + 2000
         self.error_count = 0
         self.first_poll  = True
         # Set by _poll_avr right before kicking off an async poll (denon
@@ -850,7 +914,7 @@ class _Loop:
 
         # 0.0, not now() -- fires on the very first main-loop pass if
         # get_presets() failed at boot, rather than waiting a full interval.
-        self.last_preset_retry = 0.0
+        self.last_preset_retry = 0
 
         self.mode        = MODE_MAIN
         self.menu_cursor = 0
@@ -858,13 +922,13 @@ class _Loop:
         self.sub_cursor  = 0
         self.sub_scroll  = 0    # first visible item in sub-menu (for long lists)
         self.sub_type    = None    # "input", "preset", "player", "brightness", "sound", "update"
-        self.menu_idle   = 0.0     # monotonic time of last menu interaction
+        self.menu_idle   = 0       # _now_ms() of last menu interaction
 
-        self.mute_phase_origin  = 0.0     # monotonic time the current pulse cycle started
+        self.mute_phase_origin  = 0       # _now_ms() the current pulse cycle started
         self.mute_trough_polled = False   # guards against polling every tick while under threshold
-        self.pulse_last_frame   = 0.0
+        self.pulse_last_frame   = 0
 
-        self.power_fade_start = 0.0   # monotonic time the power-off fade began; 0.0 = not fading
+        self.power_fade_start = 0     # _now_ms() the power-off fade began; 0 = not fading
         self.power_fade_from  = dial_ui.BRIGHTNESS_ON   # display brightness when the fade began
 
         # OTA session status -- ephemeral UI state, same category as mode/
@@ -972,7 +1036,7 @@ def _handle_encoder_rotation(loop, ui, state, encoder, now):
 
     if loop.mode == MODE_MAIN:
         # Accelerated volume control
-        elapsed_ms = (now - loop.enc_last_tick) * 1000 if loop.enc_last_tick > 0.0 else 999
+        elapsed_ms = (now - loop.enc_last_tick) if loop.enc_last_tick > 0 else 999
         loop.enc_last_tick = now
         # Divide by |delta| to get ms-per-tick: when spinning fast,
         # multiple ticks accumulate per loop iteration so elapsed_ms
@@ -1032,12 +1096,12 @@ def _send_volume_debounced(loop, ui, state, now):
     send the unmute, then do the one full redraw that swaps the display
     back from blue to the normal gradient and colors.
     """
-    if loop.mode != MODE_MAIN or loop.enc_last_move <= 0.0:
+    if loop.mode != MODE_MAIN or loop.enc_last_move <= 0:
         return
-    if (now - loop.enc_last_move) < ENC_DEBOUNCE_S:
+    if (now - loop.enc_last_move) < ENC_DEBOUNCE_MS:
         return
 
-    loop.enc_last_move = 0.0
+    loop.enc_last_move = 0
     was_muted = state.muted
     if _denon is not None:
         # Async kickoff never raises for a routine network hiccup (only a
@@ -1060,7 +1124,7 @@ def _send_volume_debounced(loop, ui, state, now):
             loop.error_count += 1
     if was_muted and not state.muted:
         dial_ui.draw_main(ui, state)
-    loop.last_poll = time.monotonic()
+    loop.last_poll = _now_ms()
 
 
 # ---------------------------------------------------------------------------
@@ -1070,7 +1134,7 @@ def _send_volume_debounced(loop, ui, state, now):
 def _auto_close_menu(loop, ui, state, now):
     if loop.mode in (MODE_MAIN, MODE_ERROR):
         return
-    if loop.menu_idle <= 0.0 or (now - loop.menu_idle) < MENU_TIMEOUT:
+    if loop.menu_idle <= 0 or (now - loop.menu_idle) < MENU_TIMEOUT_MS:
         return
 
     loop.mode = MODE_MAIN
@@ -1113,7 +1177,7 @@ def _handle_touch_down(loop, ui, state, touch, now):
     band and reads as "tapped outside everything," closing the menu. A
     stuck touch_x_start breaks swipe detection the same way.
     """
-    first_frame = loop.touch_start == 0.0
+    first_frame = loop.touch_start == 0
     if first_frame:
         loop.touch_start = now
     pt = _read_touch_point(touch)
@@ -1125,7 +1189,7 @@ def _handle_touch_down(loop, ui, state, touch, now):
             loop.touch_x_start = loop.touch_x
 
     held = now - loop.touch_start
-    if not driver.CAPS["power"] or loop.touch_power_fired or held < TOUCH_POWER_S:
+    if not driver.CAPS["power"] or loop.touch_power_fired or held < TOUCH_POWER_MS:
         return
 
     # Power toggle must be checked first – it works in any power state
@@ -1133,7 +1197,7 @@ def _handle_touch_down(loop, ui, state, touch, now):
     loop.touch_power_fired = True
     sound.click_heavy()
     # Both branches below apply the new power state optimistically; polls for
-    # the next _POWER_SETTLE_S will still report the old one.
+    # the next _POWER_SETTLE_MS will still report the old one.
     loop.cmd_at["power"] = now
     try:
         if state.power == "ON":
@@ -1152,7 +1216,7 @@ def _handle_touch_down(loop, ui, state, touch, now):
             state.volume_db = config.VOLUME_MIN
             dial_ui.flash_power_on(ui)
             dial_ui.draw_main(ui, state)
-        loop.last_poll = time.monotonic() - 4.0  # poll in ~1s (5s interval - 4s)
+        loop.last_poll = _now_ms() - 4000  # poll in ~1s (5s interval - 4s)
         loop.error_count = 0
     except Exception as e:
         print("power:", e)
@@ -1315,7 +1379,7 @@ def _try_action(loop, label, action):
     """
     try:
         action()
-        loop.last_poll = time.monotonic()
+        loop.last_poll = _now_ms()
         loop.error_count = 0
         return True
     except Exception as e:
@@ -1483,7 +1547,7 @@ def _tap_main_screen(loop, ui, state, now):
         # (Denon) take seconds to actually apply a preset change, so an
         # immediate read-back would just return the old value.
         dial_ui.draw_main(ui, state)
-        loop.last_poll = time.monotonic()
+        loop.last_poll = _now_ms()
         loop.error_count = 0
     except Exception as e:
         print("set_preset (quick):", e)
@@ -1534,33 +1598,33 @@ def _dispatch_tap(loop, ui, state, now):
 
 
 def _handle_touch_released(loop, ui, state, now):
-    # Measured to the last TOUCHED frame, not to now -- see TOUCH_RELEASE_S.
-    held = (loop.touch_last_seen - loop.touch_start) if loop.touch_start > 0.0 else 0.0
+    # Measured to the last TOUCHED frame, not to now -- see TOUCH_RELEASE_MS.
+    held = (loop.touch_last_seen - loop.touch_start) if loop.touch_start > 0 else 0
     # A gesture that never produced real coordinates is not a tap. The panel
     # can report touched>0 with an empty touches list (see _handle_touch_down),
     # and touch_y then stays at its reset value of 0 -- which on the main
     # screen is above the preset line, i.e. mute. So a phantom does not just
     # fire something random, it reliably fires mute.
-    fired = held >= TOUCH_MIN_S and loop.touch_got_point and not loop.touch_power_fired
+    fired = held >= TOUCH_MIN_MS and loop.touch_got_point and not loop.touch_power_fired
     if fired:
         _dispatch_tap(loop, ui, state, now)
-        # Re-arm only after TAP_RELOCK_S. A tap that ends in a bounce would
+        # Re-arm only after TAP_RELOCK_MS. A tap that ends in a bounce would
         # otherwise start a fresh gesture on the very next frame.
         #
         # Anchored to when _dispatch_tap actually returned, not to `now`.
         # `now` is sampled before the dispatch, and a tap can dispatch a
         # blocking device write -- a MiniDSP preset switch is a full DSP
-        # reconfiguration, measured ~4s -- which outlasts TAP_RELOCK_S many
+        # reconfiguration, measured ~4s -- which outlasts TAP_RELOCK_MS many
         # times over. Using `now` there left the lockout already expired on
         # return, so a finger still on the glass after the write started a
         # fresh gesture and dispatched the very same preset a second time
         # (confirmed live on MiniDSP 2026-08-08: correct switch, then an
         # immediate identical one the moment the first completed).
-        loop.tap_relock_until = time.monotonic() + TAP_RELOCK_S
+        loop.tap_relock_until = _now_ms() + TAP_RELOCK_MS
 
-    loop.touch_start       = 0.0
-    loop.touch_up_at       = 0.0
-    loop.touch_last_seen   = 0.0
+    loop.touch_start       = 0
+    loop.touch_up_at       = 0
+    loop.touch_last_seen   = 0
     loop.touch_got_point   = False
     loop.touch_x           = 0
     loop.touch_y           = 0
@@ -1569,13 +1633,13 @@ def _handle_touch_released(loop, ui, state, now):
 
 
 def _handle_touch(loop, ui, state, touch, touch_ok, now):
-    if (now - loop.last_touch_poll) < TOUCH_FRAME_S:
+    if (now - loop.last_touch_poll) < TOUCH_FRAME_MS:
         return
     loop.last_touch_poll = now
 
     try:
         is_touched = touch_ok and touch.touched > 0
-        loop.touch_err_since = 0.0
+        loop.touch_err_since = 0
     except Exception as e:
         # An I2C read error is NOT "the finger left the glass" -- and
         # treating it as one silently lost whole taps. Measured live
@@ -1590,12 +1654,12 @@ def _handle_touch(loop, ui, state, touch, touch_ok, now):
         # So: skip the frame entirely rather than reporting a release. The
         # gesture stays intact across the blip and the real frames still
         # land. Bounded, because a permanently failing bus must not wedge a
-        # gesture open forever -- after TOUCH_ERR_GRACE_S of unbroken
+        # gesture open forever -- after TOUCH_ERR_GRACE_MS of unbroken
         # errors, fall through and let the normal release path run.
-        if loop.touch_err_since == 0.0:
+        if loop.touch_err_since == 0:
             loop.touch_err_since = now
             loop.touch_err_logged = False
-        if (now - loop.touch_err_since) < TOUCH_ERR_GRACE_S:
+        if (now - loop.touch_err_since) < TOUCH_ERR_GRACE_MS:
             return
         # Once per error run, not per frame: a genuinely dead bus would
         # otherwise print at the touch sample rate forever.
@@ -1609,17 +1673,17 @@ def _handle_touch(loop, ui, state, touch, touch_ok, now):
             return                      # post-tap lockout; ignore the bounce
         # A touched frame cancels any pending release: the untouched frame
         # that started it was a dropout, not the finger leaving the glass.
-        loop.touch_up_at = 0.0
+        loop.touch_up_at = 0
         loop.touch_last_seen = now
         _handle_touch_down(loop, ui, state, touch, now)
         return
 
-    if loop.touch_start == 0.0:
+    if loop.touch_start == 0:
         return                          # no gesture in progress
-    if loop.touch_up_at == 0.0:
+    if loop.touch_up_at == 0:
         loop.touch_up_at = now          # provisional -- wait for confirmation
         return
-    if (now - loop.touch_up_at) < TOUCH_RELEASE_S:
+    if (now - loop.touch_up_at) < TOUCH_RELEASE_MS:
         return                          # not yet confirmed
     _handle_touch_released(loop, ui, state, now)
 
@@ -1648,7 +1712,7 @@ def _apply_poll_result(loop, ui, state, now, status):
         was_on      = state.power == "ON"
         was_muted   = state.muted
         prev_power  = state.power
-        prev = {f: getattr(state, f, None) for f in _SETTLE_S}
+        prev = {f: getattr(state, f, None) for f in _SETTLE_MS}
         changed = state.apply_status(status)
 
         # Undo anything a poll reverted inside its settle window. Per-field,
@@ -1659,8 +1723,8 @@ def _apply_poll_result(loop, ui, state, now, status):
         # against what the device just reported. Right after a local power
         # command those legitimately disagree -- we applied it optimistically
         # and the device hasn't got there yet -- so the disagreement means
-        # nothing until it settles. See _POWER_SETTLE_S.
-        settled = (now - loop.cmd_at.get("power", -1000.0)) >= _POWER_SETTLE_S
+        # nothing until it settles. See _POWER_SETTLE_MS.
+        settled = (now - loop.cmd_at.get("power", -1000000)) >= _POWER_SETTLE_MS
 
         if was_standby and state.power == "ON" and not loop.first_poll and settled:
             # AVR just powered on externally – show splash then normal UI.
@@ -1715,7 +1779,7 @@ def _apply_poll_result(loop, ui, state, now, status):
         # return value synchronously the way _poll_now()'s callers do --
         # see _poll_avr.
         if powered_on_externally and loop.pending_poll_interval is not None:
-            loop.last_poll = now - loop.pending_poll_interval + 1.0
+            loop.last_poll = now - loop.pending_poll_interval + 1000
         loop.pending_poll_interval = None
 
         return powered_on_externally
@@ -1801,7 +1865,7 @@ def _poll_avr(loop, ui, state, now):
 
     Interval logic:
       - AVR is in STANDBY: always 5s -- detect power-on quickly
-      - Recently active (encoder/touch in last 30s): POLL_INTERVAL_S (30s)
+      - Recently active (encoder/touch in last 30s): POLL_INTERVAL_MS (30s)
         -- prevents polls chaining immediately after commands
       - Truly idle: 5s -- catch remote/app changes promptly
     Always skipped while the encoder is moving, or while muted in MAIN with
@@ -1814,10 +1878,10 @@ def _poll_avr(loop, ui, state, now):
 
     in_standby = state.power != "ON"
     last_action = max(loop.enc_last_move, loop.enc_last_tick)
-    recently_active = (now - last_action) < config.POLL_INTERVAL_S
-    poll_interval = 5.0 if (in_standby or not recently_active) else config.POLL_INTERVAL_S
+    recently_active = (now - last_action) < config.POLL_INTERVAL_MS
+    poll_interval = 5000 if (in_standby or not recently_active) else config.POLL_INTERVAL_MS
 
-    encoder_idle = (loop.enc_last_move == 0.0)
+    encoder_idle = (loop.enc_last_move == 0)
     if not encoder_idle or (now - loop.last_poll) < poll_interval:
         return
 
@@ -1838,7 +1902,7 @@ def _poll_avr(loop, ui, state, now):
         loop.pending_poll_interval = poll_interval
         _denon.start_status_poll(now)
     elif _poll_now(loop, ui, state, now):
-        loop.last_poll = now - poll_interval + 1.0
+        loop.last_poll = now - poll_interval + 1000
 
 
 def _retry_presets(loop, ui, state, now):
@@ -1848,14 +1912,14 @@ def _retry_presets(loop, ui, state, now):
     backend isn't reachable yet (AVR still warming up, transient network
     issue), state.preset_names stays permanently empty and the quick-select
     buttons never appear, with nothing to ever retry it again. Runs on its
-    own short, fixed interval (_PRESET_RETRY_INTERVAL_S) independent of the
+    own short, fixed interval (_PRESET_RETRY_INTERVAL_MS) independent of the
     normal adaptive status poll, and stops for good the moment it succeeds
     once -- this is a boot-catch-up mechanism, not an ongoing poll (a preset
     switch already refreshes the list itself, same as at boot).
     """
     if state.preset_names or not driver.CAPS.get("presets"):
         return
-    if loop.enc_last_move != 0.0 or (now - loop.last_preset_retry) < _PRESET_RETRY_INTERVAL_S:
+    if loop.enc_last_move != 0 or (now - loop.last_preset_retry) < _PRESET_RETRY_INTERVAL_MS:
         return
     loop.last_preset_retry = now
     gc.collect()
@@ -1889,9 +1953,9 @@ def _pulse_mute(loop, ui, state, now):
         return
     if loop.mode != MODE_MAIN or state.power != "ON" or not state.muted:
         return
-    if loop.enc_last_move > 0.0:
+    if loop.enc_last_move > 0:
         return   # actively spinning -- draw_volume owns the display for now
-    if (now - loop.pulse_last_frame) < PULSE_FRAME_S:
+    if (now - loop.pulse_last_frame) < PULSE_FRAME_MS:
         return
     loop.pulse_last_frame = now
 
@@ -1921,12 +1985,12 @@ def _fade_power_off(loop, ui, state, now):
     """One-shot brightness ease after powering off, toward the static
     standby brightness draw_main() uses -- hides that redraw at the least
     visible moment, same trick as the mute-pulse trough poll."""
-    if loop.power_fade_start <= 0.0:
+    if loop.power_fade_start <= 0:
         return
     elapsed = now - loop.power_fade_start
-    done = dial_ui.fade_power_off(ui, elapsed, loop.power_fade_from, state)
+    done = dial_ui.fade_power_off(ui, elapsed / 1000, loop.power_fade_from, state)
     if done:
-        loop.power_fade_start = 0.0
+        loop.power_fade_start = 0
         dial_ui.draw_main(ui, state)
 
 
@@ -1936,7 +2000,7 @@ def _fade_power_off(loop, ui, state, now):
 
 def main():
     # ── Startup splash ────────────────────────────────────────────────────
-    _splash_t = time.monotonic()
+    _splash_t = _now_ms()
     print("free mem at top of main:", gc.mem_free(), "t:", _splash_t)
     dial_ui.show_splash(board.DISPLAY)
 
@@ -2112,45 +2176,45 @@ def main():
 
     # --- Main loop ---
     while True:
-        t0 = time.monotonic()
-        now = t0
+        t0 = supervisor.ticks_ms()
+        now = _now_ms()
 
         _handle_encoder_button(loop, ui, state, btn, now)
-        t1 = time.monotonic()
+        t1 = supervisor.ticks_ms()
         _handle_encoder_rotation(loop, ui, state, encoder, now)
-        t2 = time.monotonic()
+        t2 = supervisor.ticks_ms()
         _send_volume_debounced(loop, ui, state, now)
-        t3 = time.monotonic()
+        t3 = supervisor.ticks_ms()
         _auto_close_menu(loop, ui, state, now)
-        t4 = time.monotonic()
+        t4 = supervisor.ticks_ms()
         _handle_touch(loop, ui, state, touch, touch_ok, now)
-        t5 = time.monotonic()
+        t5 = supervisor.ticks_ms()
         # Placed before _pulse_mute (not next to _poll_avr, which kicks the
         # async poll off but never resolves it) so that if a poll resolves
         # on this tick, _pulse_mute's render afterward still "wins" the
         # frame -- see its own comment for why that ordering matters.
         _pump_denon_poll(loop, ui, state, now)
-        t5a = time.monotonic()
+        t5a = supervisor.ticks_ms()
         _pump_denon_command(loop, ui, state, now)
-        t5b = time.monotonic()
+        t5b = supervisor.ticks_ms()
         _pulse_mute(loop, ui, state, now)
-        t6 = time.monotonic()
+        t6 = supervisor.ticks_ms()
         _fade_power_off(loop, ui, state, now)
-        t7 = time.monotonic()
+        t7 = supervisor.ticks_ms()
         _poll_avr(loop, ui, state, now)
-        t8 = time.monotonic()
+        t8 = supervisor.ticks_ms()
         _retry_presets(loop, ui, state, now)
-        t9 = time.monotonic()
+        t9 = supervisor.ticks_ms()
 
-        if (t9 - t0) >= STALL_THRESHOLD_S:
+        if _ticks_diff(t9, t0) >= STALL_THRESHOLD_MS:
             print(
                 "STALL %dms enc_btn=%d enc_rot=%d vol=%d autoclose=%d "
                 "touch=%d denon=%d cmd=%d mute=%d fade=%d avr=%d presets=%d" % (
-                    (t9 - t0) * 1000,
-                    (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000,
-                    (t4 - t3) * 1000, (t5 - t4) * 1000, (t5a - t5) * 1000,
-                    (t5b - t5a) * 1000,
-                    (t6 - t5b) * 1000, (t7 - t6) * 1000, (t8 - t7) * 1000,
-                    (t9 - t8) * 1000,
+                    _ticks_diff(t9, t0),
+                    _ticks_diff(t1, t0), _ticks_diff(t2, t1), _ticks_diff(t3, t2),
+                    _ticks_diff(t4, t3), _ticks_diff(t5, t4), _ticks_diff(t5a, t5),
+                    _ticks_diff(t5b, t5a),
+                    _ticks_diff(t6, t5b), _ticks_diff(t7, t6), _ticks_diff(t8, t7),
+                    _ticks_diff(t9, t8),
                 )
             )
